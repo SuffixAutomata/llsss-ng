@@ -785,11 +785,30 @@ private:
         build(EdgeMode::Even, even_edge_acceptance_);
     }
 
-    [[nodiscard]] bool history_accepts(const std::vector<std::uint8_t>& triples) const {
-        const auto row = triples.size() - 1U;
+    // [[nodiscard]] bool history_accepts(const std::vector<std::uint8_t>& triples) const {
+    //     const auto row = triples.size() - 1U;
+    //     const auto p = static_cast<std::size_t>(geometry_.period);
+    //     const auto k = static_cast<std::size_t>(geometry_.displacement);
+    //     if (row < 2U * p) return true;
+
+    //     const std::array<std::size_t, 5> rows = {
+    //         row - 2U * p, row - p - k, row - p, row - k, row - p + k,
+    //     };
+    //     std::size_t key = 0;
+    //     unsigned shift = 0;
+    //     for (const auto history_row : rows) {
+    //         key |= static_cast<std::size_t>(triples[history_row] & 0b111U) << shift;
+    //         shift += 3U;
+    //     }
+    //     const auto candidate = triples[row] & 0b111U;
+    //     return (row_acceptance_[key] & (1U << candidate)) != 0;
+    // }
+
+    [[nodiscard]] uint8_t history_all_accepts(const std::vector<std::uint8_t>& triples) const {
+        const auto row = triples.size();
         const auto p = static_cast<std::size_t>(geometry_.period);
         const auto k = static_cast<std::size_t>(geometry_.displacement);
-        if (row < 2U * p) return true;
+        if (row < 2U * p) return 0xffU;
 
         const std::array<std::size_t, 5> rows = {
             row - 2U * p, row - p - k, row - p, row - k, row - p + k,
@@ -800,8 +819,8 @@ private:
             key |= static_cast<std::size_t>(triples[history_row] & 0b111U) << shift;
             shift += 3U;
         }
-        const auto candidate = triples[row] & 0b111U;
-        return (row_acceptance_[key] & (1U << candidate)) != 0;
+        // const auto candidate = triples[row] & 0b111U;
+        return row_acceptance_[key];
     }
 
     [[nodiscard]] static std::uint8_t pair_triple(std::uint8_t left_label,
@@ -829,12 +848,33 @@ private:
         return static_cast<std::uint8_t>(boundary | (inward << 1U));
     }
 
-    [[nodiscard]] bool edge_history_accepts(
+    // [[nodiscard]] bool edge_history_accepts(
+    //     const std::vector<std::uint8_t>& pairs, EdgeMode mode) const {
+    //     const auto row = pairs.size() - 1U;
+    //     const auto p = static_cast<std::size_t>(geometry_.period);
+    //     const auto k = static_cast<std::size_t>(geometry_.displacement);
+    //     if (row < 2U * p) return true;
+    //     const std::array<std::size_t, 5> rows = {
+    //         row - 2U * p, row - p - k, row - p, row - k, row - p + k,
+    //     };
+    //     std::size_t key = 0;
+    //     unsigned shift = 0;
+    //     for (const auto history_row : rows) {
+    //         key |= static_cast<std::size_t>(pairs[history_row] & 0b11U) << shift;
+    //         shift += 2U;
+    //     }
+    //     const auto candidate = pairs[row] & 0b11U;
+    //     const auto& table = mode == EdgeMode::Even
+    //         ? even_edge_acceptance_ : odd_edge_acceptance_;
+    //     return (table[key] & (1U << candidate)) != 0;
+    // }
+
+    [[nodiscard]] uint8_t edge_history_all_accepts(
         const std::vector<std::uint8_t>& pairs, EdgeMode mode) const {
-        const auto row = pairs.size() - 1U;
+        const auto row = pairs.size();
         const auto p = static_cast<std::size_t>(geometry_.period);
         const auto k = static_cast<std::size_t>(geometry_.displacement);
-        if (row < 2U * p) return true;
+        if (row < 2U * p) return 0xffU;
         const std::array<std::size_t, 5> rows = {
             row - 2U * p, row - p - k, row - p, row - k, row - p + k,
         };
@@ -844,11 +884,11 @@ private:
             key |= static_cast<std::size_t>(pairs[history_row] & 0b11U) << shift;
             shift += 2U;
         }
-        const auto candidate = pairs[row] & 0b11U;
         const auto& table = mode == EdgeMode::Even
             ? even_edge_acceptance_ : odd_edge_acceptance_;
-        return (table[key] & (1U << candidate)) != 0;
+        return table[key];
     }
+
 
     bool boundary_dfs(const SuccinctSliceTree& tree, Node node, std::size_t depth,
                       EdgeMode edge, bool left_side, std::vector<std::uint8_t>& history,
@@ -860,15 +900,16 @@ private:
         }
         bool any = false;
         const auto mask = tree.child_mask(node);
+        uint8_t acceptor = edge_history_all_accepts(history, edge);
         for (std::uint8_t label = 0; label < 4; ++label) {
             if ((mask & (1U << label)) == 0) continue;
             // A background boundary slice is supplied by the background
             // generator itself.  For zero background both cells in that
             // terminal slice therefore extend with zero.
             if (edge == EdgeMode::Background && label != 0) continue;
+            if (!(acceptor & (1U << canonical_edge_pair(label, left_side, edge)))) continue;
             history.push_back(canonical_edge_pair(label, left_side, edge));
-            if (edge_history_accepts(history, edge)
-                && boundary_dfs(tree, tree.child(node, label), depth + 1,
+            if (boundary_dfs(tree, tree.child(node, label), depth + 1,
                                 edge, left_side, history, tags)) {
                 any = true;
             }
@@ -911,17 +952,17 @@ private:
 
         const auto left_mask = left.child_mask(left_node);
         const auto right_mask = right.child_mask(right_node);
+        uint8_t acceptor = history_all_accepts(history);
         for (std::uint8_t a = 0; a < 4; ++a) {
             if ((left_mask & (1U << a)) == 0) continue;
             for (std::uint8_t b = 0; b < 4; ++b) {
                 if ((right_mask & (1U << b)) == 0 || (a & 1U) != (b >> 1U)) continue;
+                if (!(acceptor & (1U << pair_triple(a, b)))) continue;
                 history.push_back(pair_triple(a, b));
-                if (history_accepts(history)) {
-                    candidate_pair_dfs(
-                        left, right, left.child(left_node, a), right.child(right_node, b),
-                        depth + 1, history, parent_gate, parent_gate_depth,
-                        parent_gate_cursor, ancestry_allowed, leaf_callback);
-                }
+                candidate_pair_dfs(
+                    left, right, left.child(left_node, a), right.child(right_node, b),
+                    depth + 1, history, parent_gate, parent_gate_depth,
+                    parent_gate_cursor, ancestry_allowed, leaf_callback);
                 history.pop_back();
             }
         }
