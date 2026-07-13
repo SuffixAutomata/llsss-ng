@@ -89,9 +89,10 @@ equation it touches. The resulting `15 + 3`-bit row projection is stored as a
 two additional 1 KiB projections. The even projection models its overlapping
 reflected reads directly: it reads one physical history cell and requires the
 two newly appended cells to agree. The first sweep starts at the left boundary
-and the opposite sweep intersects reachability from the right boundary. BCAF
-needs at most four simultaneous packed tag bits per node; the witness storage
-is reused for cleanup.
+and the opposite sweep intersects reachability from the right boundary. During
+BCAF, normal reachability, witness reachability, and global cleanup use six
+simultaneous packed tag bits per expanded node. This deliberately avoids a
+much larger temporary bit tape over every compatible neighboring leaf pair.
 
 Reification performs one DFS to tag live ancestry, then stably compacts the
 four-bit records in place. This deletes empty nodes and leaves the new current
@@ -99,12 +100,15 @@ leaves as the zero-mask tail for the next extension.
 
 The optional `bcaf` filter uses the fixed first `2P+1` rows of each lineage as
 its zero-background witness, matching the Rust implementation and `cpp-old`.
-It propagates witnesses in both directions, gates individual compatible leaf
+It propagates witnesses in both directions, admits individual compatible leaf
 pairs only when they lie on an interesting prefix or suffix, and then performs
-global reachability cleanup. The surviving relation gate is packed in
-deterministic synchronized-DFS order. This is the minimum correlation state
-needed to prevent a rejected pair from reappearing merely because both unary
-slice nodes survive; it is normally tiny and has no endpoint records.
+global reachability cleanup. The BCAF predicate is recomputed during those
+existing DFS passes instead of being materialized as a temporary gate. While
+the surviving relation gate is emitted in deterministic synchronized-DFS
+order, each finished slice is immediately reified and its old gate and tags
+are released. The persistent gate is the minimum correlation state needed to
+prevent a rejected pair from reappearing merely because both unary slice nodes
+survive; it has no endpoint records.
 
 End detection uses two temporary suffix tags (valid and interesting). Partial
 and completion reconstruction rescan the compact relation gate to choose one

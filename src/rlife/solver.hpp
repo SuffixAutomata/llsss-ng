@@ -785,25 +785,6 @@ private:
         build(EdgeMode::Even, even_edge_acceptance_);
     }
 
-    // [[nodiscard]] bool history_accepts(const std::vector<std::uint8_t>& triples) const {
-    //     const auto row = triples.size() - 1U;
-    //     const auto p = static_cast<std::size_t>(geometry_.period);
-    //     const auto k = static_cast<std::size_t>(geometry_.displacement);
-    //     if (row < 2U * p) return true;
-
-    //     const std::array<std::size_t, 5> rows = {
-    //         row - 2U * p, row - p - k, row - p, row - k, row - p + k,
-    //     };
-    //     std::size_t key = 0;
-    //     unsigned shift = 0;
-    //     for (const auto history_row : rows) {
-    //         key |= static_cast<std::size_t>(triples[history_row] & 0b111U) << shift;
-    //         shift += 3U;
-    //     }
-    //     const auto candidate = triples[row] & 0b111U;
-    //     return (row_acceptance_[key] & (1U << candidate)) != 0;
-    // }
-
     [[nodiscard]] uint8_t history_all_accepts(const std::vector<std::uint8_t>& triples) const {
         const auto row = triples.size();
         const auto p = static_cast<std::size_t>(geometry_.period);
@@ -847,27 +828,6 @@ private:
         const auto boundary = left_side ? first : second;
         return static_cast<std::uint8_t>(boundary | (inward << 1U));
     }
-
-    // [[nodiscard]] bool edge_history_accepts(
-    //     const std::vector<std::uint8_t>& pairs, EdgeMode mode) const {
-    //     const auto row = pairs.size() - 1U;
-    //     const auto p = static_cast<std::size_t>(geometry_.period);
-    //     const auto k = static_cast<std::size_t>(geometry_.displacement);
-    //     if (row < 2U * p) return true;
-    //     const std::array<std::size_t, 5> rows = {
-    //         row - 2U * p, row - p - k, row - p, row - k, row - p + k,
-    //     };
-    //     std::size_t key = 0;
-    //     unsigned shift = 0;
-    //     for (const auto history_row : rows) {
-    //         key |= static_cast<std::size_t>(pairs[history_row] & 0b11U) << shift;
-    //         shift += 2U;
-    //     }
-    //     const auto candidate = pairs[row] & 0b11U;
-    //     const auto& table = mode == EdgeMode::Even
-    //         ? even_edge_acceptance_ : odd_edge_acceptance_;
-    //     return (table[key] & (1U << candidate)) != 0;
-    // }
 
     [[nodiscard]] uint8_t edge_history_all_accepts(
         const std::vector<std::uint8_t>& pairs, EdgeMode mode) const {
@@ -1051,11 +1011,9 @@ private:
         }
 
         std::vector<PairGate> next_gates(adjacency_count);
-        std::vector<TagPair>* final_tags = &normal;
-        bool final_uses_intersection = true;
+        bool slices_reified = false;
 
         const auto bcaf_window = 2U * static_cast<std::size_t>(geometry_.period) + 1U;
-        std::vector<TagPair> clean;
         if (options_.bcaf && height_ >= bcaf_window) {
             phase("  bcaf relation gate");
             std::vector<TagPair> witness;
@@ -1098,68 +1056,55 @@ private:
                     });
             }
 
-            // This temporary bit tape is aligned to every currently compatible
-            // pair.  It contains the BCAF edge gate before global cleanup.
-            std::vector<PairGate> bcaf_gates(adjacency_count);
+            // Keeping a full temporary BCAF relation tape here makes it overlap
+            // both the old and the newly produced persistent tapes.  Retain the
+            // two witness planes instead and recompute the inexpensive edge
+            // predicate during the three already-required cleanup/final walks.
+            // This costs two more tag bits per expanded node, but removes one
+            // bit for every compatible neighboring leaf pair -- a much larger
+            // term in broad searches.
+            std::vector<TagPair> clean;
+            clean.reserve(slices_.size());
+            for (const auto& slice : slices_) clean.emplace_back(slice.node_count());
+            peak_tag_bytes_ = std::max(
+                peak_tag_bytes_,
+                tag_bytes(normal) + tag_bytes(witness) + tag_bytes(clean));
+            for (Node leaf = slices_.front().leaf_begin();
+                 leaf < slices_.front().leaf_end(); ++leaf) {
+                if (normally_live(0, leaf)) clean.front()[0].set(leaf);
+            }
             for (std::size_t i = 0; i < adjacency_count; ++i) {
                 walk_candidate_pairs(i,
                     [&](Node left_leaf, Node right_leaf, const auto&, bool ancestry_allowed) {
                         const bool normal_edge = ancestry_allowed
                             && normal[i][0].get(left_leaf)
                             && normal[i + 1U][1].get(right_leaf);
-                        // An edge survives iff an interesting slice can reach
-                        // its left endpoint, or its right endpoint can reach
-                        // an interesting slice.  The other two endpoint/plane
-                        // combinations would admit an edge that merely sits
-                        // beside (rather than on) an interesting full path.
                         const bool interesting_path = witness[i][0].get(left_leaf)
                             || witness[i + 1U][1].get(right_leaf);
-                        bcaf_gates[i].push_back(normal_edge && interesting_path);
-                    });
-            }
-
-            // The witness planes are dead once the temporary relation gate is
-            // built.  Reuse their storage for global cleanup, keeping the
-            // simultaneous maximum at four tag bits per node.
-            clean = std::move(witness);
-            for (auto& tags : clean) {
-                tags[0].clear();
-                tags[1].clear();
-            }
-            for (Node leaf = slices_.front().leaf_begin();
-                 leaf < slices_.front().leaf_end(); ++leaf) {
-                if (normally_live(0, leaf)) clean.front()[0].set(leaf);
-            }
-            for (std::size_t i = 0; i < adjacency_count; ++i) {
-                std::uint64_t cursor = 0;
-                walk_candidate_pairs(i,
-                    [&](Node left_leaf, Node right_leaf, const auto&, bool) {
-                        const bool edge = bcaf_gates[i].get(cursor++);
+                        const bool edge = normal_edge && interesting_path;
                         if (edge && clean[i][0].get(left_leaf)) {
                             clean[i + 1U][0].set(right_leaf);
                         }
                     });
-                if (cursor != bcaf_gates[i].size()) {
-                    throw std::logic_error("bcaf gate enumeration mismatch");
-                }
             }
             for (Node leaf = slices_.back().leaf_begin();
                  leaf < slices_.back().leaf_end(); ++leaf) {
                 if (clean.back()[0].get(leaf)) clean.back()[1].set(leaf);
             }
             for (std::size_t i = adjacency_count; i > 0; --i) {
-                std::uint64_t cursor = 0;
                 walk_candidate_pairs(i - 1U,
-                    [&](Node left_leaf, Node right_leaf, const auto&, bool) {
-                        const bool edge = bcaf_gates[i - 1U].get(cursor++);
+                    [&](Node left_leaf, Node right_leaf, const auto&, bool ancestry_allowed) {
+                        const bool normal_edge = ancestry_allowed
+                            && normal[i - 1U][0].get(left_leaf)
+                            && normal[i][1].get(right_leaf);
+                        const bool interesting_path = witness[i - 1U][0].get(left_leaf)
+                            || witness[i][1].get(right_leaf);
+                        const bool edge = normal_edge && interesting_path;
                         if (edge && clean[i - 1U][0].get(left_leaf)
                             && clean[i][1].get(right_leaf)) {
                             clean[i - 1U][1].set(left_leaf);
                         }
                     });
-                if (cursor != bcaf_gates[i - 1U].size()) {
-                    throw std::logic_error("bcaf gate enumeration mismatch");
-                }
             }
 
             if (clean.front()[1].count(
@@ -1167,13 +1112,20 @@ private:
                 return false;
             }
 
-            // Emit only bits whose endpoints survive reification.  Stable trie
-            // compaction makes this exactly the DFS order of the next state.
+            // Emit only bits whose endpoints survive reification.  Once gate i
+            // has been emitted, old slice i and its tags can never be consulted
+            // again: later walks start at slice i+1.  Reify and release it here
+            // so the growing final gate tape does not overlap all expanded
+            // slices and all six tag planes.
             for (std::size_t i = 0; i < adjacency_count; ++i) {
-                std::uint64_t cursor = 0;
                 walk_candidate_pairs(i,
-                    [&](Node left_leaf, Node right_leaf, const auto&, bool) {
-                        const bool bcaf_edge = bcaf_gates[i].get(cursor++);
+                    [&](Node left_leaf, Node right_leaf, const auto&, bool ancestry_allowed) {
+                        const bool normal_edge = ancestry_allowed
+                            && normal[i][0].get(left_leaf)
+                            && normal[i + 1U][1].get(right_leaf);
+                        const bool interesting_path = witness[i][0].get(left_leaf)
+                            || witness[i + 1U][1].get(right_leaf);
+                        const bool bcaf_edge = normal_edge && interesting_path;
                         const bool keep_left = clean[i][1].get(left_leaf);
                         const bool keep_right = clean[i + 1U][1].get(right_leaf);
                         if (keep_left && keep_right) {
@@ -1183,12 +1135,17 @@ private:
                             next_gates[i].push_back(final_edge);
                         }
                     });
-                if (cursor != bcaf_gates[i].size()) {
-                    throw std::logic_error("bcaf final-gate enumeration mismatch");
-                }
+                if (pair_gates_ready_) pair_gates_[i] = PairGate{};
+                if (!slices_[i].reify(clean[i][1])) return false;
+                normal[i] = TagPair{};
+                witness[i] = TagPair{};
+                clean[i] = TagPair{};
             }
-            final_tags = &clean;
-            final_uses_intersection = false;
+            if (!slices_.back().reify(clean.back()[1])) return false;
+            normal.back() = TagPair{};
+            witness.back() = TagPair{};
+            clean.back() = TagPair{};
+            slices_reified = true;
         } else {
             for (std::size_t i = 0; i < adjacency_count; ++i) {
                 walk_candidate_pairs(i,
@@ -1205,15 +1162,16 @@ private:
             }
         }
 
-        for (std::size_t i = 0; i < slices_.size(); ++i) {
-            auto& keep = (*final_tags)[i][0];
-            for (Node leaf = slices_[i].leaf_begin(); leaf < slices_[i].leaf_end(); ++leaf) {
-                const bool live = final_uses_intersection
-                    ? (normal[i][0].get(leaf) && normal[i][1].get(leaf))
-                    : (*final_tags)[i][1].get(leaf);
-                keep.set(leaf, live);
+        if (!slices_reified) {
+            for (std::size_t i = 0; i < slices_.size(); ++i) {
+                auto& keep = normal[i][0];
+                for (Node leaf = slices_[i].leaf_begin();
+                     leaf < slices_[i].leaf_end(); ++leaf) {
+                    keep.set(leaf,
+                             normal[i][0].get(leaf) && normal[i][1].get(leaf));
+                }
+                if (!slices_[i].reify(keep)) return false;
             }
-            if (!slices_[i].reify(keep)) return false;
         }
 
         pair_gates_ = std::move(next_gates);
