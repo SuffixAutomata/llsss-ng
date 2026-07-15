@@ -1,5 +1,6 @@
 CXX ?= c++
 CXXFLAGS ?= -O3 -DNDEBUG -std=c++20 -Wall -Wextra -Wpedantic
+NATIVE_FLAGS ?= -march=native
 CPPFLAGS ?=
 LDFLAGS ?=
 
@@ -12,7 +13,7 @@ HEADERS := $(wildcard src/rlife/*.hpp)
 all: $(TARGET)
 
 $(TARGET): $(SOURCES) $(HEADERS)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -Isrc $(SOURCES) $(LDFLAGS) -o $@
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(NATIVE_FLAGS) -Isrc $(SOURCES) $(LDFLAGS) -o $@
 
 clean:
 	rm -f $(TARGET)

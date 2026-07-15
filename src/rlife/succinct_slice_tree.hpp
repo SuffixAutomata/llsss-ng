@@ -131,6 +131,11 @@ class SuccinctSliceTree {
 public:
     using Node = std::uint64_t;
 
+    struct ChildBlock {
+        Node first = 0;
+        std::uint8_t mask = 0;
+    };
+
     SuccinctSliceTree()
         : words_(1, 0), level_begin_{0, 1}, node_count_(1), depth_(0) {
         rebuild_rank_directory();
@@ -152,6 +157,14 @@ public:
         const auto word = words_[static_cast<std::size_t>(node >> 4U)];
         const auto shift = static_cast<unsigned>((node & 15U) * 4U);
         return static_cast<std::uint8_t>((word >> shift) & 0x0fU);
+    }
+
+    // Children of one BFS node occupy a consecutive ID range.  Fetching the
+    // range once avoids repeating the rank-directory loads and popcount for
+    // every outgoing label in synchronized DFS.
+    [[nodiscard]] ChildBlock child_block(Node node) const noexcept {
+        const auto word_index = static_cast<std::size_t>(node >> 4U);
+        return child_block_from_word(node, words_[word_index]);
     }
 
     [[nodiscard]] Node child(Node node, std::uint8_t label) const {
@@ -188,7 +201,13 @@ public:
             throw std::logic_error("tag/tree size mismatch");
         }
         tags.clear_range(0, leaf_begin());
-        return close_dfs(0, 0, tags, nullptr);
+        std::vector<Node> child_cursor(depth_);
+        for (std::size_t depth = 0; depth < depth_; ++depth) {
+            child_cursor[depth] = level_begin_[depth + 1U];
+        }
+        const bool live = close_dfs(0, 0, child_cursor, tags, nullptr);
+        validate_child_cursors(child_cursor);
+        return live;
     }
 
     // Rebuild the trie from tagged current leaves.  A single DFS marks live
@@ -200,11 +219,19 @@ public:
         }
         tags.clear_range(0, leaf_begin());
         std::vector<Node> live_per_level(depth_ + 1, 0);
-        if (!close_dfs(0, 0, tags, &live_per_level)) {
+        std::vector<Node> child_cursor(depth_);
+        for (std::size_t depth = 0; depth < depth_; ++depth) {
+            child_cursor[depth] = level_begin_[depth + 1U];
+        }
+        if (!close_dfs(0, 0, child_cursor, tags, &live_per_level)) {
             return false;
         }
+        validate_child_cursors(child_cursor);
 
         Node write = 0;
+        Node old_child_cursor = 1;
+        std::size_t output_word_index = 0;
+        std::uint64_t output_word = 0;
         const auto old_count = node_count_;
         const auto old_word_count = words_.size();
         for (std::size_t word_index = 0; word_index < old_word_count; ++word_index) {
@@ -214,24 +241,37 @@ public:
             const Node first = static_cast<Node>(word_index) * 16U;
             const Node last = std::min<Node>(first + 16U, old_count);
             for (Node node = first; node < last; ++node) {
-                if (!tags.get(node)) {
-                    continue;
-                }
                 const auto shift = static_cast<unsigned>((node & 15U) * 4U);
                 const auto original_mask = static_cast<std::uint8_t>(
                     (original_word >> shift) & 0x0fU);
+                auto old_child = old_child_cursor;
+                old_child_cursor += static_cast<Node>(std::popcount(original_mask));
+                if (!tags.get(node)) {
+                    continue;
+                }
                 std::uint8_t retained_mask = 0;
                 for (std::uint8_t label = 0; label < 4; ++label) {
                     if ((original_mask & (1U << label)) == 0) {
                         continue;
                     }
-                    const auto old_child = child_from_word(node, label, original_word);
-                    if (tags.get(old_child)) {
+                    if (tags.get(old_child++)) {
                         retained_mask |= static_cast<std::uint8_t>(1U << label);
                     }
                 }
-                set_child_mask(write++, retained_mask);
+                const auto output_shift = static_cast<unsigned>((write & 15U) * 4U);
+                output_word |= static_cast<std::uint64_t>(retained_mask) << output_shift;
+                ++write;
+                if ((write & 15U) == 0) {
+                    words_[output_word_index++] = output_word;
+                    output_word = 0;
+                }
             }
+        }
+        if (old_child_cursor != old_count) {
+            throw std::logic_error("slice-tree compaction child cursor lost alignment");
+        }
+        if ((write & 15U) != 0) {
+            words_[output_word_index] = output_word;
         }
 
         node_count_ = write;
@@ -339,6 +379,22 @@ private:
         return rank + 1U;
     }
 
+    [[nodiscard]] ChildBlock child_block_from_word(
+        Node node, std::uint64_t original_word) const noexcept {
+        const auto word_index = static_cast<std::size_t>(node >> 4U);
+        const auto shift = static_cast<unsigned>((node & 15U) * 4U);
+        const auto lower = shift == 0
+            ? std::uint64_t{0}
+            : (std::uint64_t{1} << shift) - 1U;
+        const auto rank = absolute_rank_[word_index / words_per_absolute_chunk]
+                        + relative_rank_[word_index]
+                        + static_cast<Node>(std::popcount(original_word & lower));
+        return ChildBlock{
+            rank + 1U,
+            static_cast<std::uint8_t>((original_word >> shift) & 0x0fU),
+        };
+    }
+
     void rebuild_rank_directory() {
         absolute_rank_.clear();
         relative_rank_.assign(words_.size(), 0);
@@ -365,16 +421,28 @@ private:
         relative_rank_.shrink_to_fit();
     }
 
-    bool close_dfs(Node node, std::size_t depth, PackedTags& tags,
+    void validate_child_cursors(const std::vector<Node>& child_cursor) const {
+        for (std::size_t depth = 0; depth < depth_; ++depth) {
+            if (child_cursor[depth] != level_begin_[depth + 2U]) {
+                throw std::logic_error("slice-tree DFS child cursor lost alignment");
+            }
+        }
+    }
+
+    bool close_dfs(Node node, std::size_t depth,
+                   std::vector<Node>& child_cursor, PackedTags& tags,
                    std::vector<Node>* live_per_level) const {
         bool live = false;
         if (depth == depth_) {
             live = tags.get(node);
         } else {
             const auto mask = child_mask(node);
+            auto child = child_cursor[depth];
+            child_cursor[depth] += static_cast<Node>(std::popcount(mask));
             for (std::uint8_t label = 0; label < 4; ++label) {
-                if ((mask & (1U << label)) != 0
-                    && close_dfs(child(node, label), depth + 1, tags, live_per_level)) {
+                if ((mask & (1U << label)) == 0) continue;
+                if (close_dfs(child++, depth + 1, child_cursor,
+                              tags, live_per_level)) {
                     live = true;
                 }
             }
@@ -391,13 +459,13 @@ private:
         if (depth == depth_) {
             return node == target;
         }
-        const auto mask = child_mask(node);
+        const auto children = child_block(node);
+        auto child = children.first;
         for (std::uint8_t label = 0; label < 4; ++label) {
-            if ((mask & (1U << label)) == 0) {
-                continue;
-            }
+            if ((children.mask & (1U << label)) == 0) continue;
+            const auto next = child++;
             path.push_back(label);
-            if (lineage_dfs(child(node, label), depth + 1, target, path)) {
+            if (lineage_dfs(next, depth + 1, target, path)) {
                 return true;
             }
             path.pop_back();

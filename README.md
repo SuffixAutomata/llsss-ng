@@ -25,6 +25,10 @@ cmake -S cpp -B cpp/build
 cmake --build cpp/build -j
 ```
 
+The default Make and CMake builds use `-march=native`, primarily so succinct
+rank uses the host's hardware `popcount`. Set `NATIVE_FLAGS=` with Make, or
+configure CMake with `-DRLIFE_NATIVE=OFF`, to build a portable binary.
+
 ## Run
 
 ```sh
@@ -88,14 +92,25 @@ equation it touches. The resulting `15 + 3`-bit row projection is stored as a
 32 KiB read-only lookup shared by every slice traversal. Odd and even edges use
 two additional 1 KiB projections. The even projection models its overlapping
 reflected reads directly: it reads one physical history cell and requires the
-two newly appended cells to agree. The first sweep starts at the left boundary
-and the opposite sweep intersects reachability from the right boundary. During
-BCAF, normal reachability, witness reachability, and global cleanup use six
-simultaneous packed tag bits per expanded node. This deliberately avoids a
-much larger temporary bit tape over every compatible neighboring leaf pair.
+two newly appended cells to agree. A compact transition table maps the two
+four-bit child masks directly to the possible overlapping child pairs, so a
+pair state performs one rank operation per trie and iterates only present,
+CA-accepted branches.
+
+Without BCAF, one sweep starts at the left boundary and the opposite sweep
+intersects reachability from the right boundary. With BCAF, dependency order
+combines normal right reachability with suffix witnesses, then combines normal
+left reachability, prefix witnesses, and the first global-cleanup direction.
+The reverse cleanup and final gate emission bring the total to four pair-tree
+traversals instead of six independent traversals. Normal reachability, witness
+reachability, and global cleanup use six simultaneous packed tag bits per
+expanded node. This deliberately avoids a much larger temporary bit tape over
+every compatible neighboring leaf pair.
 
 Reification performs one DFS to tag live ancestry, then stably compacts the
-four-bit records in place. This deletes empty nodes and leaves the new current
+four-bit records in place. Whole-tree walks exploit BFS ordering with one child
+cursor per depth; children remain contiguous, so these walks do not need a
+rank lookup for each child. This deletes empty nodes and leaves the new current
 leaves as the zero-mask tail for the next extension.
 
 The optional `bcaf` filter uses the fixed first `2P+1` rows of each lineage as
@@ -110,10 +125,12 @@ are released. The persistent gate is the minimum correlation state needed to
 prevent a rejected pair from reappearing merely because both unary slice nodes
 survive; it has no endpoint records.
 
-End detection uses two temporary suffix tags (valid and interesting). Partial
-and completion reconstruction rescan the compact relation gate to choose one
-allowed successor at a time, so they need neither parent IDs nor cached join
-endpoints. An additional `O(all nodes)` scan per recovered slice is intentional.
+End detection uses two temporary leaf suffix tags (valid and interesting).
+Internal closure is unnecessary because the uncached synchronized traversal
+consults those tags only at candidate leaves. Partial and completion
+reconstruction rescan the compact relation gate to choose one allowed
+successor at a time, so they need neither parent IDs nor cached join endpoints.
+An additional `O(all nodes)` scan per recovered slice is intentional.
 
 This version is serial. Pair-tree traversal is isolated from mutation of the
 persistent tries, leaving its top-level branch work suitable for later

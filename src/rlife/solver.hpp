@@ -345,6 +345,8 @@ public:
     explicit Solver(Options options)
         : options_(std::move(options)), geometry_(Geometry::parse(options_.geometry)),
           rule_(RuleTable::parse(options_.rule)) {
+        configure_pair_history();
+        build_pair_transition_table();
         build_row_acceptance_table();
         build_edge_acceptance_tables();
         rule_.release_partial_lookup();
@@ -403,7 +405,7 @@ public:
             }
             ++height_;
 
-            phase("two directional support sweeps");
+            phase("support and filter sweeps");
             if (!prune_supported()) {
                 std::cout << "search exhausted at height " << height_ << '\n';
                 slices_.clear();
@@ -671,9 +673,10 @@ private:
                 remaining >>= 3U;
             }
             std::uint8_t mask = 0;
-            for (std::uint8_t candidate = 0; candidate < 8; ++candidate) {
+            for (std::uint8_t position = 0; position < 8; ++position) {
+                const auto candidate = pair_triple_order_[position];
                 if (row_candidate_accepts(history, candidate)) {
-                    mask = static_cast<std::uint8_t>(mask | (1U << candidate));
+                    mask = static_cast<std::uint8_t>(mask | (1U << position));
                 }
             }
             row_acceptance_[key] = mask;
@@ -785,31 +788,64 @@ private:
         build(EdgeMode::Even, even_edge_acceptance_);
     }
 
-    [[nodiscard]] uint8_t history_all_accepts(const std::vector<std::uint8_t>& triples) const {
-        const auto row = triples.size();
+    void configure_pair_history() {
         const auto p = static_cast<std::size_t>(geometry_.period);
         const auto k = static_cast<std::size_t>(geometry_.displacement);
-        if (row < 2U * p) return 0xffU;
+        pair_history_offsets_ = {2U * p, p + k, p, k, p - k};
+    }
 
-        const std::array<std::size_t, 5> rows = {
-            row - 2U * p, row - p - k, row - p, row - k, row - p + k,
-        };
-        std::size_t key = 0;
-        unsigned shift = 0;
-        for (const auto history_row : rows) {
-            key |= static_cast<std::size_t>(triples[history_row] & 0b111U) << shift;
-            shift += 3U;
-        }
+    [[nodiscard]] std::uint8_t history_all_accepts(
+        const std::uint8_t* triples, std::size_t row) const {
+        if (row < pair_history_offsets_[0]) return 0xffU;
+        const auto key =
+            static_cast<std::size_t>(triples[row - pair_history_offsets_[0]])
+            | (static_cast<std::size_t>(triples[row - pair_history_offsets_[1]]) << 3U)
+            | (static_cast<std::size_t>(triples[row - pair_history_offsets_[2]]) << 6U)
+            | (static_cast<std::size_t>(triples[row - pair_history_offsets_[3]]) << 9U)
+            | (static_cast<std::size_t>(triples[row - pair_history_offsets_[4]]) << 12U);
         // const auto candidate = triples[row] & 0b111U;
         return row_acceptance_[key];
     }
 
-    [[nodiscard]] static std::uint8_t pair_triple(std::uint8_t left_label,
-                                                   std::uint8_t right_label) {
-        const auto left = static_cast<std::uint8_t>((left_label >> 1U) & 1U);
-        const auto middle = static_cast<std::uint8_t>(left_label & 1U);
-        const auto right = static_cast<std::uint8_t>(right_label & 1U);
-        return static_cast<std::uint8_t>(left | (middle << 1U) | (right << 2U));
+    struct PairTransitions {
+        // In the original left-label/right-label DFS order, bits 0..1 are the
+        // offset within the left child block and bits 2..3 the offset within
+        // the right block.
+        std::array<std::uint8_t, 8> child_offsets{};
+        std::uint8_t present = 0;
+    };
+
+    inline static constexpr std::array<std::uint8_t, 8> pair_triple_order_ = {
+        0, 4, 2, 6, 1, 5, 3, 7,
+    };
+
+    void build_pair_transition_table() {
+        for (std::uint8_t left_mask = 0; left_mask < 16; ++left_mask) {
+            for (std::uint8_t right_mask = 0; right_mask < 16; ++right_mask) {
+                auto& transitions = pair_transitions_[
+                    static_cast<std::size_t>(left_mask)
+                    | (static_cast<std::size_t>(right_mask) << 4U)];
+                for (std::uint8_t position = 0; position < 8; ++position) {
+                    const auto triple = pair_triple_order_[position];
+                    const auto left_label = static_cast<std::uint8_t>(
+                        ((triple & 1U) << 1U) | ((triple >> 1U) & 1U));
+                    const auto right_label = static_cast<std::uint8_t>(
+                        (triple & 0b010U) | ((triple >> 2U) & 1U));
+                    if ((left_mask & (1U << left_label)) == 0
+                        || (right_mask & (1U << right_label)) == 0) {
+                        continue;
+                    }
+                    const auto left_offset = static_cast<std::uint8_t>(std::popcount(
+                        static_cast<unsigned>(left_mask & ((1U << left_label) - 1U))));
+                    const auto right_offset = static_cast<std::uint8_t>(std::popcount(
+                        static_cast<unsigned>(right_mask & ((1U << right_label) - 1U))));
+                    transitions.child_offsets[position] = static_cast<std::uint8_t>(
+                        left_offset | (right_offset << 2U));
+                    transitions.present = static_cast<std::uint8_t>(
+                        transitions.present | (1U << position));
+                }
+            }
+        }
     }
 
     [[nodiscard]] static std::uint8_t canonical_edge_pair(std::uint8_t label,
@@ -829,9 +865,8 @@ private:
         return static_cast<std::uint8_t>(boundary | (inward << 1U));
     }
 
-    [[nodiscard]] uint8_t edge_history_all_accepts(
-        const std::vector<std::uint8_t>& pairs, EdgeMode mode) const {
-        const auto row = pairs.size();
+    [[nodiscard]] std::uint8_t edge_history_all_accepts(
+        const std::uint8_t* pairs, std::size_t row, EdgeMode mode) const {
         const auto p = static_cast<std::size_t>(geometry_.period);
         const auto k = static_cast<std::size_t>(geometry_.displacement);
         if (row < 2U * p) return 0xffU;
@@ -859,21 +894,22 @@ private:
             return true;
         }
         bool any = false;
-        const auto mask = tree.child_mask(node);
-        uint8_t acceptor = edge_history_all_accepts(history, edge);
+        const auto children = tree.child_block(node);
+        auto child = children.first;
+        const auto acceptor = edge_history_all_accepts(history.data(), depth, edge);
         for (std::uint8_t label = 0; label < 4; ++label) {
-            if ((mask & (1U << label)) == 0) continue;
+            if ((children.mask & (1U << label)) == 0) continue;
+            const auto next = child++;
             // A background boundary slice is supplied by the background
             // generator itself.  For zero background both cells in that
             // terminal slice therefore extend with zero.
             if (edge == EdgeMode::Background && label != 0) continue;
             if (!(acceptor & (1U << canonical_edge_pair(label, left_side, edge)))) continue;
-            history.push_back(canonical_edge_pair(label, left_side, edge));
-            if (boundary_dfs(tree, tree.child(node, label), depth + 1,
+            history[depth] = canonical_edge_pair(label, left_side, edge);
+            if (boundary_dfs(tree, next, depth + 1,
                                 edge, left_side, history, tags)) {
                 any = true;
             }
-            history.pop_back();
         }
         if (any) tags.set(node);
         return any;
@@ -882,53 +918,121 @@ private:
     void mark_boundary(const SuccinctSliceTree& tree, EdgeMode edge, bool left_side,
                        PackedTags& tags) {
         tags.clear();
-        std::vector<std::uint8_t> history;
-        history.reserve(tree.depth());
+        std::vector<std::uint8_t> history(tree.depth());
         boundary_dfs(tree, 0, 0, edge, left_side, history, tags);
     }
 
-    template<class LeafCallback>
+    struct PairPathSummary {
+        std::size_t first_left_nonzero = std::numeric_limits<std::size_t>::max();
+        std::size_t last_left_nonzero = std::numeric_limits<std::size_t>::max();
+    };
+
+    enum class PairGateLocation : std::uint8_t {
+        None,
+        ParentOfLeaf,
+        Leaf,
+    };
+
+    template<bool CountStats, bool VisitRejected, bool TrackSummary,
+             PairGateLocation GateLocation,
+             class LeafCallback>
     void candidate_pair_dfs(const SuccinctSliceTree& left,
                             const SuccinctSliceTree& right,
                             Node left_node, Node right_node, std::size_t depth,
                             std::vector<std::uint8_t>& history,
                             const PairGate* parent_gate,
-                            std::size_t parent_gate_depth,
                             std::uint64_t& parent_gate_cursor,
                             bool ancestry_allowed,
+                            PairPathSummary summary,
                             LeafCallback& leaf_callback) {
-        ++pair_states_;
-        if (parent_gate != nullptr && depth == parent_gate_depth) {
-            if (parent_gate_cursor >= parent_gate->size()) {
-                throw std::logic_error("pair gate ended before its DFS enumeration");
+        if constexpr (CountStats) ++pair_states_;
+        const auto tree_depth = left.depth();
+        if constexpr (GateLocation == PairGateLocation::ParentOfLeaf) {
+            if (depth + 1U == tree_depth) {
+                if (parent_gate_cursor >= parent_gate->size()) {
+                    throw std::logic_error("pair gate ended before its DFS enumeration");
+                }
+                ancestry_allowed = parent_gate->get(parent_gate_cursor++);
+                if constexpr (!VisitRejected) {
+                    if (!ancestry_allowed) return;
+                }
             }
-            ancestry_allowed = parent_gate->get(parent_gate_cursor++);
         }
-        if (depth == left.depth()) {
-            ++pair_leaves_;
-            leaf_callback(left_node, right_node, history, ancestry_allowed);
+        if (depth == tree_depth) {
+            if constexpr (CountStats) ++pair_leaves_;
+            if constexpr (TrackSummary) {
+                leaf_callback(left_node, right_node, history, ancestry_allowed, summary);
+            } else {
+                leaf_callback(left_node, right_node, history, ancestry_allowed);
+            }
             return;
         }
 
-        const auto left_mask = left.child_mask(left_node);
-        const auto right_mask = right.child_mask(right_node);
-        uint8_t acceptor = history_all_accepts(history);
-        for (std::uint8_t a = 0; a < 4; ++a) {
-            if ((left_mask & (1U << a)) == 0) continue;
-            for (std::uint8_t b = 0; b < 4; ++b) {
-                if ((right_mask & (1U << b)) == 0 || (a & 1U) != (b >> 1U)) continue;
-                if (!(acceptor & (1U << pair_triple(a, b)))) continue;
-                history.push_back(pair_triple(a, b));
-                candidate_pair_dfs(
-                    left, right, left.child(left_node, a), right.child(right_node, b),
-                    depth + 1, history, parent_gate, parent_gate_depth,
-                    parent_gate_cursor, ancestry_allowed, leaf_callback);
-                history.pop_back();
+        const auto left_children = left.child_block(left_node);
+        const auto right_children = right.child_block(right_node);
+        const auto acceptor = history_all_accepts(history.data(), depth);
+        const auto& transitions = pair_transitions_[
+            static_cast<std::size_t>(left_children.mask)
+            | (static_cast<std::size_t>(right_children.mask) << 4U)];
+        auto active = static_cast<std::uint8_t>(acceptor & transitions.present);
+        const bool children_are_leaves = depth + 1U == tree_depth;
+        while (active != 0) {
+            const auto position = static_cast<std::uint8_t>(std::countr_zero(
+                static_cast<unsigned>(active)));
+            const auto triple = pair_triple_order_[position];
+            const auto offsets = transitions.child_offsets[position];
+            history[depth] = triple;
+            auto next_summary = summary;
+            if constexpr (TrackSummary) {
+                if ((triple & 0b011U) != 0) {
+                    if (next_summary.first_left_nonzero
+                        == std::numeric_limits<std::size_t>::max()) {
+                        next_summary.first_left_nonzero = depth;
+                    }
+                    next_summary.last_left_nonzero = depth;
+                }
             }
+            const auto next_left = left_children.first + (offsets & 0b11U);
+            const auto next_right = right_children.first + ((offsets >> 2U) & 0b11U);
+            if (children_are_leaves) {
+                bool leaf_allowed = ancestry_allowed;
+                if constexpr (GateLocation == PairGateLocation::Leaf) {
+                    if (parent_gate_cursor >= parent_gate->size()) {
+                        throw std::logic_error(
+                            "pair gate ended before its DFS enumeration");
+                    }
+                    leaf_allowed = parent_gate->get(parent_gate_cursor++);
+                }
+                if constexpr (CountStats) ++pair_states_;
+                if constexpr (VisitRejected) {
+                    if constexpr (CountStats) ++pair_leaves_;
+                    if constexpr (TrackSummary) {
+                        leaf_callback(next_left, next_right, history, leaf_allowed,
+                                      next_summary);
+                    } else {
+                        leaf_callback(next_left, next_right, history, leaf_allowed);
+                    }
+                } else if (leaf_allowed) {
+                    if constexpr (CountStats) ++pair_leaves_;
+                    if constexpr (TrackSummary) {
+                        leaf_callback(next_left, next_right, history, true, next_summary);
+                    } else {
+                        leaf_callback(next_left, next_right, history, true);
+                    }
+                }
+            } else {
+                candidate_pair_dfs<CountStats, VisitRejected, TrackSummary,
+                                   GateLocation>(
+                    left, right, next_left, next_right,
+                    depth + 1, history, parent_gate,
+                    parent_gate_cursor, ancestry_allowed, next_summary, leaf_callback);
+            }
+            active = static_cast<std::uint8_t>(active & (active - 1U));
         }
     }
 
-    template<class LeafCallback>
+    template<bool VisitRejected = true, bool TrackSummary = false,
+             class LeafCallback>
     void walk_candidate_pairs(std::size_t position, LeafCallback&& leaf_callback) {
         const auto& left = slices_.at(position);
         const auto& right = slices_.at(position + 1U);
@@ -936,21 +1040,38 @@ private:
             throw std::logic_error("neighboring slice trees have different depths");
         }
         const PairGate* parent_gate = nullptr;
-        std::size_t parent_depth = 0;
         if (pair_gates_ready_) {
             parent_gate = &pair_gates_.at(position);
-            parent_depth = pair_gate_depth_;
-            if (parent_depth > left.depth()) {
+            if (pair_gate_depth_ > left.depth()) {
                 throw std::logic_error("pair gate is deeper than its slice trees");
             }
         }
 
         std::uint64_t cursor = 0;
-        std::vector<std::uint8_t> history;
-        history.reserve(left.depth());
+        std::vector<std::uint8_t> history(left.depth());
         auto callback = std::forward<LeafCallback>(leaf_callback);
-        candidate_pair_dfs(left, right, 0, 0, 0, history, parent_gate,
-                           parent_depth, cursor, true, callback);
+        auto run = [&]<bool CountStats, PairGateLocation GateLocation>() {
+            candidate_pair_dfs<CountStats, VisitRejected, TrackSummary,
+                               GateLocation>(
+                left, right, 0, 0, 0, history, parent_gate,
+                cursor, true, PairPathSummary{}, callback);
+        };
+        auto run_for_gate = [&]<PairGateLocation GateLocation>() {
+            if (options_.verbose) {
+                run.template operator()<true, GateLocation>();
+            } else {
+                run.template operator()<false, GateLocation>();
+            }
+        };
+        if (parent_gate == nullptr) {
+            run_for_gate.template operator()<PairGateLocation::None>();
+        } else if (pair_gate_depth_ + 1U == left.depth()) {
+            run_for_gate.template operator()<PairGateLocation::ParentOfLeaf>();
+        } else if (pair_gate_depth_ == left.depth()) {
+            run_for_gate.template operator()<PairGateLocation::Leaf>();
+        } else {
+            throw std::logic_error("pair gate is not on the current or parent leaf level");
+        }
         if (parent_gate != nullptr && cursor != parent_gate->size()) {
             throw std::logic_error("pair gate has bits beyond its DFS enumeration");
         }
@@ -962,9 +1083,10 @@ private:
             throw std::logic_error("current pair gates are unavailable");
         }
         auto callback = std::forward<LeafCallback>(leaf_callback);
-        walk_candidate_pairs(position,
-            [&](Node left_leaf, Node right_leaf, const auto& history, bool allowed) {
-                if (allowed) callback(left_leaf, right_leaf, history);
+        walk_candidate_pairs<false, true>(position,
+            [&](Node left_leaf, Node right_leaf, const auto& history, bool allowed,
+                const PairPathSummary& summary) {
+                if (allowed) callback(left_leaf, right_leaf, history, summary);
             });
     }
 
@@ -976,35 +1098,139 @@ private:
         for (const auto& slice : slices_) normal.emplace_back(slice.node_count());
         account_tags(normal);
 
+        const auto bcaf_window = 2U * static_cast<std::size_t>(geometry_.period) + 1U;
+        const bool bcaf_active = options_.bcaf && height_ >= bcaf_window;
+        std::vector<TagPair> witness;
+        if (bcaf_active) {
+            witness.reserve(slices_.size());
+            for (const auto& slice : slices_) witness.emplace_back(slice.node_count());
+            peak_tag_bytes_ = std::max(
+                peak_tag_bytes_, tag_bytes(normal) + tag_bytes(witness));
+        }
+
         // The two planes remain pure boundary reachability.  Pair-gate bits
         // ensure that a compatibility removed at an earlier height cannot be
         // recreated merely because both endpoint slices still exist.
         mark_boundary(slices_.front(), options_.left_edge, true, normal.front()[0]);
         mark_boundary(slices_.back(), options_.right_edge, false, normal.back()[1]);
-        phase("  relation sweep: left to right");
-        for (std::size_t i = 0; i < adjacency_count; ++i) {
-            normal[i + 1U][0].clear();
-            walk_candidate_pairs(i,
-                [&](Node left_leaf, Node right_leaf, const auto&, bool ancestry_allowed) {
-                    if (ancestry_allowed && normal[i][0].get(left_leaf)) {
-                        normal[i + 1U][0].set(right_leaf);
-                    }
-                });
-        }
-        phase("  relation sweep: right to left");
-        for (std::size_t i = adjacency_count; i > 0; --i) {
-            normal[i - 1U][1].clear();
-            walk_candidate_pairs(i - 1U,
-                [&](Node left_leaf, Node right_leaf, const auto&, bool ancestry_allowed) {
-                    if (ancestry_allowed && normal[i][1].get(right_leaf)) {
-                        normal[i - 1U][1].set(left_leaf);
-                    }
-                });
+        std::vector<TagPair> clean;
+        if (bcaf_active) {
+            // Right reachability is sufficient to build the suffix witness:
+            // once a left-to-right path reaches such a node, its witnessed
+            // suffix completes a full path.  Symmetrically, left reachability
+            // is sufficient for the prefix witness.  Computing the two in
+            // dependency order lets the normal left-to-right sweep also be the
+            // BCAF prefix and cleanup sweep.
+            auto seed_suffix = [&](std::size_t position) {
+                walk_leaves(slices_[position],
+                    [&](Node leaf, std::size_t first_nonzero, std::size_t) {
+                        if (normal[position][1].get(leaf)
+                            && first_nonzero < bcaf_window) {
+                            witness[position][1].set(leaf);
+                        }
+                    });
+            };
+
+            phase("  relation sweep: right to left + bcaf suffix");
+            seed_suffix(slices_.size() - 1U);
+            for (std::size_t i = adjacency_count; i > 0; --i) {
+                normal[i - 1U][1].clear();
+                walk_candidate_pairs<false>(i - 1U,
+                    [&](Node left_leaf, Node right_leaf, const auto&,
+                        bool ancestry_allowed) {
+                        const bool reaches_right = ancestry_allowed
+                            && normal[i][1].get(right_leaf);
+                        if (reaches_right) {
+                            normal[i - 1U][1].set(left_leaf);
+                            if (witness[i][1].get(right_leaf)) {
+                                witness[i - 1U][1].set(left_leaf);
+                            }
+                        }
+                    });
+                seed_suffix(i - 1U);
+            }
+
+            clean.reserve(slices_.size());
+            for (const auto& slice : slices_) clean.emplace_back(slice.node_count());
+            peak_tag_bytes_ = std::max(
+                peak_tag_bytes_,
+                tag_bytes(normal) + tag_bytes(witness) + tag_bytes(clean));
+
+            auto seed_prefix = [&](std::size_t position) {
+                walk_leaves(slices_[position],
+                    [&](Node leaf, std::size_t first_nonzero, std::size_t) {
+                        if (normal[position][0].get(leaf)
+                            && first_nonzero < bcaf_window) {
+                            witness[position][0].set(leaf);
+                        }
+                    });
+            };
+
+            seed_prefix(0);
+            for (Node leaf = slices_.front().leaf_begin();
+                 leaf < slices_.front().leaf_end(); ++leaf) {
+                if (normal.front()[0].get(leaf)
+                    && normal.front()[1].get(leaf)) {
+                    clean.front()[0].set(leaf);
+                }
+            }
+
+            phase("  relation sweep: left to right + bcaf prefix/cleanup");
+            for (std::size_t i = 0; i < adjacency_count; ++i) {
+                normal[i + 1U][0].clear();
+                walk_candidate_pairs<false>(i,
+                    [&](Node left_leaf, Node right_leaf, const auto&,
+                        bool ancestry_allowed) {
+                        const bool reaches_left = ancestry_allowed
+                            && normal[i][0].get(left_leaf);
+                        if (reaches_left) {
+                            normal[i + 1U][0].set(right_leaf);
+                        }
+                        const bool normal_edge = reaches_left
+                            && normal[i + 1U][1].get(right_leaf);
+                        const bool interesting_prefix = witness[i][0].get(left_leaf);
+                        if (normal_edge && interesting_prefix) {
+                            witness[i + 1U][0].set(right_leaf);
+                        }
+                        const bool interesting_path = interesting_prefix
+                            || witness[i + 1U][1].get(right_leaf);
+                        if (normal_edge && interesting_path
+                            && clean[i][0].get(left_leaf)) {
+                            clean[i + 1U][0].set(right_leaf);
+                        }
+                    });
+                seed_prefix(i + 1U);
+            }
+        } else {
+            phase("  relation sweep: left to right");
+            for (std::size_t i = 0; i < adjacency_count; ++i) {
+                normal[i + 1U][0].clear();
+                walk_candidate_pairs<false>(i,
+                    [&](Node left_leaf, Node right_leaf, const auto&,
+                        bool ancestry_allowed) {
+                        if (ancestry_allowed && normal[i][0].get(left_leaf)) {
+                            normal[i + 1U][0].set(right_leaf);
+                        }
+                    });
+            }
+
+            phase("  relation sweep: right to left");
+            for (std::size_t i = adjacency_count; i > 0; --i) {
+                normal[i - 1U][1].clear();
+                walk_candidate_pairs<false>(i - 1U,
+                    [&](Node left_leaf, Node right_leaf, const auto&,
+                        bool ancestry_allowed) {
+                        if (ancestry_allowed && normal[i][1].get(right_leaf)) {
+                            normal[i - 1U][1].set(left_leaf);
+                        }
+                    });
+            }
         }
 
         auto normally_live = [&](std::size_t position, Node leaf) {
             return normal[position][0].get(leaf) && normal[position][1].get(leaf);
         };
+
         if (normal.front()[0].count(slices_.front().leaf_begin(), slices_.front().leaf_end()) == 0
             || normal.front()[1].count(slices_.front().leaf_begin(), slices_.front().leaf_end()) == 0) {
             return false;
@@ -1013,86 +1239,21 @@ private:
         std::vector<PairGate> next_gates(adjacency_count);
         bool slices_reified = false;
 
-        const auto bcaf_window = 2U * static_cast<std::size_t>(geometry_.period) + 1U;
-        if (options_.bcaf && height_ >= bcaf_window) {
+        if (bcaf_active) {
             phase("  bcaf relation gate");
-            std::vector<TagPair> witness;
-            witness.reserve(slices_.size());
-            for (const auto& slice : slices_) witness.emplace_back(slice.node_count());
-            peak_tag_bytes_ = std::max(
-                peak_tag_bytes_, tag_bytes(normal) + tag_bytes(witness));
-
-            // Plane 0: an interesting prefix reaches this node.
-            // Plane 1: an interesting suffix leaves this node.
-            for (std::size_t i = 0; i < slices_.size(); ++i) {
-                walk_leaves(slices_[i], [&](Node leaf, const auto& labels) {
-                    if (normally_live(i, leaf)
-                        && labels_prefix_interesting(labels, bcaf_window)) {
-                        witness[i][0].set(leaf);
-                        witness[i][1].set(leaf);
-                    }
-                });
-            }
-            for (std::size_t i = 0; i < adjacency_count; ++i) {
-                walk_candidate_pairs(i,
-                    [&](Node left_leaf, Node right_leaf, const auto&, bool ancestry_allowed) {
-                        const bool normal_edge = ancestry_allowed
-                            && normal[i][0].get(left_leaf)
-                            && normal[i + 1U][1].get(right_leaf);
-                        if (normal_edge && witness[i][0].get(left_leaf)) {
-                            witness[i + 1U][0].set(right_leaf);
-                        }
-                    });
-            }
-            for (std::size_t i = adjacency_count; i > 0; --i) {
-                walk_candidate_pairs(i - 1U,
-                    [&](Node left_leaf, Node right_leaf, const auto&, bool ancestry_allowed) {
-                        const bool normal_edge = ancestry_allowed
-                            && normal[i - 1U][0].get(left_leaf)
-                            && normal[i][1].get(right_leaf);
-                        if (normal_edge && witness[i][1].get(right_leaf)) {
-                            witness[i - 1U][1].set(left_leaf);
-                        }
-                    });
-            }
 
             // Keeping a full temporary BCAF relation tape here makes it overlap
             // both the old and the newly produced persistent tapes.  Retain the
-            // two witness planes instead and recompute the inexpensive edge
-            // predicate during the three already-required cleanup/final walks.
-            // This costs two more tag bits per expanded node, but removes one
-            // bit for every compatible neighboring leaf pair -- a much larger
-            // term in broad searches.
-            std::vector<TagPair> clean;
-            clean.reserve(slices_.size());
-            for (const auto& slice : slices_) clean.emplace_back(slice.node_count());
-            peak_tag_bytes_ = std::max(
-                peak_tag_bytes_,
-                tag_bytes(normal) + tag_bytes(witness) + tag_bytes(clean));
-            for (Node leaf = slices_.front().leaf_begin();
-                 leaf < slices_.front().leaf_end(); ++leaf) {
-                if (normally_live(0, leaf)) clean.front()[0].set(leaf);
-            }
-            for (std::size_t i = 0; i < adjacency_count; ++i) {
-                walk_candidate_pairs(i,
-                    [&](Node left_leaf, Node right_leaf, const auto&, bool ancestry_allowed) {
-                        const bool normal_edge = ancestry_allowed
-                            && normal[i][0].get(left_leaf)
-                            && normal[i + 1U][1].get(right_leaf);
-                        const bool interesting_path = witness[i][0].get(left_leaf)
-                            || witness[i + 1U][1].get(right_leaf);
-                        const bool edge = normal_edge && interesting_path;
-                        if (edge && clean[i][0].get(left_leaf)) {
-                            clean[i + 1U][0].set(right_leaf);
-                        }
-                    });
-            }
+            // two witness planes and recompute the inexpensive edge predicate
+            // during cleanup/final walks.  This costs two more tag bits per
+            // expanded node, but removes one bit for every compatible
+            // neighboring leaf pair -- a much larger term in broad searches.
             for (Node leaf = slices_.back().leaf_begin();
                  leaf < slices_.back().leaf_end(); ++leaf) {
                 if (clean.back()[0].get(leaf)) clean.back()[1].set(leaf);
             }
             for (std::size_t i = adjacency_count; i > 0; --i) {
-                walk_candidate_pairs(i - 1U,
+                walk_candidate_pairs<false>(i - 1U,
                     [&](Node left_leaf, Node right_leaf, const auto&, bool ancestry_allowed) {
                         const bool normal_edge = ancestry_allowed
                             && normal[i - 1U][0].get(left_leaf)
@@ -1182,26 +1343,41 @@ private:
 
     template<class LeafCallback>
     void leaf_dfs(const SuccinctSliceTree& tree, Node node, std::size_t depth,
-                  std::vector<std::uint8_t>& lineage, LeafCallback& callback) const {
+                  std::size_t first_nonzero, std::size_t last_nonzero,
+                  std::vector<Node>& child_cursor,
+                  LeafCallback& callback) const {
         if (depth == tree.depth()) {
-            callback(node, lineage);
+            callback(node, first_nonzero, last_nonzero);
             return;
         }
         const auto mask = tree.child_mask(node);
+        auto child = child_cursor[depth];
+        child_cursor[depth] += static_cast<Node>(std::popcount(mask));
         for (std::uint8_t label = 0; label < 4; ++label) {
             if ((mask & (1U << label)) == 0) continue;
-            lineage.push_back(label);
-            leaf_dfs(tree, tree.child(node, label), depth + 1, lineage, callback);
-            lineage.pop_back();
+            const auto next = child++;
+            auto next_first = first_nonzero;
+            auto next_last = last_nonzero;
+            if (label != 0) {
+                if (next_first == std::numeric_limits<std::size_t>::max()) {
+                    next_first = depth;
+                }
+                next_last = depth;
+            }
+            leaf_dfs(tree, next, depth + 1, next_first, next_last,
+                     child_cursor, callback);
         }
     }
 
     template<class LeafCallback>
     void walk_leaves(const SuccinctSliceTree& tree, LeafCallback&& callback) const {
-        std::vector<std::uint8_t> lineage;
-        lineage.reserve(tree.depth());
         auto actual = std::forward<LeafCallback>(callback);
-        leaf_dfs(tree, 0, 0, lineage, actual);
+        constexpr auto none = std::numeric_limits<std::size_t>::max();
+        std::vector<Node> child_cursor(tree.depth());
+        for (std::size_t depth = 0; depth < tree.depth(); ++depth) {
+            child_cursor[depth] = tree.level_begin(depth + 1U);
+        }
+        leaf_dfs(tree, 0, 0, none, none, child_cursor, actual);
     }
 
     static bool labels_interesting(const std::vector<std::uint8_t>& labels,
@@ -1219,38 +1395,6 @@ private:
                            [](std::uint8_t label) { return label != 0; });
     }
 
-    static bool triples_interesting(const std::vector<std::uint8_t>& triples,
-                                    std::size_t window, bool left_slice) {
-        if (triples.size() < window) return false;
-        const std::uint8_t mask = left_slice ? 0b011U : 0b110U;
-        return std::any_of(triples.end() - static_cast<std::ptrdiff_t>(window), triples.end(),
-                           [mask](std::uint8_t triple) { return (triple & mask) != 0; });
-    }
-
-    static bool triples_prefix_interesting(const std::vector<std::uint8_t>& triples,
-                                           std::size_t window, bool left_slice) {
-        if (triples.size() < window) return false;
-        const std::uint8_t mask = left_slice ? 0b011U : 0b110U;
-        return std::any_of(triples.begin(),
-                           triples.begin() + static_cast<std::ptrdiff_t>(window),
-                           [mask](std::uint8_t triple) { return (triple & mask) != 0; });
-    }
-
-    static bool labels_tail_zero(const std::vector<std::uint8_t>& labels,
-                                 std::size_t window) {
-        if (labels.size() < window) return false;
-        return std::all_of(labels.end() - static_cast<std::ptrdiff_t>(window), labels.end(),
-                           [](std::uint8_t label) { return label == 0; });
-    }
-
-    static bool triples_tail_zero(const std::vector<std::uint8_t>& triples,
-                                  std::size_t window, bool left_slice) {
-        if (triples.size() < window) return false;
-        const std::uint8_t mask = left_slice ? 0b011U : 0b110U;
-        return std::all_of(triples.end() - static_cast<std::ptrdiff_t>(window), triples.end(),
-                           [mask](std::uint8_t triple) { return (triple & mask) == 0; });
-    }
-
     std::optional<Board> find_completion() {
         const auto short_window = 2U * static_cast<std::size_t>(geometry_.period);
         const auto long_window = short_window + 1U;
@@ -1261,27 +1405,35 @@ private:
         for (const auto& slice : slices_) suffix.emplace_back(slice.node_count());
         account_tags(suffix);
 
-        walk_leaves(slices_.back(), [&](Node leaf, const auto& labels) {
-            const bool valid = labels_tail_zero(labels, short_window);
+        const auto short_start = height_ - short_window;
+        const auto long_start = height_ - long_window;
+        walk_leaves(slices_.back(), [&](Node leaf, std::size_t,
+                                        std::size_t last_nonzero) {
+            const bool valid = last_nonzero == std::numeric_limits<std::size_t>::max()
+                || last_nonzero < short_start;
             if (valid) suffix.back()[0].set(leaf);
-            if (valid && labels_interesting(labels, long_window)) suffix.back()[1].set(leaf);
+            if (valid && last_nonzero != std::numeric_limits<std::size_t>::max()
+                && last_nonzero >= long_start) {
+                suffix.back()[1].set(leaf);
+            }
         });
-        slices_.back().close_from_leaves(suffix.back()[0]);
-        slices_.back().close_from_leaves(suffix.back()[1]);
 
         for (std::size_t i = slices_.size() - 1; i > 0; --i) {
             walk_current_edges(i - 1U,
-                [&](Node left_leaf, Node right_leaf, const auto& triples) {
+                [&](Node left_leaf, Node right_leaf, const auto&,
+                    const PairPathSummary& summary) {
+                    const auto last = summary.last_left_nonzero;
+                    const bool zero_tail = last == std::numeric_limits<std::size_t>::max()
+                        || last < short_start;
                     if (!suffix[i][0].get(right_leaf)
-                        || !triples_tail_zero(triples, short_window, true)) return;
+                        || !zero_tail) return;
                     suffix[i - 1][0].set(left_leaf);
                     if (suffix[i][1].get(right_leaf)
-                        || triples_interesting(triples, long_window, true)) {
+                        || (last != std::numeric_limits<std::size_t>::max()
+                            && last >= long_start)) {
                         suffix[i - 1][1].set(left_leaf);
                     }
                 });
-            slices_[i - 1].close_from_leaves(suffix[i - 1][0]);
-            slices_[i - 1].close_from_leaves(suffix[i - 1][1]);
         }
 
         Node first = slices_.front().leaf_end();
@@ -1302,7 +1454,7 @@ private:
         std::vector<std::uint8_t> result_labels;
         auto actual = std::forward<Predicate>(predicate);
         walk_current_edges(position,
-            [&](Node candidate_left, Node candidate_right, const auto&) {
+            [&](Node candidate_left, Node candidate_right, const auto&, const auto&) {
                 if (result != slices_[position + 1U].leaf_end()
                     || candidate_left != left_leaf) return;
                 auto labels = slices_[position + 1U].lineage(candidate_right);
@@ -1349,19 +1501,19 @@ private:
         for (const auto& slice : slices_) suffix.emplace_back(slice.node_count());
         account_tags(suffix);
 
-        walk_leaves(slices_.back(), [&](Node leaf, const auto& labels) {
-            if (labels_prefix_interesting(labels, window)) suffix.back()[0].set(leaf);
+        walk_leaves(slices_.back(), [&](Node leaf, std::size_t first_nonzero,
+                                        std::size_t) {
+            if (first_nonzero < window) suffix.back()[0].set(leaf);
         });
-        slices_.back().close_from_leaves(suffix.back()[0]);
         for (std::size_t i = slices_.size() - 1; i > 0; --i) {
             walk_current_edges(i - 1U,
-                [&](Node left_leaf, Node right_leaf, const auto& triples) {
+                [&](Node left_leaf, Node right_leaf, const auto&,
+                    const PairPathSummary& summary) {
                     if (suffix[i][0].get(right_leaf)
-                        || triples_prefix_interesting(triples, window, true)) {
+                        || summary.first_left_nonzero < window) {
                         suffix[i - 1][0].set(left_leaf);
                     }
                 });
-            slices_[i - 1].close_from_leaves(suffix[i - 1][0]);
         }
 
         Node first = slices_.front().leaf_end();
@@ -1609,7 +1761,8 @@ private:
         const auto lookup_bytes = rule_.storage_bytes()
             + row_acceptance_.size() * sizeof(row_acceptance_[0])
             + odd_edge_acceptance_.size() * sizeof(odd_edge_acceptance_[0])
-            + even_edge_acceptance_.size() * sizeof(even_edge_acceptance_[0]);
+            + even_edge_acceptance_.size() * sizeof(even_edge_acceptance_[0])
+            + pair_transitions_.size() * sizeof(pair_transitions_[0]);
         const auto persistent_payload_bytes = allocated + pair_gate_bytes + lookup_bytes;
         std::ostringstream line;
         if (options_.verbose) {
@@ -1652,6 +1805,8 @@ private:
     std::array<std::uint8_t, 1U << 15U> row_acceptance_{};
     std::array<std::uint8_t, 1U << 10U> odd_edge_acceptance_{};
     std::array<std::uint8_t, 1U << 10U> even_edge_acceptance_{};
+    std::array<PairTransitions, 1U << 8U> pair_transitions_{};
+    std::array<std::size_t, 5> pair_history_offsets_{};
     std::size_t width_ = 0;
     std::size_t height_ = 0;
     std::vector<SuccinctSliceTree> slices_;
