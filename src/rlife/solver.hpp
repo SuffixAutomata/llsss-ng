@@ -13,6 +13,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <regex>
@@ -114,6 +115,7 @@ struct Options {
     std::string partial_output;
     std::string stats_output;
     bool verbose = false;
+    bool phase_timings = false;
 };
 
 // One bit for each CA-compatible neighboring leaf pair in deterministic
@@ -182,6 +184,7 @@ Orthogonal fixed-width LLSSS using succinct two-column slice trees.
   --partial-output FILE      write RLE partials/completions to FILE
   --dump-slice-stats FILE    append per-height succinct-slice statistics
   --phase-progress           print individual sweep phases
+  --phase-timings            print final cumulative timings per phase
   --verbose                  verbose information at every row
   --threads N                reserved for future parallel DFS (currently serial)
   -h, --help                 show this help
@@ -298,6 +301,8 @@ inline Options parse_cli(int argc, char** argv) {
             options.stats_output = argument(current);
         } else if (current == "--phase-progress") {
             options.phase_progress = true;
+        } else if (current == "--phase-timings") {
+            options.phase_timings = true;
         } else if (current == "--verbose") {
             options.verbose = true;
         } else if (current == "--threads") {
@@ -363,6 +368,12 @@ public:
             }
         }
         initialize();
+    }
+
+    ~Solver() {
+        if (options_.phase_timings)
+            for (auto [phase, seconds] : phase_timings_)
+                std::cerr << phase << " >> " << std::fixed << std::setprecision(6) << seconds << '\n';
     }
 
     int run() {
@@ -1696,9 +1707,21 @@ private:
         }
     }
 
-    void phase(std::string_view message) const {
-        if (running_ && options_.phase_progress) {
-            std::cout << "height=" << height_ << " " << message << '\n';
+    void phase(std::string_view message) {
+        if (running_) {
+            if (options_.phase_progress)
+                std::cout << "height=" << height_ << " " << message << '\n';
+            if (options_.phase_timings) {
+                static std::string last_phase;
+                auto current = Clock::now();
+                static decltype(current) last_timing;
+                if (last_phase.size()) {
+                    const auto seconds = std::chrono::duration<double>(current - last_timing).count();
+                    phase_timings_[last_phase] += seconds;
+                }
+                last_phase = message;
+                last_timing = current;
+            }
         }
     }
 
@@ -1820,6 +1843,8 @@ private:
     std::uint64_t boundary_states_ = 0;
     std::size_t peak_tag_bytes_ = 0;
     bool running_ = false;
+
+    std::map<std::string, double> phase_timings_;
 };
 
 } // namespace rlife::llsss
