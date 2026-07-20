@@ -125,12 +125,13 @@ are released. The persistent gate is the minimum correlation state needed to
 prevent a rejected pair from reappearing merely because both unary slice nodes
 survive; it has no endpoint records.
 
-End detection uses two temporary leaf suffix tags (valid and interesting).
-Internal closure is unnecessary because the uncached synchronized traversal
-consults those tags only at candidate leaves. Partial and completion
-reconstruction rescan the compact relation gate to choose one allowed
-successor at a time, so they need neither parent IDs nor cached join endpoints.
-An additional `O(all nodes)` scan per recovered slice is intentional.
+End detection uses two temporary leaf suffix tags (valid and interesting), and
+BCAF partial reconstruction uses one.  Under BCAF these tags are propagated by
+the existing reverse cleanup walk, then the existing forward gate-emission walk
+chooses and saves the corresponding lineages before reification changes node
+IDs.  Thus partial and completion reconstruction add no pair-tree traversals.
+The non-BCAF fallback still rescans the compact relation gate and needs neither
+parent IDs nor cached join endpoints.
 
 This version is serial. Pair-tree traversal is isolated from mutation of the
 persistent tries, leaving its top-level branch work suitable for later

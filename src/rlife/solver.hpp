@@ -428,6 +428,7 @@ public:
 
             if (options_.partial_mode == PartialMode::Every
                 && height_ % static_cast<std::size_t>(options_.partial_every) == 0) {
+                phase("partial reconstruction/output");
                 emit_board(reconstruct_partial(), "partial");
             }
 
@@ -1103,6 +1104,9 @@ private:
 
     bool prune_supported() {
         if (slices_.empty()) return false;
+        cached_partial_.reset();
+        cached_completion_.reset();
+        cached_completion_height_ = std::numeric_limits<std::size_t>::max();
         const auto adjacency_count = slices_.size() - 1U;
         std::vector<TagPair> normal;
         normal.reserve(slices_.size());
@@ -1253,6 +1257,40 @@ private:
         if (bcaf_active) {
             phase("  bcaf relation gate");
 
+            const bool cache_partial =
+                (options_.partial_mode == PartialMode::Every
+                 && height_ % static_cast<std::size_t>(options_.partial_every) == 0)
+                || (options_.partial_mode != PartialMode::None
+                    && options_.halt_height >= 0
+                    && height_ >= static_cast<std::size_t>(options_.halt_height));
+            const bool cache_completion = options_.detect_ends;
+            std::vector<PackedTags> partial_suffix;
+            std::vector<TagPair> completion_suffix;
+            if (cache_partial) {
+                partial_suffix.reserve(slices_.size());
+                for (const auto& slice : slices_) {
+                    partial_suffix.emplace_back(slice.node_count());
+                }
+            }
+            if (cache_completion) {
+                completion_suffix.reserve(slices_.size());
+                for (const auto& slice : slices_) {
+                    completion_suffix.emplace_back(slice.node_count());
+                }
+            }
+            std::size_t reconstruction_tag_bytes = 0;
+            for (const auto& tags : partial_suffix) {
+                reconstruction_tag_bytes += tags.allocated_bytes();
+            }
+            peak_tag_bytes_ = std::max(
+                peak_tag_bytes_, tag_bytes(normal) + tag_bytes(witness)
+                    + tag_bytes(clean) + tag_bytes(completion_suffix)
+                    + reconstruction_tag_bytes);
+
+            const auto short_window = 2U * static_cast<std::size_t>(geometry_.period);
+            const auto short_start = height_ - short_window;
+            const auto long_start = height_ - bcaf_window;
+
             // Keeping a full temporary BCAF relation tape here makes it overlap
             // both the old and the newly produced persistent tapes.  Retain the
             // two witness planes and recompute the inexpensive edge predicate
@@ -1263,25 +1301,121 @@ private:
                  leaf < slices_.back().leaf_end(); ++leaf) {
                 if (clean.back()[0].get(leaf)) clean.back()[1].set(leaf);
             }
-            for (std::size_t i = adjacency_count; i > 0; --i) {
-                walk_candidate_pairs<false>(i - 1U,
-                    [&](Node left_leaf, Node right_leaf, const auto&, bool ancestry_allowed) {
-                        const bool normal_edge = ancestry_allowed
-                            && normal[i - 1U][0].get(left_leaf)
-                            && normal[i][1].get(right_leaf);
-                        const bool interesting_path = witness[i - 1U][0].get(left_leaf)
-                            || witness[i][1].get(right_leaf);
-                        const bool edge = normal_edge && interesting_path;
-                        if (edge && clean[i - 1U][0].get(left_leaf)
-                            && clean[i][1].get(right_leaf)) {
-                            clean[i - 1U][1].set(left_leaf);
+            if (cache_partial || cache_completion) {
+                walk_leaves(slices_.back(), [&](Node leaf, std::size_t first_nonzero,
+                                                std::size_t last_nonzero) {
+                    if (!clean.back()[1].get(leaf)) return;
+                    if (cache_partial && first_nonzero < bcaf_window) {
+                        partial_suffix.back().set(leaf);
+                    }
+                    if (cache_completion) {
+                        const bool valid =
+                            last_nonzero == std::numeric_limits<std::size_t>::max()
+                            || last_nonzero < short_start;
+                        if (valid) completion_suffix.back()[0].set(leaf);
+                        if (valid
+                            && last_nonzero != std::numeric_limits<std::size_t>::max()
+                            && last_nonzero >= long_start) {
+                            completion_suffix.back()[1].set(leaf);
                         }
-                    });
+                    }
+                });
+            }
+            for (std::size_t i = adjacency_count; i > 0; --i) {
+                auto visit_edge = [&](Node left_leaf, Node right_leaf,
+                                      bool ancestry_allowed,
+                                      const PairPathSummary* summary) {
+                    const bool normal_edge = ancestry_allowed
+                        && normal[i - 1U][0].get(left_leaf)
+                        && normal[i][1].get(right_leaf);
+                    const bool interesting_path = witness[i - 1U][0].get(left_leaf)
+                        || witness[i][1].get(right_leaf);
+                    const bool edge = normal_edge && interesting_path;
+                    if (edge && clean[i - 1U][0].get(left_leaf)
+                        && clean[i][1].get(right_leaf)) {
+                        clean[i - 1U][1].set(left_leaf);
+                        if (cache_partial
+                            && (partial_suffix[i].get(right_leaf)
+                                || summary->first_left_nonzero < bcaf_window)) {
+                            partial_suffix[i - 1U].set(left_leaf);
+                        }
+                        if (cache_completion) {
+                            const auto last = summary->last_left_nonzero;
+                            const bool zero_tail =
+                                last == std::numeric_limits<std::size_t>::max()
+                                || last < short_start;
+                            if (completion_suffix[i][0].get(right_leaf)
+                                && zero_tail) {
+                                completion_suffix[i - 1U][0].set(left_leaf);
+                                if (completion_suffix[i][1].get(right_leaf)
+                                    || (last != std::numeric_limits<std::size_t>::max()
+                                        && last >= long_start)) {
+                                    completion_suffix[i - 1U][1].set(left_leaf);
+                                }
+                            }
+                        }
+                    }
+                };
+                if (cache_partial || cache_completion) {
+                    walk_candidate_pairs<false, true>(i - 1U,
+                        [&](Node left_leaf, Node right_leaf, const auto&,
+                            bool ancestry_allowed, const PairPathSummary& summary) {
+                            visit_edge(left_leaf, right_leaf, ancestry_allowed, &summary);
+                        });
+                } else {
+                    walk_candidate_pairs<false>(i - 1U,
+                        [&](Node left_leaf, Node right_leaf, const auto&,
+                            bool ancestry_allowed) {
+                            visit_edge(left_leaf, right_leaf, ancestry_allowed, nullptr);
+                        });
+                }
             }
 
             if (clean.front()[1].count(
                     slices_.front().leaf_begin(), slices_.front().leaf_end()) == 0) {
                 return false;
+            }
+
+            Node partial_current = slices_.front().leaf_end();
+            std::vector<std::vector<std::uint8_t>> partial_lineages;
+            bool partial_seen = false;
+            if (cache_partial) {
+                for (Node leaf = slices_.front().leaf_begin();
+                     leaf < slices_.front().leaf_end(); ++leaf) {
+                    if (partial_suffix.front().get(leaf)) {
+                        partial_current = leaf;
+                        break;
+                    }
+                }
+                if (partial_current == slices_.front().leaf_end()) {
+                    throw std::logic_error("bcaf-projected state has no interesting path");
+                }
+                partial_lineages.reserve(slices_.size());
+                partial_lineages.push_back(slices_.front().lineage(partial_current));
+                partial_seen = labels_prefix_interesting(
+                    partial_lineages.front(), bcaf_window);
+            }
+
+            Node completion_current = slices_.front().leaf_end();
+            std::vector<std::vector<std::uint8_t>> completion_lineages;
+            bool completion_seen = false;
+            bool completion_found = false;
+            if (cache_completion) {
+                for (Node leaf = slices_.front().leaf_begin();
+                     leaf < slices_.front().leaf_end(); ++leaf) {
+                    if (completion_suffix.front()[1].get(leaf)) {
+                        completion_current = leaf;
+                        completion_found = true;
+                        break;
+                    }
+                }
+                if (completion_found) {
+                    completion_lineages.reserve(slices_.size());
+                    completion_lineages.push_back(
+                        slices_.front().lineage(completion_current));
+                    completion_seen = labels_interesting(
+                        completion_lineages.front(), bcaf_window);
+                }
             }
 
             // Emit only bits whose endpoints survive reification.  Once gate i
@@ -1290,6 +1424,8 @@ private:
             // so the growing final gate tape does not overlap all expanded
             // slices and all six tag planes.
             for (std::size_t i = 0; i < adjacency_count; ++i) {
+                bool partial_selected = false;
+                bool completion_selected = false;
                 walk_candidate_pairs(i,
                     [&](Node left_leaf, Node right_leaf, const auto&, bool ancestry_allowed) {
                         const bool normal_edge = ancestry_allowed
@@ -1305,8 +1441,38 @@ private:
                                 && clean[i][0].get(left_leaf)
                                 && clean[i + 1U][1].get(right_leaf);
                             next_gates[i].push_back(final_edge);
+                            if (final_edge && cache_partial && !partial_selected
+                                && left_leaf == partial_current
+                                && (partial_seen
+                                    || partial_suffix[i + 1U].get(right_leaf))) {
+                                partial_current = right_leaf;
+                                partial_lineages.push_back(
+                                    slices_[i + 1U].lineage(right_leaf));
+                                partial_seen = partial_seen || labels_prefix_interesting(
+                                    partial_lineages.back(), bcaf_window);
+                                partial_selected = true;
+                            }
+                            const auto completion_plane = completion_seen ? 0U : 1U;
+                            if (final_edge && !completion_selected
+                                && completion_found
+                                && left_leaf == completion_current
+                                && completion_suffix[i + 1U][completion_plane].get(
+                                    right_leaf)) {
+                                completion_current = right_leaf;
+                                completion_lineages.push_back(
+                                    slices_[i + 1U].lineage(right_leaf));
+                                completion_seen = completion_seen || labels_interesting(
+                                    completion_lineages.back(), bcaf_window);
+                                completion_selected = true;
+                            }
                         }
                     });
+                if (cache_partial && !partial_selected) {
+                    throw std::logic_error("interesting-path reconstruction lost its edge");
+                }
+                if (completion_found && !completion_selected) {
+                    throw std::logic_error("end reconstruction lost its edge");
+                }
                 if (pair_gates_ready_) pair_gates_[i] = PairGate{};
                 if (!slices_[i].reify(clean[i][1])) return false;
                 normal[i] = TagPair{};
@@ -1317,6 +1483,22 @@ private:
             normal.back() = TagPair{};
             witness.back() = TagPair{};
             clean.back() = TagPair{};
+            if (cache_partial) {
+                if (!partial_seen) {
+                    throw std::logic_error(
+                        "interesting-path reconstruction lost its witness");
+                }
+                cached_partial_ = board_from_lineages(partial_lineages);
+            }
+            if (cache_completion) {
+                cached_completion_height_ = height_;
+                if (completion_found) {
+                    if (!completion_seen) {
+                        throw std::logic_error("end reconstruction lost its witness");
+                    }
+                    cached_completion_ = board_from_lineages(completion_lineages);
+                }
+            }
             slices_reified = true;
         } else {
             for (std::size_t i = 0; i < adjacency_count; ++i) {
@@ -1407,6 +1589,7 @@ private:
     }
 
     std::optional<Board> find_completion() {
+        if (cached_completion_height_ == height_) return cached_completion_;
         const auto short_window = 2U * static_cast<std::size_t>(geometry_.period);
         const auto long_window = short_window + 1U;
         if (height_ < long_window) return std::nullopt;
@@ -1559,6 +1742,7 @@ private:
     }
 
     Board reconstruct_partial() {
+        if (cached_partial_) return *cached_partial_;
         const auto bcaf_window = 2U * static_cast<std::size_t>(geometry_.period) + 1U;
         if (options_.bcaf && height_ >= bcaf_window) {
             return reconstruct_interesting(bcaf_window);
@@ -1703,6 +1887,7 @@ private:
 
     void emit_final_partial(std::string_view kind) {
         if (options_.partial_mode != PartialMode::None && !slices_.empty()) {
+            phase("partial reconstruction/output");
             emit_board(reconstruct_partial(), kind);
         }
     }
@@ -1843,6 +2028,9 @@ private:
     std::uint64_t boundary_states_ = 0;
     std::size_t peak_tag_bytes_ = 0;
     bool running_ = false;
+    std::optional<Board> cached_partial_;
+    std::optional<Board> cached_completion_;
+    std::size_t cached_completion_height_ = std::numeric_limits<std::size_t>::max();
 
     std::map<std::string, double> phase_timings_;
 };
