@@ -6,14 +6,24 @@ LDFLAGS ?=
 
 TARGET := rlife_llsss
 SOURCES := src/main.cpp
+OBJECTS := src/main.o src/rlife/indexed_executor.o
 HEADERS := $(wildcard src/rlife/*.hpp)
 
-.PHONY: all clean
+.PHONY: all clean test
 
 all: $(TARGET)
 
-$(TARGET): $(SOURCES) $(HEADERS)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(NATIVE_FLAGS) -Isrc $(SOURCES) $(LDFLAGS) -o $@
+$(TARGET): $(OBJECTS)
+	$(CXX) $(OBJECTS) $(LDFLAGS) -fopenmp -o $@
+
+src/main.o: src/main.cpp $(HEADERS)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(NATIVE_FLAGS) -Isrc -c $< -o $@
+
+src/rlife/indexed_executor.o: src/rlife/indexed_executor.cpp src/rlife/indexed_executor.hpp
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(NATIVE_FLAGS) -fopenmp -Isrc -c $< -o $@
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET) $(OBJECTS)
+
+test: $(TARGET)
+	bash tests/parallel_regression.sh ./$(TARGET)

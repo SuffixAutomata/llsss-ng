@@ -133,6 +133,11 @@ IDs.  Thus partial and completion reconstruction add no pair-tree traversals.
 The non-BCAF fallback still rescans the compact relation gate and needs neither
 parent IDs nor cached join endpoints.
 
-This version is serial. Pair-tree traversal is isolated from mutation of the
-persistent tries, leaving its top-level branch work suitable for later
-parallelization. Autochoke is intentionally absent.
+Pair-tree traversal is isolated from mutation of the persistent tries. With
+`--threads N`, it first builds deterministic,
+work-balanced ranges over the synchronized DFS stream and then executes those
+ranges through a small OpenMP-backed indexed executor. The solver translation
+unit itself is compiled without OpenMP, so `--threads 1` retains the original
+recursive DFS. Parallel destination writes use dense private leaf planes and
+word-owned reductions; relation-gate segments are concatenated in DFS range
+order. Autochoke is intentionally absent.

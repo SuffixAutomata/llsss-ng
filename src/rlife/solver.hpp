@@ -1,9 +1,11 @@
 #pragma once
 
+#include "indexed_executor.hpp"
 #include "rule.hpp"
 #include "succinct_slice_tree.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cctype>
 #include <cstdlib>
@@ -21,6 +23,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -140,6 +143,23 @@ struct PairGate {
         }
         ++bit_count;
     }
+    void append(PairGate&& segment) {
+        if (segment.bit_count == 0) return;
+        if (bits.size() == 0 && segment.bits.size() == 0) {
+            bit_count += segment.bit_count;
+            return;
+        }
+        if (bits.size() == 0) {
+            bits.reset_size(bit_count);
+            bits.set_all();
+        }
+        if (segment.bits.size() == 0) {
+            bits.append_ones(segment.bit_count);
+        } else {
+            bits.append(segment.bits);
+        }
+        bit_count += segment.bit_count;
+    }
     [[nodiscard]] std::size_t allocated_bytes() const noexcept {
         return bits.allocated_bytes();
     }
@@ -186,7 +206,7 @@ Orthogonal fixed-width LLSSS using succinct two-column slice trees.
   --phase-progress           print individual sweep phases
   --phase-timings            print final cumulative timings per phase
   --verbose                  verbose information at every row
-  --threads N                reserved for future parallel DFS (currently serial)
+  --threads N                pair-tree traversal workers (default 1)
   -h, --help                 show this help
 
 The implementation has no autochoke and stores no join endpoints or join DAG.
@@ -387,9 +407,6 @@ public:
                   << " bcaf=" << (options_.bcaf ? "yes" : "no")
                   << " halt_on_ends=" << (options_.halt_on_ends ? "yes" : "no")
                   << '\n';
-        if (options_.reserved_threads != 1) {
-            std::cout << "note: --threads is reserved; this build runs synchronized DFS serially\n";
-        }
         running_ = true;
         print_stats("init", 0.0);
 
@@ -945,6 +962,503 @@ private:
         Leaf,
     };
 
+#ifndef RLIFE_PAIR_WORK_QUANTUM_LOG2
+#define RLIFE_PAIR_WORK_QUANTUM_LOG2 16
+#endif
+    static constexpr std::uint64_t pair_work_quantum_ =
+        std::uint64_t{1} << RLIFE_PAIR_WORK_QUANTUM_LOG2;
+
+    struct PlannedRange {
+        std::uint32_t coarse_root = 0;
+        std::uint32_t path_offset = 0;
+        std::uint16_t depth = 0;
+        std::uint64_t work = 0;
+        std::uint64_t gate_begin = 0;
+        std::uint64_t gate_count = 0;
+        PairPathSummary summary;
+    };
+
+    struct RootPlanningResult {
+        std::vector<PlannedRange> ranges;
+        std::vector<std::uint64_t> paths;
+        std::uint64_t work = 0;
+        std::uint64_t gate_count = 0;
+        std::uint64_t open_work = 0;
+        std::uint64_t open_gate_begin = 0;
+        bool range_open = false;
+    };
+
+    struct CoarseRoot {
+        Node left_node = 0;
+        Node right_node = 0;
+        std::uint32_t path_offset = 0;
+        std::uint16_t depth = 0;
+        std::uint64_t work = 0;
+        std::uint64_t gate_begin = 0;
+        std::uint64_t gate_count = 0;
+        RootPlanningResult planning;
+    };
+
+    struct PairTraversalPlan {
+        PairGateLocation gate_location = PairGateLocation::None;
+        std::size_t tree_depth = 0;
+        std::size_t words_per_path = 1;
+        std::vector<CoarseRoot> roots;
+        std::vector<PlannedRange> ranges;
+        std::vector<std::uint64_t> paths;
+        std::uint64_t total_work = 0;
+        std::uint64_t total_gates = 0;
+    };
+
+    struct FrontierState {
+        Node left_node = 0;
+        Node right_node = 0;
+        std::vector<std::uint8_t> positions;
+        std::vector<std::uint8_t> history;
+        bool expandable = true;
+    };
+
+    struct PairWalkFrame {
+        Node left_first = 0;
+        Node right_first = 0;
+        PairPathSummary summary;
+        std::uint8_t remaining = 0;
+        std::uint8_t transition_key = 0;
+    };
+
+    struct PairWalkScratch {
+        std::vector<std::uint8_t> history;
+        std::vector<PairWalkFrame> frames;
+    };
+
+    class WorkerLeafPlanes {
+    public:
+        void prepare(Node leaf_begin, Node leaf_end, std::size_t plane_count,
+                     std::size_t workers) {
+            base_word_ = static_cast<std::size_t>(leaf_begin >> 6U);
+            const auto end_word = static_cast<std::size_t>((leaf_end + 63U) >> 6U);
+            word_count_ = end_word - base_word_;
+            plane_count_ = plane_count;
+            workers_ = workers;
+            const auto required = plane_count_ * workers_ * word_count_;
+            words_.resize(required);
+            std::fill(words_.begin(), words_.end(), 0);
+        }
+
+        void set(std::size_t worker, std::size_t plane, Node leaf) noexcept {
+            const auto absolute_word = static_cast<std::size_t>(leaf >> 6U);
+            const auto word = absolute_word - base_word_;
+            words_[offset(plane, worker, word)]
+                |= std::uint64_t{1} << (leaf & 63U);
+        }
+
+        [[nodiscard]] bool get(std::size_t worker, std::size_t plane,
+                               Node leaf) const noexcept {
+            const auto absolute_word = static_cast<std::size_t>(leaf >> 6U);
+            const auto word = absolute_word - base_word_;
+            return ((words_[offset(plane, worker, word)] >> (leaf & 63U))
+                    & 1U) != 0;
+        }
+
+        void set_two_bit_max(std::size_t worker, std::size_t low_plane,
+                             Node leaf, std::uint8_t value) noexcept {
+            const auto current = static_cast<std::uint8_t>(
+                get(worker, low_plane, leaf)
+                | (get(worker, low_plane + 1U, leaf) << 1U));
+            if (value <= current) return;
+            const auto absolute_word = static_cast<std::size_t>(leaf >> 6U);
+            const auto word = absolute_word - base_word_;
+            const auto mask = std::uint64_t{1} << (leaf & 63U);
+            auto& low = words_[offset(low_plane, worker, word)];
+            auto& high = words_[offset(low_plane + 1U, worker, word)];
+            low = (value & 1U) != 0 ? low | mask : low & ~mask;
+            high = (value & 2U) != 0 ? high | mask : high & ~mask;
+        }
+
+        [[nodiscard]] std::uint64_t word(std::size_t plane,
+                                         std::size_t worker,
+                                         std::size_t index) const noexcept {
+            return words_[offset(plane, worker, index)];
+        }
+
+        [[nodiscard]] std::size_t base_word() const noexcept { return base_word_; }
+        [[nodiscard]] std::size_t word_count() const noexcept { return word_count_; }
+        [[nodiscard]] std::size_t workers() const noexcept { return workers_; }
+
+    private:
+        [[nodiscard]] std::size_t offset(std::size_t plane, std::size_t worker,
+                                         std::size_t word) const noexcept {
+            return (plane * workers_ + worker) * word_count_ + word;
+        }
+
+        std::size_t base_word_ = 0;
+        std::size_t word_count_ = 0;
+        std::size_t plane_count_ = 0;
+        std::size_t workers_ = 0;
+        std::vector<std::uint64_t> words_;
+    };
+
+    static void update_pair_summary(PairPathSummary& summary,
+                                    std::uint8_t triple,
+                                    std::size_t depth) noexcept {
+        if ((triple & 0b011U) == 0) return;
+        if (summary.first_left_nonzero
+            == std::numeric_limits<std::size_t>::max()) {
+            summary.first_left_nonzero = depth;
+        }
+        summary.last_left_nonzero = depth;
+    }
+
+    static std::uint32_t append_compressed_path(
+        std::vector<std::uint64_t>& output, std::size_t words_per_path,
+        const std::vector<std::uint8_t>& positions, std::size_t depth) {
+        if (output.size() > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::overflow_error("parallel pair-plan path storage is too large");
+        }
+        const auto offset = static_cast<std::uint32_t>(output.size());
+        output.resize(output.size() + words_per_path, 0);
+        for (std::size_t i = 0; i < depth; ++i) {
+            const auto bit = i * 3U;
+            output[offset + bit / 64U] |=
+                static_cast<std::uint64_t>(positions[i]) << (bit & 63U);
+            if ((bit & 63U) > 61U) {
+                output[offset + bit / 64U + 1U] |=
+                    static_cast<std::uint64_t>(positions[i])
+                    >> (64U - (bit & 63U));
+            }
+        }
+        return offset;
+    }
+
+    static std::uint8_t compressed_path_position(
+        const std::vector<std::uint64_t>& storage, std::uint32_t offset,
+        std::size_t depth) noexcept {
+        const auto bit = depth * 3U;
+        auto value = storage[offset + bit / 64U] >> (bit & 63U);
+        if ((bit & 63U) > 61U) {
+            value |= storage[offset + bit / 64U + 1U]
+                  << (64U - (bit & 63U));
+        }
+        return static_cast<std::uint8_t>(value & 0b111U);
+    }
+
+    [[nodiscard]] std::vector<FrontierState> extract_coarse_frontier(
+        std::size_t position, std::size_t limit) const {
+        const auto& left = slices_[position];
+        const auto& right = slices_[position + 1U];
+        std::vector<FrontierState> frontier(1);
+        while (frontier.size() < limit) {
+            std::size_t shallowest = std::numeric_limits<std::size_t>::max();
+            for (const auto& root : frontier) {
+                const auto depth = root.history.size();
+                if (root.expandable && depth + 1U < left.depth()) {
+                    shallowest = std::min(shallowest, depth);
+                }
+            }
+            if (shallowest == std::numeric_limits<std::size_t>::max()) break;
+            std::size_t selected = frontier.size();
+            std::vector<FrontierState> children;
+            for (std::size_t i = 0; i < frontier.size(); ++i) {
+                auto& root = frontier[i];
+                const auto depth = root.history.size();
+                if (!root.expandable || depth != shallowest) {
+                    continue;
+                }
+                const auto left_children = left.child_block(root.left_node);
+                const auto right_children = right.child_block(root.right_node);
+                const auto acceptor = history_all_accepts(root.history.data(), depth);
+                const auto& transitions = pair_transitions_[
+                    static_cast<std::size_t>(left_children.mask)
+                    | (static_cast<std::size_t>(right_children.mask) << 4U)];
+                auto active = static_cast<std::uint8_t>(
+                    acceptor & transitions.present);
+                const auto child_count = static_cast<std::size_t>(
+                    std::popcount(static_cast<unsigned>(active)));
+                if (child_count == 0
+                    || frontier.size() - 1U + child_count > limit) {
+                    root.expandable = false;
+                    continue;
+                }
+                selected = i;
+                children.clear();
+                children.reserve(child_count);
+                while (active != 0) {
+                    const auto branch = static_cast<std::uint8_t>(
+                        std::countr_zero(static_cast<unsigned>(active)));
+                    const auto offsets = transitions.child_offsets[branch];
+                    auto child = root;
+                    child.left_node = left_children.first + (offsets & 0b11U);
+                    child.right_node =
+                        right_children.first + ((offsets >> 2U) & 0b11U);
+                    child.positions.push_back(branch);
+                    child.history.push_back(pair_triple_order_[branch]);
+                    child.expandable = true;
+                    children.push_back(std::move(child));
+                    active = static_cast<std::uint8_t>(active & (active - 1U));
+                }
+                break;
+            }
+            if (selected == frontier.size()) break;
+            frontier.erase(frontier.begin() + static_cast<std::ptrdiff_t>(selected));
+            frontier.insert(frontier.begin() + static_cast<std::ptrdiff_t>(selected),
+                            std::make_move_iterator(children.begin()),
+                            std::make_move_iterator(children.end()));
+        }
+        return frontier;
+    }
+
+    void begin_planned_range(PairTraversalPlan& plan,
+                             RootPlanningResult& result,
+                             const std::vector<std::uint8_t>& path,
+                             std::size_t depth,
+                             std::uint32_t coarse_root,
+                             PairPathSummary summary) {
+        if (result.range_open) return;
+        PlannedRange range;
+        range.coarse_root = coarse_root;
+        range.depth = static_cast<std::uint16_t>(depth);
+        range.path_offset = append_compressed_path(
+            result.paths, plan.words_per_path, path, depth);
+        range.gate_begin = result.gate_count;
+        range.summary = summary;
+        result.ranges.push_back(range);
+        result.open_gate_begin = result.gate_count;
+        result.range_open = true;
+    }
+
+    static void finish_planned_range(RootPlanningResult& result) {
+        if (!result.range_open) return;
+        auto& range = result.ranges.back();
+        range.work = result.open_work;
+        range.gate_count = result.gate_count - result.open_gate_begin;
+        result.open_work = 0;
+        result.range_open = false;
+    }
+
+    template<PairGateLocation GateLocation>
+    void count_planned_subtree(std::size_t position,
+                               PairTraversalPlan& plan,
+                               std::uint32_t coarse_root,
+                               Node left_node, Node right_node,
+                               std::size_t depth,
+                               std::vector<std::uint8_t>& history,
+                               std::vector<std::uint8_t>& path,
+                               PairPathSummary summary,
+                               RootPlanningResult& result) {
+        begin_planned_range(
+            plan, result, path, depth, coarse_root, summary);
+        ++result.open_work;
+        ++result.work;
+
+        const auto& left = slices_[position];
+        const auto& right = slices_[position + 1U];
+        const auto tree_depth = left.depth();
+        if (depth == tree_depth) {
+            if constexpr (GateLocation == PairGateLocation::Leaf) {
+                ++result.gate_count;
+            }
+            if (result.open_work >= pair_work_quantum_) {
+                finish_planned_range(result);
+            }
+            return;
+        }
+
+        const auto left_children = left.child_block(left_node);
+        const auto right_children = right.child_block(right_node);
+        const auto acceptor = history_all_accepts(history.data(), depth);
+        const auto& transitions = pair_transitions_[
+            static_cast<std::size_t>(left_children.mask)
+            | (static_cast<std::size_t>(right_children.mask) << 4U)];
+        auto active = static_cast<std::uint8_t>(acceptor & transitions.present);
+        if (depth + 1U == tree_depth) {
+            if constexpr (GateLocation == PairGateLocation::ParentOfLeaf) {
+                ++result.gate_count;
+            }
+            const auto fanout = static_cast<std::uint64_t>(
+                std::popcount(static_cast<unsigned>(active)));
+            result.open_work += fanout;
+            result.work += fanout;
+            if constexpr (GateLocation == PairGateLocation::Leaf) {
+                result.gate_count += fanout;
+            }
+            if (result.open_work >= pair_work_quantum_) {
+                finish_planned_range(result);
+            }
+            return;
+        }
+
+        if (result.open_work >= pair_work_quantum_) {
+            finish_planned_range(result);
+        }
+        while (active != 0) {
+            const auto branch = static_cast<std::uint8_t>(
+                std::countr_zero(static_cast<unsigned>(active)));
+            const auto offsets = transitions.child_offsets[branch];
+            history[depth] = pair_triple_order_[branch];
+            path.push_back(branch);
+            auto next_summary = summary;
+            update_pair_summary(
+                next_summary, history[depth], depth);
+            count_planned_subtree<GateLocation>(
+                position, plan, coarse_root,
+                left_children.first + (offsets & 0b11U),
+                right_children.first + ((offsets >> 2U) & 0b11U),
+                depth + 1U, history, path, next_summary, result);
+            path.pop_back();
+            active = static_cast<std::uint8_t>(active & (active - 1U));
+        }
+    }
+
+    template<PairGateLocation GateLocation>
+    void plan_one_coarse_root(std::size_t position, PairTraversalPlan& plan,
+                              std::uint32_t root_index) {
+        auto& root = plan.roots[root_index];
+        auto& result = root.planning;
+        result = RootPlanningResult{};
+        std::vector<std::uint8_t> history(plan.tree_depth);
+        std::vector<std::uint8_t> path;
+        path.reserve(plan.tree_depth);
+        PairPathSummary summary;
+        for (std::size_t depth = 0; depth < root.depth; ++depth) {
+            const auto branch = compressed_path_position(
+                plan.paths, root.path_offset, depth);
+            path.push_back(branch);
+            history[depth] = pair_triple_order_[branch];
+            update_pair_summary(summary, history[depth], depth);
+        }
+        count_planned_subtree<GateLocation>(
+            position, plan, root_index, root.left_node, root.right_node,
+            root.depth, history, path, summary, result);
+        finish_planned_range(result);
+    }
+
+    struct PlanningJob {
+        Solver* solver = nullptr;
+        PairTraversalPlan* plan = nullptr;
+        std::size_t position = 0;
+        std::uint32_t root_index = 0;
+    };
+
+    struct PlanningContext {
+        std::vector<PlanningJob>* jobs = nullptr;
+    };
+
+    static void execute_planning_job(void* opaque, std::size_t task,
+                                     std::size_t) {
+        auto& job = (*static_cast<PlanningContext*>(opaque)->jobs)[task];
+        switch (job.plan->gate_location) {
+            case PairGateLocation::None:
+                job.solver->plan_one_coarse_root<PairGateLocation::None>(
+                    job.position, *job.plan, job.root_index);
+                break;
+            case PairGateLocation::ParentOfLeaf:
+                job.solver->plan_one_coarse_root<PairGateLocation::ParentOfLeaf>(
+                    job.position, *job.plan, job.root_index);
+                break;
+            case PairGateLocation::Leaf:
+                job.solver->plan_one_coarse_root<PairGateLocation::Leaf>(
+                    job.position, *job.plan, job.root_index);
+                break;
+        }
+    }
+
+    [[nodiscard]] PairGateLocation current_gate_location(
+        std::size_t position) const {
+        if (!pair_gates_ready_) return PairGateLocation::None;
+        const auto depth = slices_[position].depth();
+        if (pair_gate_depth_ + 1U == depth) {
+            return PairGateLocation::ParentOfLeaf;
+        }
+        if (pair_gate_depth_ == depth) {
+            return PairGateLocation::Leaf;
+        }
+        throw std::logic_error(
+            "pair gate is not on the current or parent leaf level");
+    }
+
+    void prepare_pair_plans() {
+        const auto adjacency_count = slices_.size() - 1U;
+        pair_plans_.clear();
+        pair_plans_.resize(adjacency_count);
+        std::vector<PlanningJob> jobs;
+        const auto root_limit =
+            64U * static_cast<std::size_t>(options_.reserved_threads);
+
+        for (std::size_t position = 0; position < adjacency_count; ++position) {
+            const auto& left = slices_[position];
+            const auto& right = slices_[position + 1U];
+            if (left.depth() != right.depth()) {
+                throw std::logic_error(
+                    "neighboring slice trees have different depths");
+            }
+            auto plan = std::make_unique<PairTraversalPlan>();
+            plan->tree_depth = left.depth();
+            plan->words_per_path =
+                std::max<std::size_t>(1U, (left.depth() * 3U + 63U) / 64U);
+            plan->gate_location = current_gate_location(position);
+            auto frontier = extract_coarse_frontier(position, root_limit);
+            plan->roots.reserve(frontier.size());
+            for (auto& state : frontier) {
+                CoarseRoot root;
+                root.left_node = state.left_node;
+                root.right_node = state.right_node;
+                root.depth = static_cast<std::uint16_t>(state.history.size());
+                root.path_offset = append_compressed_path(
+                    plan->paths, plan->words_per_path,
+                    state.positions, state.positions.size());
+                plan->roots.push_back(std::move(root));
+            }
+            pair_plans_[position] = std::move(plan);
+        }
+
+        for (std::size_t position = 0; position < adjacency_count; ++position) {
+            auto& plan = *pair_plans_[position];
+            for (std::size_t root = 0; root < plan.roots.size(); ++root) {
+                jobs.push_back(PlanningJob{
+                    this, &plan, position, static_cast<std::uint32_t>(root)});
+            }
+        }
+        PlanningContext context{&jobs};
+        execute_indexed_tasks(jobs.size(), options_.reserved_threads,
+                              &context, &execute_planning_job);
+
+        for (std::size_t position = 0; position < adjacency_count; ++position) {
+            auto& plan = *pair_plans_[position];
+            std::uint64_t gate_prefix = 0;
+            for (std::size_t root_index = 0;
+                 root_index < plan.roots.size(); ++root_index) {
+                auto& root = plan.roots[root_index];
+                auto& result = root.planning;
+                root.work = result.work;
+                root.gate_begin = gate_prefix;
+                root.gate_count = result.gate_count;
+                plan.total_work += result.work;
+                plan.total_gates += result.gate_count;
+                for (auto& range : result.ranges) {
+                    range.path_offset = static_cast<std::uint32_t>(
+                        plan.paths.size() + range.path_offset);
+                    range.gate_begin += gate_prefix;
+                    plan.ranges.push_back(range);
+                }
+                plan.paths.insert(plan.paths.end(),
+                                  result.paths.begin(), result.paths.end());
+                gate_prefix += result.gate_count;
+                result = RootPlanningResult{};
+            }
+            if (pair_gates_ready_
+                && plan.total_gates != pair_gates_[position].size()) {
+                throw std::logic_error(
+                    "parallel pair plan lost gate-tape alignment");
+            }
+        }
+        parallel_walk_scratch_.resize(
+            static_cast<std::size_t>(options_.reserved_threads));
+        for (auto& scratch : parallel_walk_scratch_) {
+            scratch.history.resize(height_);
+            scratch.frames.resize(height_);
+        }
+    }
+
     template<bool CountStats, bool VisitRejected, bool TrackSummary,
              PairGateLocation GateLocation,
              class LeafCallback>
@@ -1089,6 +1603,466 @@ private:
         }
     }
 
+    template<bool CountStats, bool VisitRejected, bool TrackSummary,
+             PairGateLocation GateLocation, class LeafCallback>
+    std::uint64_t execute_planned_range(
+        std::size_t position, const PairTraversalPlan& plan,
+        std::size_t range_index, std::size_t worker,
+        LeafCallback& leaf_callback) {
+        const auto& range = plan.ranges[range_index];
+        const auto& root = plan.roots[range.coarse_root];
+        const auto& left = slices_[position];
+        const auto& right = slices_[position + 1U];
+        const PairGate* gate = GateLocation == PairGateLocation::None
+            ? nullptr : &pair_gates_[position];
+        auto& scratch = parallel_walk_scratch_[worker];
+        auto& history = scratch.history;
+        auto& frames = scratch.frames;
+
+        Node left_node = 0;
+        Node right_node = 0;
+        PairPathSummary summary;
+        for (std::size_t depth = 0; depth < range.depth; ++depth) {
+            if (depth == root.depth
+                && (left_node != root.left_node || right_node != root.right_node)) {
+                throw std::logic_error(
+                    "parallel range path does not reach its coarse root");
+            }
+            const auto branch = compressed_path_position(
+                plan.paths, range.path_offset, depth);
+            const auto left_children = left.child_block(left_node);
+            const auto right_children = right.child_block(right_node);
+            const auto acceptor = history_all_accepts(history.data(), depth);
+            const auto& transitions = pair_transitions_[
+                static_cast<std::size_t>(left_children.mask)
+                | (static_cast<std::size_t>(right_children.mask) << 4U)];
+            const auto active = static_cast<std::uint8_t>(
+                acceptor & transitions.present);
+            const auto selected = static_cast<std::uint8_t>(1U << branch);
+            if ((active & selected) == 0) {
+                throw std::logic_error(
+                    "parallel range path names an absent branch");
+            }
+            if (depth >= root.depth) {
+                frames[depth] = PairWalkFrame{
+                    left_children.first,
+                    right_children.first,
+                    summary,
+                    static_cast<std::uint8_t>(
+                        active & ~((selected << 1U) - 1U)),
+                    static_cast<std::uint8_t>(
+                        left_children.mask | (right_children.mask << 4U)),
+                };
+            }
+            const auto offsets = transitions.child_offsets[branch];
+            history[depth] = pair_triple_order_[branch];
+            if constexpr (TrackSummary) {
+                update_pair_summary(summary, history[depth], depth);
+            }
+            left_node = left_children.first + (offsets & 0b11U);
+            right_node = right_children.first + ((offsets >> 2U) & 0b11U);
+        }
+        if (range.depth == root.depth
+            && (left_node != root.left_node || right_node != root.right_node)) {
+            throw std::logic_error(
+                "parallel range starts at the wrong coarse root");
+        }
+        if constexpr (TrackSummary) {
+            if (summary.first_left_nonzero
+                    != range.summary.first_left_nonzero
+                || summary.last_left_nonzero
+                    != range.summary.last_left_nonzero) {
+                throw std::logic_error(
+                    "parallel range path-summary reconstruction failed");
+            }
+            summary = range.summary;
+        }
+
+        auto depth = static_cast<std::size_t>(range.depth);
+        const auto base_depth = static_cast<std::size_t>(root.depth);
+        std::uint64_t used = 0;
+        std::uint64_t gate_cursor = range.gate_begin;
+        std::uint64_t callbacks = 0;
+
+        auto advance_to_sibling = [&]() {
+            while (depth > base_depth) {
+                const auto parent_depth = depth - 1U;
+                auto& frame = frames[parent_depth];
+                if (frame.remaining != 0) {
+                    const auto branch = static_cast<std::uint8_t>(
+                        std::countr_zero(
+                            static_cast<unsigned>(frame.remaining)));
+                    frame.remaining = static_cast<std::uint8_t>(
+                        frame.remaining & (frame.remaining - 1U));
+                    const auto& transitions =
+                        pair_transitions_[frame.transition_key];
+                    const auto offsets = transitions.child_offsets[branch];
+                    history[parent_depth] = pair_triple_order_[branch];
+                    if constexpr (TrackSummary) {
+                        summary = frame.summary;
+                        update_pair_summary(
+                            summary, history[parent_depth], parent_depth);
+                    }
+                    left_node = frame.left_first + (offsets & 0b11U);
+                    right_node = frame.right_first + ((offsets >> 2U) & 0b11U);
+                    depth = parent_depth + 1U;
+                    return true;
+                }
+                depth = parent_depth;
+            }
+            return false;
+        };
+
+        while (used < range.work) {
+            ++used;
+            if (depth == plan.tree_depth) {
+                bool allowed = true;
+                if constexpr (GateLocation == PairGateLocation::Leaf) {
+                    allowed = gate->get(gate_cursor++);
+                }
+                if constexpr (VisitRejected) {
+                    if constexpr (TrackSummary) {
+                        leaf_callback(left_node, right_node, history, allowed,
+                                      summary, range_index, worker);
+                    } else {
+                        leaf_callback(left_node, right_node, history, allowed,
+                                      range_index, worker);
+                    }
+                    if constexpr (CountStats) ++callbacks;
+                } else if (allowed) {
+                    if constexpr (TrackSummary) {
+                        leaf_callback(left_node, right_node, history, true,
+                                      summary, range_index, worker);
+                    } else {
+                        leaf_callback(left_node, right_node, history, true,
+                                      range_index, worker);
+                    }
+                    if constexpr (CountStats) ++callbacks;
+                }
+                if (used == range.work) break;
+                if (!advance_to_sibling()) {
+                    throw std::logic_error(
+                        "parallel range exhausted its coarse root early");
+                }
+                continue;
+            }
+
+            const auto left_children = left.child_block(left_node);
+            const auto right_children = right.child_block(right_node);
+            const auto acceptor = history_all_accepts(history.data(), depth);
+            const auto& transitions = pair_transitions_[
+                static_cast<std::size_t>(left_children.mask)
+                | (static_cast<std::size_t>(right_children.mask) << 4U)];
+            auto active = static_cast<std::uint8_t>(
+                acceptor & transitions.present);
+            if (depth + 1U == plan.tree_depth) {
+                bool ancestry_allowed = true;
+                if constexpr (GateLocation == PairGateLocation::ParentOfLeaf) {
+                    ancestry_allowed = gate->get(gate_cursor++);
+                }
+                const auto fanout = static_cast<std::uint64_t>(
+                    std::popcount(static_cast<unsigned>(active)));
+                used += fanout;
+                if (used > range.work) {
+                    throw std::logic_error(
+                        "parallel range quota splits a terminal fanout");
+                }
+                while (active != 0) {
+                    const auto branch = static_cast<std::uint8_t>(
+                        std::countr_zero(static_cast<unsigned>(active)));
+                    const auto offsets = transitions.child_offsets[branch];
+                    history[depth] = pair_triple_order_[branch];
+                    auto next_summary = summary;
+                    if constexpr (TrackSummary) {
+                        update_pair_summary(
+                            next_summary, history[depth], depth);
+                    }
+                    bool allowed = ancestry_allowed;
+                    if constexpr (GateLocation == PairGateLocation::Leaf) {
+                        allowed = gate->get(gate_cursor++);
+                    }
+                    if constexpr (VisitRejected) {
+                        if constexpr (TrackSummary) {
+                            leaf_callback(
+                                left_children.first + (offsets & 0b11U),
+                                right_children.first
+                                    + ((offsets >> 2U) & 0b11U),
+                                history, allowed, next_summary,
+                                range_index, worker);
+                        } else {
+                            leaf_callback(
+                                left_children.first + (offsets & 0b11U),
+                                right_children.first
+                                    + ((offsets >> 2U) & 0b11U),
+                                history, allowed, range_index, worker);
+                        }
+                        if constexpr (CountStats) ++callbacks;
+                    } else if (allowed) {
+                        if constexpr (TrackSummary) {
+                            leaf_callback(
+                                left_children.first + (offsets & 0b11U),
+                                right_children.first
+                                    + ((offsets >> 2U) & 0b11U),
+                                history, true, next_summary,
+                                range_index, worker);
+                        } else {
+                            leaf_callback(
+                                left_children.first + (offsets & 0b11U),
+                                right_children.first
+                                    + ((offsets >> 2U) & 0b11U),
+                                history, true, range_index, worker);
+                        }
+                        if constexpr (CountStats) ++callbacks;
+                    }
+                    active = static_cast<std::uint8_t>(active & (active - 1U));
+                }
+                if (used == range.work) break;
+                if (!advance_to_sibling()) {
+                    throw std::logic_error(
+                        "parallel range exhausted its coarse root early");
+                }
+                continue;
+            }
+
+            if (used == range.work) break;
+            if (active == 0) {
+                if (!advance_to_sibling()) {
+                    throw std::logic_error(
+                        "parallel range exhausted its coarse root early");
+                }
+                continue;
+            }
+            const auto branch = static_cast<std::uint8_t>(
+                std::countr_zero(static_cast<unsigned>(active)));
+            active = static_cast<std::uint8_t>(active & (active - 1U));
+            frames[depth] = PairWalkFrame{
+                left_children.first, right_children.first, summary, active,
+                static_cast<std::uint8_t>(
+                    left_children.mask | (right_children.mask << 4U))};
+            const auto offsets = transitions.child_offsets[branch];
+            history[depth] = pair_triple_order_[branch];
+            if constexpr (TrackSummary) {
+                update_pair_summary(summary, history[depth], depth);
+            }
+            left_node = left_children.first + (offsets & 0b11U);
+            right_node = right_children.first + ((offsets >> 2U) & 0b11U);
+            ++depth;
+        }
+        if (gate_cursor != range.gate_begin + range.gate_count) {
+            throw std::logic_error(
+                "parallel range lost gate-tape alignment");
+        }
+        return callbacks;
+    }
+
+    template<bool VisitRejected, bool TrackSummary, class LeafCallback>
+    struct ParallelWalkContext {
+        Solver* solver = nullptr;
+        std::size_t position = 0;
+        const PairTraversalPlan* plan = nullptr;
+        const std::vector<std::size_t>* active_ranges = nullptr;
+        LeafCallback* callback = nullptr;
+        std::vector<std::uint64_t>* callback_counts = nullptr;
+    };
+
+    template<bool CountStats, bool VisitRejected, bool TrackSummary,
+             PairGateLocation GateLocation, class LeafCallback>
+    static void execute_parallel_range(void* opaque, std::size_t task,
+                                       std::size_t worker) {
+        auto& context =
+            *static_cast<ParallelWalkContext<
+                VisitRejected, TrackSummary, LeafCallback>*>(opaque);
+        const auto range = (*context.active_ranges)[task];
+        const auto callbacks =
+            context.solver->template execute_planned_range<
+                CountStats, VisitRejected, TrackSummary, GateLocation>(
+                    context.position, *context.plan, range, worker,
+                    *context.callback);
+        if constexpr (CountStats) {
+            (*context.callback_counts)[task] = callbacks;
+        }
+    }
+
+    template<bool VisitRejected = true, bool TrackSummary = false,
+             class LeafCallback>
+    void walk_candidate_pairs_parallel(
+        std::size_t position, const PackedTags* live_left,
+        const PackedTags* live_right, LeafCallback&& leaf_callback) {
+        auto& plan = *pair_plans_.at(position);
+        parallel_active_ranges_.clear();
+        parallel_active_ranges_.reserve(plan.ranges.size());
+        for (std::size_t range = 0; range < plan.ranges.size(); ++range) {
+            const auto& root =
+                plan.roots[plan.ranges[range].coarse_root];
+            if (live_left != nullptr && !live_left->get(root.left_node)) continue;
+            if (live_right != nullptr && !live_right->get(root.right_node)) continue;
+            parallel_active_ranges_.push_back(range);
+        }
+        if (options_.verbose) {
+            parallel_callback_counts_.resize(
+                parallel_active_ranges_.size());
+        }
+        auto callback = std::forward<LeafCallback>(leaf_callback);
+        ParallelWalkContext<VisitRejected, TrackSummary, decltype(callback)> context{
+            this, position, &plan, &parallel_active_ranges_, &callback,
+            &parallel_callback_counts_};
+        IndexedTaskFunction function = nullptr;
+        auto select_function = [&]<bool CountStats>() {
+            switch (plan.gate_location) {
+                case PairGateLocation::None:
+                    function =
+                        &execute_parallel_range<
+                            CountStats, VisitRejected, TrackSummary,
+                            PairGateLocation::None, decltype(callback)>;
+                    break;
+                case PairGateLocation::ParentOfLeaf:
+                    function =
+                        &execute_parallel_range<
+                            CountStats, VisitRejected, TrackSummary,
+                            PairGateLocation::ParentOfLeaf,
+                            decltype(callback)>;
+                    break;
+                case PairGateLocation::Leaf:
+                    function =
+                        &execute_parallel_range<
+                            CountStats, VisitRejected, TrackSummary,
+                            PairGateLocation::Leaf, decltype(callback)>;
+                    break;
+            }
+        };
+        if (options_.verbose) {
+            select_function.template operator()<true>();
+        } else {
+            select_function.template operator()<false>();
+        }
+        execute_indexed_tasks(parallel_active_ranges_.size(),
+                              options_.reserved_threads, &context, function);
+        if (options_.verbose) {
+            for (const auto range : parallel_active_ranges_) {
+                pair_states_ += plan.ranges[range].work;
+            }
+            for (const auto callbacks : parallel_callback_counts_) {
+                pair_leaves_ += callbacks;
+            }
+        }
+    }
+
+    struct LeafPlaneReductionContext {
+        WorkerLeafPlanes* planes = nullptr;
+        std::vector<PackedTags*>* destinations = nullptr;
+        std::size_t chunks = 0;
+    };
+
+    static void reduce_leaf_plane_words(void* opaque, std::size_t task,
+                                        std::size_t) {
+        auto& context = *static_cast<LeafPlaneReductionContext*>(opaque);
+        const auto words = context.planes->word_count();
+        const auto begin = words * task / context.chunks;
+        const auto end = words * (task + 1U) / context.chunks;
+        for (std::size_t plane = 0;
+             plane < context.destinations->size(); ++plane) {
+            auto& destination = *(*context.destinations)[plane];
+            for (std::size_t word = begin; word < end; ++word) {
+                std::uint64_t combined = 0;
+                for (std::size_t worker = 0;
+                     worker < context.planes->workers(); ++worker) {
+                    combined |= context.planes->word(plane, worker, word);
+                }
+                destination.or_word(
+                    context.planes->base_word() + word, combined);
+            }
+        }
+    }
+
+    void prepare_leaf_planes(const SuccinctSliceTree& destination,
+                             std::size_t plane_count) {
+        parallel_leaf_planes_.prepare(
+            destination.leaf_begin(), destination.leaf_end(), plane_count,
+            static_cast<std::size_t>(options_.reserved_threads));
+    }
+
+    void reduce_leaf_planes(std::initializer_list<PackedTags*> destinations) {
+        parallel_leaf_destinations_.assign(
+            destinations.begin(), destinations.end());
+        reduce_prepared_leaf_planes();
+    }
+
+    void reduce_leaf_planes(const std::vector<PackedTags*>& destinations) {
+        parallel_leaf_destinations_ = destinations;
+        reduce_prepared_leaf_planes();
+    }
+
+    void reduce_prepared_leaf_planes() {
+        const auto chunks =
+            static_cast<std::size_t>(options_.reserved_threads);
+        LeafPlaneReductionContext context{
+            &parallel_leaf_planes_, &parallel_leaf_destinations_, chunks};
+        execute_indexed_tasks(chunks, options_.reserved_threads,
+                              &context, &reduce_leaf_plane_words);
+    }
+
+    struct EncodedLeafReductionContext {
+        WorkerLeafPlanes* planes = nullptr;
+        PackedTags* clean = nullptr;
+        PackedTags* partial = nullptr;
+        PackedTags* completion_valid = nullptr;
+        PackedTags* completion_interesting = nullptr;
+        std::size_t chunks = 0;
+    };
+
+    static void reduce_encoded_leaf_words(void* opaque, std::size_t task,
+                                          std::size_t) {
+        auto& context =
+            *static_cast<EncodedLeafReductionContext*>(opaque);
+        const auto words = context.planes->word_count();
+        const auto begin = words * task / context.chunks;
+        const auto end = words * (task + 1U) / context.chunks;
+        for (std::size_t word = begin; word < end; ++word) {
+            std::uint64_t low = 0;
+            std::uint64_t high = 0;
+            std::uint64_t partial = 0;
+            for (std::size_t worker = 0;
+                 worker < context.planes->workers(); ++worker) {
+                const auto next_low =
+                    context.planes->word(0, worker, word);
+                const auto next_high =
+                    context.planes->word(1, worker, word);
+                const auto same_high = ~(high ^ next_high);
+                low = (same_high & (low | next_low))
+                    | (high & ~next_high & low)
+                    | (~high & next_high & next_low);
+                high |= next_high;
+                if (context.partial != nullptr) {
+                    partial |= context.planes->word(2, worker, word);
+                }
+            }
+            const auto destination_word =
+                context.planes->base_word() + word;
+            context.clean->or_word(
+                destination_word, low | high | partial);
+            if (context.partial != nullptr) {
+                context.partial->or_word(destination_word, partial);
+            }
+            context.completion_valid->or_word(
+                destination_word, high);
+            context.completion_interesting->or_word(
+                destination_word, high & low);
+        }
+    }
+
+    void reduce_encoded_leaf_planes(
+        PackedTags& clean, PackedTags* partial,
+        PackedTags& completion_valid,
+        PackedTags& completion_interesting) {
+        const auto chunks =
+            static_cast<std::size_t>(options_.reserved_threads);
+        EncodedLeafReductionContext context{
+            &parallel_leaf_planes_, &clean, partial, &completion_valid,
+            &completion_interesting, chunks};
+        execute_indexed_tasks(chunks, options_.reserved_threads,
+                              &context, &reduce_encoded_leaf_words);
+    }
+
     template<class LeafCallback>
     void walk_current_edges(std::size_t position, LeafCallback&& leaf_callback) {
         if (!pair_gates_ready_ || pair_gate_depth_ != height_) {
@@ -1108,6 +2082,11 @@ private:
         cached_completion_.reset();
         cached_completion_height_ = std::numeric_limits<std::size_t>::max();
         const auto adjacency_count = slices_.size() - 1U;
+        if (options_.reserved_threads > 1) {
+            prepare_pair_plans();
+        } else {
+            pair_plans_.clear();
+        }
         std::vector<TagPair> normal;
         normal.reserve(slices_.size());
         for (const auto& slice : slices_) normal.emplace_back(slice.node_count());
@@ -1150,18 +2129,41 @@ private:
             seed_suffix(slices_.size() - 1U);
             for (std::size_t i = adjacency_count; i > 0; --i) {
                 normal[i - 1U][1].clear();
-                walk_candidate_pairs<false>(i - 1U,
-                    [&](Node left_leaf, Node right_leaf, const auto&,
-                        bool ancestry_allowed) {
-                        const bool reaches_right = ancestry_allowed
-                            && normal[i][1].get(right_leaf);
-                        if (reaches_right) {
-                            normal[i - 1U][1].set(left_leaf);
-                            if (witness[i][1].get(right_leaf)) {
-                                witness[i - 1U][1].set(left_leaf);
+                if (options_.reserved_threads == 1) {
+                    walk_candidate_pairs<false>(i - 1U,
+                        [&](Node left_leaf, Node right_leaf, const auto&,
+                            bool ancestry_allowed) {
+                            const bool reaches_right = ancestry_allowed
+                                && normal[i][1].get(right_leaf);
+                            if (reaches_right) {
+                                normal[i - 1U][1].set(left_leaf);
+                                if (witness[i][1].get(right_leaf)) {
+                                    witness[i - 1U][1].set(left_leaf);
+                                }
                             }
-                        }
-                    });
+                        });
+                } else {
+                    slices_[i].close_from_leaves(normal[i][1]);
+                    prepare_leaf_planes(slices_[i - 1U], 2);
+                    walk_candidate_pairs_parallel<false>(
+                        i - 1U, nullptr, &normal[i][1],
+                        [&](Node left_leaf, Node right_leaf, const auto&,
+                            bool ancestry_allowed, std::size_t,
+                            std::size_t worker) {
+                            const bool reaches_right = ancestry_allowed
+                                && normal[i][1].get(right_leaf);
+                            if (reaches_right) {
+                                parallel_leaf_planes_.set(
+                                    worker, 0, left_leaf);
+                                if (witness[i][1].get(right_leaf)) {
+                                    parallel_leaf_planes_.set(
+                                        worker, 1, left_leaf);
+                                }
+                            }
+                        });
+                    reduce_leaf_planes({
+                        &normal[i - 1U][1], &witness[i - 1U][1]});
+                }
                 seed_suffix(i - 1U);
             }
 
@@ -1193,52 +2195,124 @@ private:
             phase("  relation sweep: left to right + bcaf prefix/cleanup");
             for (std::size_t i = 0; i < adjacency_count; ++i) {
                 normal[i + 1U][0].clear();
-                walk_candidate_pairs<false>(i,
-                    [&](Node left_leaf, Node right_leaf, const auto&,
-                        bool ancestry_allowed) {
-                        const bool reaches_left = ancestry_allowed
-                            && normal[i][0].get(left_leaf);
-                        if (reaches_left) {
-                            normal[i + 1U][0].set(right_leaf);
-                        }
-                        const bool normal_edge = reaches_left
-                            && normal[i + 1U][1].get(right_leaf);
-                        const bool interesting_prefix = witness[i][0].get(left_leaf);
-                        if (normal_edge && interesting_prefix) {
-                            witness[i + 1U][0].set(right_leaf);
-                        }
-                        const bool interesting_path = interesting_prefix
-                            || witness[i + 1U][1].get(right_leaf);
-                        if (normal_edge && interesting_path
-                            && clean[i][0].get(left_leaf)) {
-                            clean[i + 1U][0].set(right_leaf);
-                        }
-                    });
+                if (options_.reserved_threads == 1) {
+                    walk_candidate_pairs<false>(i,
+                        [&](Node left_leaf, Node right_leaf, const auto&,
+                            bool ancestry_allowed) {
+                            const bool reaches_left = ancestry_allowed
+                                && normal[i][0].get(left_leaf);
+                            if (reaches_left) {
+                                normal[i + 1U][0].set(right_leaf);
+                            }
+                            const bool normal_edge = reaches_left
+                                && normal[i + 1U][1].get(right_leaf);
+                            const bool interesting_prefix =
+                                witness[i][0].get(left_leaf);
+                            if (normal_edge && interesting_prefix) {
+                                witness[i + 1U][0].set(right_leaf);
+                            }
+                            const bool interesting_path = interesting_prefix
+                                || witness[i + 1U][1].get(right_leaf);
+                            if (normal_edge && interesting_path
+                                && clean[i][0].get(left_leaf)) {
+                                clean[i + 1U][0].set(right_leaf);
+                            }
+                        });
+                } else {
+                    slices_[i].close_from_leaves(normal[i][0]);
+                    prepare_leaf_planes(slices_[i + 1U], 3);
+                    walk_candidate_pairs_parallel<false>(
+                        i, &normal[i][0], nullptr,
+                        [&](Node left_leaf, Node right_leaf, const auto&,
+                            bool ancestry_allowed, std::size_t,
+                            std::size_t worker) {
+                            const bool reaches_left = ancestry_allowed
+                                && normal[i][0].get(left_leaf);
+                            if (reaches_left) {
+                                parallel_leaf_planes_.set(
+                                    worker, 0, right_leaf);
+                            }
+                            const bool normal_edge = reaches_left
+                                && normal[i + 1U][1].get(right_leaf);
+                            const bool interesting_prefix =
+                                witness[i][0].get(left_leaf);
+                            if (normal_edge && interesting_prefix) {
+                                parallel_leaf_planes_.set(
+                                    worker, 1, right_leaf);
+                            }
+                            const bool interesting_path = interesting_prefix
+                                || witness[i + 1U][1].get(right_leaf);
+                            if (normal_edge && interesting_path
+                                && clean[i][0].get(left_leaf)) {
+                                parallel_leaf_planes_.set(
+                                    worker, 2, right_leaf);
+                            }
+                        });
+                    reduce_leaf_planes({
+                        &normal[i + 1U][0], &witness[i + 1U][0],
+                        &clean[i + 1U][0]});
+                }
                 seed_prefix(i + 1U);
             }
         } else {
             phase("  relation sweep: left to right");
             for (std::size_t i = 0; i < adjacency_count; ++i) {
                 normal[i + 1U][0].clear();
-                walk_candidate_pairs<false>(i,
-                    [&](Node left_leaf, Node right_leaf, const auto&,
-                        bool ancestry_allowed) {
-                        if (ancestry_allowed && normal[i][0].get(left_leaf)) {
-                            normal[i + 1U][0].set(right_leaf);
-                        }
-                    });
+                if (options_.reserved_threads == 1) {
+                    walk_candidate_pairs<false>(i,
+                        [&](Node left_leaf, Node right_leaf, const auto&,
+                            bool ancestry_allowed) {
+                            if (ancestry_allowed
+                                && normal[i][0].get(left_leaf)) {
+                                normal[i + 1U][0].set(right_leaf);
+                            }
+                        });
+                } else {
+                    slices_[i].close_from_leaves(normal[i][0]);
+                    prepare_leaf_planes(slices_[i + 1U], 1);
+                    walk_candidate_pairs_parallel<false>(
+                        i, &normal[i][0], nullptr,
+                        [&](Node left_leaf, Node right_leaf, const auto&,
+                            bool ancestry_allowed, std::size_t,
+                            std::size_t worker) {
+                            if (ancestry_allowed
+                                && normal[i][0].get(left_leaf)) {
+                                parallel_leaf_planes_.set(
+                                    worker, 0, right_leaf);
+                            }
+                        });
+                    reduce_leaf_planes({&normal[i + 1U][0]});
+                }
             }
 
             phase("  relation sweep: right to left");
             for (std::size_t i = adjacency_count; i > 0; --i) {
                 normal[i - 1U][1].clear();
-                walk_candidate_pairs<false>(i - 1U,
-                    [&](Node left_leaf, Node right_leaf, const auto&,
-                        bool ancestry_allowed) {
-                        if (ancestry_allowed && normal[i][1].get(right_leaf)) {
-                            normal[i - 1U][1].set(left_leaf);
-                        }
-                    });
+                if (options_.reserved_threads == 1) {
+                    walk_candidate_pairs<false>(i - 1U,
+                        [&](Node left_leaf, Node right_leaf, const auto&,
+                            bool ancestry_allowed) {
+                            if (ancestry_allowed
+                                && normal[i][1].get(right_leaf)) {
+                                normal[i - 1U][1].set(left_leaf);
+                            }
+                        });
+                } else {
+                    slices_[i].close_from_leaves(normal[i][1]);
+                    prepare_leaf_planes(slices_[i - 1U], 1);
+                    walk_candidate_pairs_parallel<false>(
+                        i - 1U, nullptr, &normal[i][1],
+                        [&](Node left_leaf, Node right_leaf, const auto&,
+                            bool ancestry_allowed, std::size_t,
+                            std::size_t worker) {
+                            if (ancestry_allowed
+                                && normal[i][1].get(right_leaf)) {
+                                parallel_leaf_planes_.set(
+                                    worker, 0, left_leaf);
+                            }
+                        });
+                    reduce_leaf_planes({&normal[i - 1U][1]});
+                }
             }
         }
 
@@ -1322,52 +2396,161 @@ private:
                 });
             }
             for (std::size_t i = adjacency_count; i > 0; --i) {
-                auto visit_edge = [&](Node left_leaf, Node right_leaf,
-                                      bool ancestry_allowed,
-                                      const PairPathSummary* summary) {
-                    const bool normal_edge = ancestry_allowed
-                        && normal[i - 1U][0].get(left_leaf)
-                        && normal[i][1].get(right_leaf);
-                    const bool interesting_path = witness[i - 1U][0].get(left_leaf)
-                        || witness[i][1].get(right_leaf);
-                    const bool edge = normal_edge && interesting_path;
-                    if (edge && clean[i - 1U][0].get(left_leaf)
-                        && clean[i][1].get(right_leaf)) {
-                        clean[i - 1U][1].set(left_leaf);
-                        if (cache_partial
-                            && (partial_suffix[i].get(right_leaf)
-                                || summary->first_left_nonzero < bcaf_window)) {
-                            partial_suffix[i - 1U].set(left_leaf);
-                        }
-                        if (cache_completion) {
-                            const auto last = summary->last_left_nonzero;
-                            const bool zero_tail =
-                                last == std::numeric_limits<std::size_t>::max()
-                                || last < short_start;
-                            if (completion_suffix[i][0].get(right_leaf)
-                                && zero_tail) {
-                                completion_suffix[i - 1U][0].set(left_leaf);
-                                if (completion_suffix[i][1].get(right_leaf)
-                                    || (last != std::numeric_limits<std::size_t>::max()
-                                        && last >= long_start)) {
-                                    completion_suffix[i - 1U][1].set(left_leaf);
+                if (options_.reserved_threads == 1) {
+                    auto visit_edge = [&](Node left_leaf, Node right_leaf,
+                                          bool ancestry_allowed,
+                                          const PairPathSummary* summary) {
+                        const bool normal_edge = ancestry_allowed
+                            && normal[i - 1U][0].get(left_leaf)
+                            && normal[i][1].get(right_leaf);
+                        const bool interesting_path =
+                            witness[i - 1U][0].get(left_leaf)
+                            || witness[i][1].get(right_leaf);
+                        const bool edge = normal_edge && interesting_path;
+                        if (edge && clean[i - 1U][0].get(left_leaf)
+                            && clean[i][1].get(right_leaf)) {
+                            clean[i - 1U][1].set(left_leaf);
+                            if (cache_partial
+                                && (partial_suffix[i].get(right_leaf)
+                                    || summary->first_left_nonzero
+                                        < bcaf_window)) {
+                                partial_suffix[i - 1U].set(left_leaf);
+                            }
+                            if (cache_completion) {
+                                const auto last = summary->last_left_nonzero;
+                                const bool zero_tail =
+                                    last
+                                        == std::numeric_limits<
+                                            std::size_t>::max()
+                                    || last < short_start;
+                                if (completion_suffix[i][0].get(right_leaf)
+                                    && zero_tail) {
+                                    completion_suffix[i - 1U][0].set(
+                                        left_leaf);
+                                    if (completion_suffix[i][1].get(right_leaf)
+                                        || (last != std::numeric_limits<
+                                                        std::size_t>::max()
+                                            && last >= long_start)) {
+                                        completion_suffix[i - 1U][1].set(
+                                            left_leaf);
+                                    }
                                 }
                             }
                         }
+                    };
+                    if (cache_partial || cache_completion) {
+                        walk_candidate_pairs<false, true>(i - 1U,
+                            [&](Node left_leaf, Node right_leaf, const auto&,
+                                bool ancestry_allowed,
+                                const PairPathSummary& summary) {
+                                visit_edge(left_leaf, right_leaf,
+                                           ancestry_allowed, &summary);
+                            });
+                    } else {
+                        walk_candidate_pairs<false>(i - 1U,
+                            [&](Node left_leaf, Node right_leaf, const auto&,
+                                bool ancestry_allowed) {
+                                visit_edge(left_leaf, right_leaf,
+                                           ancestry_allowed, nullptr);
+                            });
                     }
-                };
-                if (cache_partial || cache_completion) {
-                    walk_candidate_pairs<false, true>(i - 1U,
-                        [&](Node left_leaf, Node right_leaf, const auto&,
-                            bool ancestry_allowed, const PairPathSummary& summary) {
-                            visit_edge(left_leaf, right_leaf, ancestry_allowed, &summary);
-                        });
                 } else {
-                    walk_candidate_pairs<false>(i - 1U,
-                        [&](Node left_leaf, Node right_leaf, const auto&,
-                            bool ancestry_allowed) {
-                            visit_edge(left_leaf, right_leaf, ancestry_allowed, nullptr);
-                        });
+                    slices_[i].close_from_leaves(clean[i][1]);
+                    const auto partial_plane =
+                        cache_completion ? 2U : 1U;
+                    const auto plane_count = cache_completion
+                        ? 2U + static_cast<std::size_t>(cache_partial)
+                        : 1U + static_cast<std::size_t>(cache_partial);
+                    prepare_leaf_planes(slices_[i - 1U], plane_count);
+                    if (cache_partial || cache_completion) {
+                        walk_candidate_pairs_parallel<false, true>(
+                            i - 1U, nullptr, &clean[i][1],
+                            [&](Node left_leaf, Node right_leaf, const auto&,
+                                bool ancestry_allowed,
+                                const PairPathSummary& summary,
+                                std::size_t, std::size_t worker) {
+                                const bool normal_edge = ancestry_allowed
+                                    && normal[i - 1U][0].get(left_leaf)
+                                    && normal[i][1].get(right_leaf);
+                                const bool interesting_path =
+                                    witness[i - 1U][0].get(left_leaf)
+                                    || witness[i][1].get(right_leaf);
+                                const bool edge =
+                                    normal_edge && interesting_path;
+                                if (!edge
+                                    || !clean[i - 1U][0].get(left_leaf)
+                                    || !clean[i][1].get(right_leaf)) {
+                                    return;
+                                }
+                                if (cache_partial
+                                    && (partial_suffix[i].get(right_leaf)
+                                        || summary.first_left_nonzero
+                                            < bcaf_window)) {
+                                    parallel_leaf_planes_.set(
+                                        worker, partial_plane, left_leaf);
+                                }
+                                if (cache_completion) {
+                                    std::uint8_t completion_state = 1;
+                                    const auto last =
+                                        summary.last_left_nonzero;
+                                    const bool zero_tail =
+                                        last == std::numeric_limits<
+                                                    std::size_t>::max()
+                                        || last < short_start;
+                                    if (completion_suffix[i][0].get(
+                                            right_leaf)
+                                        && zero_tail) {
+                                        completion_state = 2;
+                                        if (completion_suffix[i][1].get(
+                                                right_leaf)
+                                            || (last != std::numeric_limits<
+                                                            std::size_t>::max()
+                                                && last >= long_start)) {
+                                            completion_state = 3;
+                                        }
+                                    }
+                                    parallel_leaf_planes_.set_two_bit_max(
+                                        worker, 0, left_leaf,
+                                        completion_state);
+                                } else {
+                                    parallel_leaf_planes_.set(
+                                        worker, 0, left_leaf);
+                                }
+                            });
+                    } else {
+                        walk_candidate_pairs_parallel<false>(
+                            i - 1U, nullptr, &clean[i][1],
+                            [&](Node left_leaf, Node right_leaf, const auto&,
+                                bool ancestry_allowed, std::size_t,
+                                std::size_t worker) {
+                                const bool normal_edge = ancestry_allowed
+                                    && normal[i - 1U][0].get(left_leaf)
+                                    && normal[i][1].get(right_leaf);
+                                const bool interesting_path =
+                                    witness[i - 1U][0].get(left_leaf)
+                                    || witness[i][1].get(right_leaf);
+                                if (normal_edge && interesting_path
+                                    && clean[i - 1U][0].get(left_leaf)
+                                    && clean[i][1].get(right_leaf)) {
+                                    parallel_leaf_planes_.set(
+                                        worker, 0, left_leaf);
+                                }
+                            });
+                    }
+                    if (cache_completion) {
+                        reduce_encoded_leaf_planes(
+                            clean[i - 1U][1],
+                            cache_partial
+                                ? &partial_suffix[i - 1U] : nullptr,
+                            completion_suffix[i - 1U][0],
+                            completion_suffix[i - 1U][1]);
+                    } else if (cache_partial) {
+                        reduce_leaf_planes({
+                            &clean[i - 1U][1],
+                            &partial_suffix[i - 1U]});
+                    } else {
+                        reduce_leaf_planes({&clean[i - 1U][1]});
+                    }
                 }
             }
 
@@ -1423,63 +2606,170 @@ private:
             // again: later walks start at slice i+1.  Reify and release it here
             // so the growing final gate tape does not overlap all expanded
             // slices and all six tag planes.
+            if (options_.reserved_threads > 1) {
+                // Reverse cleanup closed every source plane except the final
+                // leftmost destination.  Close that one once; all emission
+                // filters can now reuse the existing internal bits.
+                slices_.front().close_from_leaves(clean.front()[1]);
+            }
             for (std::size_t i = 0; i < adjacency_count; ++i) {
                 bool partial_selected = false;
                 bool completion_selected = false;
-                walk_candidate_pairs(i,
-                    [&](Node left_leaf, Node right_leaf, const auto&, bool ancestry_allowed) {
-                        const bool normal_edge = ancestry_allowed
-                            && normal[i][0].get(left_leaf)
-                            && normal[i + 1U][1].get(right_leaf);
-                        const bool interesting_path = witness[i][0].get(left_leaf)
-                            || witness[i + 1U][1].get(right_leaf);
-                        const bool bcaf_edge = normal_edge && interesting_path;
-                        const bool keep_left = clean[i][1].get(left_leaf);
-                        const bool keep_right = clean[i + 1U][1].get(right_leaf);
-                        if (keep_left && keep_right) {
-                            const bool final_edge = bcaf_edge
+                if (options_.reserved_threads == 1) {
+                    walk_candidate_pairs(i,
+                        [&](Node left_leaf, Node right_leaf, const auto&,
+                            bool ancestry_allowed) {
+                            const bool normal_edge = ancestry_allowed
+                                && normal[i][0].get(left_leaf)
+                                && normal[i + 1U][1].get(right_leaf);
+                            const bool interesting_path =
+                                witness[i][0].get(left_leaf)
+                                || witness[i + 1U][1].get(right_leaf);
+                            const bool bcaf_edge =
+                                normal_edge && interesting_path;
+                            const bool keep_left =
+                                clean[i][1].get(left_leaf);
+                            const bool keep_right =
+                                clean[i + 1U][1].get(right_leaf);
+                            if (keep_left && keep_right) {
+                                const bool final_edge = bcaf_edge
+                                    && clean[i][0].get(left_leaf)
+                                    && clean[i + 1U][1].get(right_leaf);
+                                next_gates[i].push_back(final_edge);
+                                if (final_edge && cache_partial
+                                    && !partial_selected
+                                    && left_leaf == partial_current
+                                    && (partial_seen
+                                        || partial_suffix[i + 1U].get(
+                                            right_leaf))) {
+                                    partial_current = right_leaf;
+                                    partial_lineages.push_back(
+                                        slices_[i + 1U].lineage(right_leaf));
+                                    partial_seen = partial_seen
+                                        || labels_prefix_interesting(
+                                            partial_lineages.back(),
+                                            bcaf_window);
+                                    partial_selected = true;
+                                }
+                                const auto completion_plane =
+                                    completion_seen ? 0U : 1U;
+                                if (final_edge && !completion_selected
+                                    && completion_found
+                                    && left_leaf == completion_current
+                                    && completion_suffix[i + 1U][
+                                           completion_plane].get(
+                                               right_leaf)) {
+                                    completion_current = right_leaf;
+                                    completion_lineages.push_back(
+                                        slices_[i + 1U].lineage(right_leaf));
+                                    completion_seen = completion_seen
+                                        || labels_interesting(
+                                            completion_lineages.back(),
+                                            bcaf_window);
+                                    completion_selected = true;
+                                }
+                            }
+                        });
+                } else {
+                    auto& plan = *pair_plans_[i];
+                    std::vector<PairGate> segments(plan.ranges.size());
+                    const auto absent = slices_[i + 1U].leaf_end();
+                    std::vector<Node> partial_candidates(
+                        plan.ranges.size(), absent);
+                    std::vector<Node> completion_candidates(
+                        plan.ranges.size(), absent);
+                    walk_candidate_pairs_parallel(
+                        i, &clean[i][1], &clean[i + 1U][1],
+                        [&](Node left_leaf, Node right_leaf, const auto&,
+                            bool ancestry_allowed, std::size_t range,
+                            std::size_t) {
+                            if (!clean[i][1].get(left_leaf)
+                                || !clean[i + 1U][1].get(right_leaf)) {
+                                return;
+                            }
+                            const bool normal_edge = ancestry_allowed
+                                && normal[i][0].get(left_leaf)
+                                && normal[i + 1U][1].get(right_leaf);
+                            const bool interesting_path =
+                                witness[i][0].get(left_leaf)
+                                || witness[i + 1U][1].get(right_leaf);
+                            const bool final_edge =
+                                normal_edge && interesting_path
                                 && clean[i][0].get(left_leaf)
                                 && clean[i + 1U][1].get(right_leaf);
-                            next_gates[i].push_back(final_edge);
-                            if (final_edge && cache_partial && !partial_selected
+                            segments[range].push_back(final_edge);
+                            if (final_edge && cache_partial
+                                && partial_candidates[range] == absent
                                 && left_leaf == partial_current
                                 && (partial_seen
-                                    || partial_suffix[i + 1U].get(right_leaf))) {
-                                partial_current = right_leaf;
-                                partial_lineages.push_back(
-                                    slices_[i + 1U].lineage(right_leaf));
-                                partial_seen = partial_seen || labels_prefix_interesting(
-                                    partial_lineages.back(), bcaf_window);
-                                partial_selected = true;
+                                    || partial_suffix[i + 1U].get(
+                                        right_leaf))) {
+                                partial_candidates[range] = right_leaf;
                             }
-                            const auto completion_plane = completion_seen ? 0U : 1U;
-                            if (final_edge && !completion_selected
-                                && completion_found
+                            const auto completion_plane =
+                                completion_seen ? 0U : 1U;
+                            if (final_edge && completion_found
+                                && completion_candidates[range] == absent
                                 && left_leaf == completion_current
-                                && completion_suffix[i + 1U][completion_plane].get(
-                                    right_leaf)) {
-                                completion_current = right_leaf;
-                                completion_lineages.push_back(
-                                    slices_[i + 1U].lineage(right_leaf));
-                                completion_seen = completion_seen || labels_interesting(
-                                    completion_lineages.back(), bcaf_window);
-                                completion_selected = true;
+                                && completion_suffix[i + 1U][
+                                       completion_plane].get(right_leaf)) {
+                                completion_candidates[range] = right_leaf;
                             }
+                        });
+                    for (auto& segment : segments) {
+                        next_gates[i].append(std::move(segment));
+                    }
+                    if (cache_partial) {
+                        for (const auto candidate : partial_candidates) {
+                            if (candidate == absent) continue;
+                            partial_current = candidate;
+                            partial_lineages.push_back(
+                                slices_[i + 1U].lineage(candidate));
+                            partial_seen = partial_seen
+                                || labels_prefix_interesting(
+                                    partial_lineages.back(), bcaf_window);
+                            partial_selected = true;
+                            break;
                         }
-                    });
+                    }
+                    if (completion_found) {
+                        for (const auto candidate : completion_candidates) {
+                            if (candidate == absent) continue;
+                            completion_current = candidate;
+                            completion_lineages.push_back(
+                                slices_[i + 1U].lineage(candidate));
+                            completion_seen = completion_seen
+                                || labels_interesting(
+                                    completion_lineages.back(), bcaf_window);
+                            completion_selected = true;
+                            break;
+                        }
+                    }
+                }
                 if (cache_partial && !partial_selected) {
                     throw std::logic_error("interesting-path reconstruction lost its edge");
                 }
                 if (completion_found && !completion_selected) {
                     throw std::logic_error("end reconstruction lost its edge");
                 }
+                if (options_.reserved_threads > 1) {
+                    pair_plans_[i].reset();
+                }
                 if (pair_gates_ready_) pair_gates_[i] = PairGate{};
-                if (!slices_[i].reify(clean[i][1])) return false;
+                if (!(options_.reserved_threads > 1
+                          ? slices_[i].reify_closed(clean[i][1])
+                          : slices_[i].reify(clean[i][1]))) {
+                    return false;
+                }
                 normal[i] = TagPair{};
                 witness[i] = TagPair{};
                 clean[i] = TagPair{};
             }
-            if (!slices_.back().reify(clean.back()[1])) return false;
+            if (!(options_.reserved_threads > 1
+                      ? slices_.back().reify_closed(clean.back()[1])
+                      : slices_.back().reify(clean.back()[1]))) {
+                return false;
+            }
             normal.back() = TagPair{};
             witness.back() = TagPair{};
             clean.back() = TagPair{};
@@ -1501,18 +2791,55 @@ private:
             }
             slices_reified = true;
         } else {
+            if (options_.reserved_threads > 1) {
+                for (std::size_t i = 0; i < slices_.size(); ++i) {
+                    for (Node leaf = slices_[i].leaf_begin();
+                         leaf < slices_[i].leaf_end(); ++leaf) {
+                        normal[i][0].set(
+                            leaf, normal[i][0].get(leaf)
+                                && normal[i][1].get(leaf));
+                    }
+                    slices_[i].close_from_leaves(normal[i][0]);
+                }
+            }
             for (std::size_t i = 0; i < adjacency_count; ++i) {
-                walk_candidate_pairs(i,
-                    [&](Node left_leaf, Node right_leaf, const auto&, bool ancestry_allowed) {
-                        const bool keep_left = normally_live(i, left_leaf);
-                        const bool keep_right = normally_live(i + 1U, right_leaf);
-                        if (keep_left && keep_right) {
+                if (options_.reserved_threads == 1) {
+                    walk_candidate_pairs(i,
+                        [&](Node left_leaf, Node right_leaf, const auto&,
+                            bool ancestry_allowed) {
+                            const bool keep_left =
+                                normally_live(i, left_leaf);
+                            const bool keep_right =
+                                normally_live(i + 1U, right_leaf);
+                            if (keep_left && keep_right) {
+                                const bool final_edge = ancestry_allowed
+                                    && normal[i][0].get(left_leaf)
+                                    && normal[i + 1U][1].get(right_leaf);
+                                next_gates[i].push_back(final_edge);
+                            }
+                        });
+                } else {
+                    auto& plan = *pair_plans_[i];
+                    std::vector<PairGate> segments(plan.ranges.size());
+                    walk_candidate_pairs_parallel(
+                        i, &normal[i][0], &normal[i + 1U][0],
+                        [&](Node left_leaf, Node right_leaf, const auto&,
+                            bool ancestry_allowed, std::size_t range,
+                            std::size_t) {
+                            if (!normal[i][0].get(left_leaf)
+                                || !normal[i + 1U][0].get(right_leaf)) {
+                                return;
+                            }
                             const bool final_edge = ancestry_allowed
                                 && normal[i][0].get(left_leaf)
                                 && normal[i + 1U][1].get(right_leaf);
-                            next_gates[i].push_back(final_edge);
-                        }
-                    });
+                            segments[range].push_back(final_edge);
+                        });
+                    for (auto& segment : segments) {
+                        next_gates[i].append(std::move(segment));
+                    }
+                    pair_plans_[i].reset();
+                }
             }
         }
 
@@ -1524,13 +2851,18 @@ private:
                     keep.set(leaf,
                              normal[i][0].get(leaf) && normal[i][1].get(leaf));
                 }
-                if (!slices_[i].reify(keep)) return false;
+                if (!(options_.reserved_threads > 1
+                          ? slices_[i].reify_closed(keep)
+                          : slices_[i].reify(keep))) {
+                    return false;
+                }
             }
         }
 
         pair_gates_ = std::move(next_gates);
         pair_gate_depth_ = height_;
         pair_gates_ready_ = true;
+        pair_plans_.clear();
         return true;
     }
 
@@ -2021,6 +3353,12 @@ private:
     std::vector<PairGate> pair_gates_;
     std::size_t pair_gate_depth_ = 0;
     bool pair_gates_ready_ = false;
+    std::vector<std::unique_ptr<PairTraversalPlan>> pair_plans_;
+    std::vector<PairWalkScratch> parallel_walk_scratch_;
+    std::vector<std::size_t> parallel_active_ranges_;
+    std::vector<std::uint64_t> parallel_callback_counts_;
+    WorkerLeafPlanes parallel_leaf_planes_;
+    std::vector<PackedTags*> parallel_leaf_destinations_;
     std::ofstream partial_file_;
     std::ofstream stats_file_;
     std::uint64_t pair_states_ = 0;

@@ -57,6 +57,45 @@ public:
         word = value ? word | mask : word & ~mask;
     }
 
+    // Parallel reductions assign disjoint destination words to workers.  The
+    // caller is responsible for that ownership; no atomic operation is
+    // needed here.
+    void or_word(std::size_t word_index, std::uint64_t value) noexcept {
+        words_[word_index] |= value;
+    }
+
+    [[nodiscard]] std::size_t word_size() const noexcept {
+        return words_.size();
+    }
+
+    void append_ones(std::uint64_t count) {
+        if (count == 0) return;
+        const auto old_size = bit_count_;
+        resize_preserving(old_size + count);
+        set_range(old_size, bit_count_);
+    }
+
+    void append(const PackedTags& source) {
+        if (source.bit_count_ == 0) return;
+        const auto old_size = bit_count_;
+        resize_preserving(old_size + source.bit_count_);
+        const auto shift = static_cast<unsigned>(old_size & 63U);
+        const auto output_word = static_cast<std::size_t>(old_size >> 6U);
+        if (shift == 0) {
+            std::copy(source.words_.begin(), source.words_.end(),
+                      words_.begin() + static_cast<std::ptrdiff_t>(output_word));
+        } else {
+            for (std::size_t i = 0; i < source.words_.size(); ++i) {
+                const auto value = source.words_[i];
+                words_[output_word + i] |= value << shift;
+                if (output_word + i + 1U < words_.size()) {
+                    words_[output_word + i + 1U] |= value >> (64U - shift);
+                }
+            }
+        }
+        clear_unused_tail();
+    }
+
     void clear_range(std::uint64_t begin, std::uint64_t end) noexcept {
         if (begin >= end) return;
         const auto first_word = static_cast<std::size_t>(begin >> 6U);
@@ -106,6 +145,41 @@ public:
 private:
     static std::size_t word_count(std::uint64_t bits) {
         return static_cast<std::size_t>((bits + 63U) / 64U);
+    }
+
+    void resize_preserving(std::uint64_t bit_count) {
+        words_.resize(word_count(bit_count), 0);
+        bit_count_ = bit_count;
+        clear_unused_tail();
+    }
+
+    void set_range(std::uint64_t begin, std::uint64_t end) noexcept {
+        if (begin >= end) return;
+        const auto first_word = static_cast<std::size_t>(begin >> 6U);
+        const auto last_word = static_cast<std::size_t>((end - 1U) >> 6U);
+        const auto first_offset = static_cast<unsigned>(begin & 63U);
+        const auto last_offset = static_cast<unsigned>(end & 63U);
+        if (first_word == last_word) {
+            const auto high = last_offset == 0 ? ~std::uint64_t{0}
+                                               : (std::uint64_t{1} << last_offset) - 1U;
+            const auto low = first_offset == 0 ? std::uint64_t{0}
+                                               : (std::uint64_t{1} << first_offset) - 1U;
+            words_[first_word] |= high & ~low;
+            return;
+        }
+        words_[first_word] |= ~std::uint64_t{0} << first_offset;
+        std::fill(words_.begin() + static_cast<std::ptrdiff_t>(first_word + 1U),
+                  words_.begin() + static_cast<std::ptrdiff_t>(last_word),
+                  ~std::uint64_t{0});
+        words_[last_word] |= last_offset == 0
+            ? ~std::uint64_t{0}
+            : (std::uint64_t{1} << last_offset) - 1U;
+    }
+
+    void clear_unused_tail() noexcept {
+        if (!words_.empty() && (bit_count_ & 63U) != 0) {
+            words_.back() &= (std::uint64_t{1} << (bit_count_ & 63U)) - 1U;
+        }
     }
 
     std::uint64_t bit_count_ = 0;
@@ -227,72 +301,24 @@ public:
             return false;
         }
         validate_child_cursors(child_cursor);
+        return compact_closed_tags(tags, live_per_level);
+    }
 
-        Node write = 0;
-        Node old_child_cursor = 1;
-        std::size_t output_word_index = 0;
-        std::uint64_t output_word = 0;
-        const auto old_count = node_count_;
-        const auto old_word_count = words_.size();
-        for (std::size_t word_index = 0; word_index < old_word_count; ++word_index) {
-            // Earlier compacted nibbles may land in this word.  Save its old
-            // contents before processing any of its original node records.
-            const auto original_word = words_[word_index];
-            const Node first = static_cast<Node>(word_index) * 16U;
-            const Node last = std::min<Node>(first + 16U, old_count);
-            for (Node node = first; node < last; ++node) {
-                const auto shift = static_cast<unsigned>((node & 15U) * 4U);
-                const auto original_mask = static_cast<std::uint8_t>(
-                    (original_word >> shift) & 0x0fU);
-                auto old_child = old_child_cursor;
-                old_child_cursor += static_cast<Node>(std::popcount(original_mask));
-                if (!tags.get(node)) {
-                    continue;
-                }
-                std::uint8_t retained_mask = 0;
-                for (std::uint8_t label = 0; label < 4; ++label) {
-                    if ((original_mask & (1U << label)) == 0) {
-                        continue;
-                    }
-                    if (tags.get(old_child++)) {
-                        retained_mask |= static_cast<std::uint8_t>(1U << label);
-                    }
-                }
-                const auto output_shift = static_cast<unsigned>((write & 15U) * 4U);
-                output_word |= static_cast<std::uint64_t>(retained_mask) << output_shift;
-                ++write;
-                if ((write & 15U) == 0) {
-                    words_[output_word_index++] = output_word;
-                    output_word = 0;
-                }
-            }
+    // The parallel sweeps already close their retained leaf planes in order
+    // to omit dead coarse roots.  Reuse those internal bits and obtain the
+    // per-level counts with packed popcounts instead of repeating the DFS.
+    bool reify_closed(PackedTags& tags) {
+        if (tags.size() != node_count_) {
+            throw std::logic_error(
+                "tag/tree size mismatch during closed reification");
         }
-        if (old_child_cursor != old_count) {
-            throw std::logic_error("slice-tree compaction child cursor lost alignment");
+        if (!tags.get(0)) return false;
+        std::vector<Node> live_per_level(depth_ + 1U, 0);
+        for (std::size_t depth = 0; depth <= depth_; ++depth) {
+            live_per_level[depth] = tags.count(
+                level_begin_[depth], level_begin_[depth + 1U]);
         }
-        if ((write & 15U) != 0) {
-            words_[output_word_index] = output_word;
-        }
-
-        node_count_ = write;
-        words_.resize(word_count_for_nodes(node_count_));
-        clear_unused_tail();
-        words_.shrink_to_fit();
-
-        level_begin_.clear();
-        level_begin_.reserve(depth_ + 2);
-        Node begin = 0;
-        level_begin_.push_back(begin);
-        for (const Node live : live_per_level) {
-            begin += live;
-            level_begin_.push_back(begin);
-        }
-        if (begin != node_count_ || live_per_level.front() != 1) {
-            throw std::logic_error("slice-tree level accounting failed");
-        }
-
-        rebuild_rank_directory();
-        return true;
+        return compact_closed_tags(tags, live_per_level);
     }
 
     [[nodiscard]] std::vector<std::uint8_t> lineage(Node leaf) const {
@@ -332,6 +358,79 @@ private:
 
     static std::size_t word_count_for_nodes(Node nodes) {
         return static_cast<std::size_t>((nodes + nodes_per_word - 1U) / nodes_per_word);
+    }
+
+    bool compact_closed_tags(PackedTags& tags,
+                             const std::vector<Node>& live_per_level) {
+        Node write = 0;
+        Node old_child_cursor = 1;
+        std::size_t output_word_index = 0;
+        std::uint64_t output_word = 0;
+        const auto old_count = node_count_;
+        const auto old_word_count = words_.size();
+        for (std::size_t word_index = 0;
+             word_index < old_word_count; ++word_index) {
+            // Earlier compacted nibbles may land in this word.  Save its old
+            // contents before processing any of its original node records.
+            const auto original_word = words_[word_index];
+            const Node first = static_cast<Node>(word_index) * 16U;
+            const Node last = std::min<Node>(first + 16U, old_count);
+            for (Node node = first; node < last; ++node) {
+                const auto shift =
+                    static_cast<unsigned>((node & 15U) * 4U);
+                const auto original_mask = static_cast<std::uint8_t>(
+                    (original_word >> shift) & 0x0fU);
+                auto old_child = old_child_cursor;
+                old_child_cursor +=
+                    static_cast<Node>(std::popcount(original_mask));
+                if (!tags.get(node)) continue;
+                std::uint8_t retained_mask = 0;
+                for (std::uint8_t label = 0; label < 4; ++label) {
+                    if ((original_mask & (1U << label)) == 0) continue;
+                    if (tags.get(old_child++)) {
+                        retained_mask |=
+                            static_cast<std::uint8_t>(1U << label);
+                    }
+                }
+                const auto output_shift =
+                    static_cast<unsigned>((write & 15U) * 4U);
+                output_word |=
+                    static_cast<std::uint64_t>(retained_mask)
+                    << output_shift;
+                ++write;
+                if ((write & 15U) == 0) {
+                    words_[output_word_index++] = output_word;
+                    output_word = 0;
+                }
+            }
+        }
+        if (old_child_cursor != old_count) {
+            throw std::logic_error(
+                "slice-tree compaction child cursor lost alignment");
+        }
+        if ((write & 15U) != 0) {
+            words_[output_word_index] = output_word;
+        }
+
+        node_count_ = write;
+        words_.resize(word_count_for_nodes(node_count_));
+        clear_unused_tail();
+        words_.shrink_to_fit();
+
+        level_begin_.clear();
+        level_begin_.reserve(depth_ + 2U);
+        Node begin = 0;
+        level_begin_.push_back(begin);
+        for (const Node live : live_per_level) {
+            begin += live;
+            level_begin_.push_back(begin);
+        }
+        if (begin != node_count_ || live_per_level.front() != 1) {
+            throw std::logic_error("slice-tree level accounting failed");
+        }
+
+        rebuild_rank_directory();
+        return true;
     }
 
     void resize_nodes(Node nodes) {

@@ -1,3 +1,4 @@
 /build/
 /rlife_llsss
 /target/
+*.o
