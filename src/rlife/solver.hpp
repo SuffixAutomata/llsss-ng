@@ -15,12 +15,15 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -78,24 +81,194 @@ inline EdgeMode parse_edge(const std::string& text) {
 }
 
 struct Geometry {
+  enum class Lattice { Orthogonal, Diagonal };
+
+  struct Coordinate {
+    std::int64_t u = 0;
+    std::int64_t v = 0;
+    std::int64_t w = 0;
+
+    bool operator==(const Coordinate&) const = default;
+    bool operator<(const Coordinate& other) const noexcept { return std::tie(w, v, u) < std::tie(other.w, other.v, other.u); }
+  };
+
+  struct PhysicalCoordinate {
+    std::int64_t x = 0;
+    std::int64_t y = 0;
+    std::int64_t t = 0;
+  };
+
   int displacement = 1;
   int period = 0;
+  int gcd = 1;
+  int subtile_count = 1;
+  std::int64_t w_space = 0;
+  std::int64_t w_time = 1;
+  Lattice lattice = Lattice::Orthogonal;
+  std::vector<Coordinate> spots;
   std::string source;
 
   static Geometry parse(const std::string& text) {
-    static const std::regex pattern(R"(^([0-9]*)c([0-9]+)-f2b$)");
+    static const std::regex pattern(R"(^([0-9]*)c([0-9]+)(d?)-f2b$)");
     std::smatch match;
     if(!std::regex_match(text, match, pattern)) {
-      throw std::runtime_error("orthogonal geometry must look like c4-f2b or 2c5-f2b");
+      throw std::runtime_error("geometry must look like c4-f2b, 2c5-f2b, or c5d-f2b");
     }
     Geometry result;
     result.source = text;
     result.displacement = match[1].str().empty() ? 1 : std::stoi(match[1].str());
     result.period = std::stoi(match[2].str());
+    result.lattice = match[3].str().empty() ? Lattice::Orthogonal : Lattice::Diagonal;
     if(result.period <= 0 || result.displacement < 0 || result.displacement > result.period) {
       throw std::runtime_error("geometry requires 0 <= displacement <= period and period > 0");
     }
+    result.gcd = std::gcd(result.displacement, result.period);
+    if(result.lattice == Lattice::Orthogonal && result.gcd != 1) {
+      throw std::runtime_error("non-coprime orthogonal periods are not supported");
+    }
+    const auto diagonal_subtiles = 2LL * static_cast<std::int64_t>(result.gcd);
+    if(result.lattice == Lattice::Diagonal && diagonal_subtiles > std::numeric_limits<int>::max()) {
+      throw std::runtime_error("diagonal geometry has too many lattice subtiles");
+    }
+    result.subtile_count = result.lattice == Lattice::Diagonal ? static_cast<int>(diagonal_subtiles) : 1;
+
+    if(result.lattice == Lattice::Diagonal) {
+      const auto [common, time, space] = extended_gcd(result.displacement, result.period);
+      if(common != result.gcd) {
+        throw std::logic_error("diagonal geometry Bezout construction failed");
+      }
+      result.w_time = time;
+      result.w_space = space;
+      result.build_diagonal_spots();
+    }
     return result;
+  }
+
+  [[nodiscard]] bool diagonal() const noexcept { return lattice == Lattice::Diagonal; }
+
+  [[nodiscard]] std::size_t short_window() const noexcept {
+    return static_cast<std::size_t>(diagonal() ? 4 : 2) * static_cast<std::size_t>(period);
+  }
+
+  [[nodiscard]] std::size_t long_window() const noexcept { return short_window() + static_cast<std::size_t>(subtile_count); }
+
+  [[nodiscard]] bool complete_tile(std::size_t depth) const noexcept { return depth % static_cast<std::size_t>(subtile_count) == 0; }
+
+  [[nodiscard]] std::size_t w_position(std::size_t depth) const noexcept { return depth / static_cast<std::size_t>(subtile_count); }
+
+  [[nodiscard]] std::size_t subtile_position(std::size_t depth) const noexcept { return depth % static_cast<std::size_t>(subtile_count); }
+
+  [[nodiscard]] std::string position_string(std::size_t depth) const {
+    if(subtile_count == 1) {
+      return std::to_string(depth);
+    }
+    return std::to_string(w_position(depth)) + "[" + std::to_string(subtile_position(depth)) + "]";
+  }
+
+  [[nodiscard]] Coordinate shift(Coordinate coordinate, int dx, int dy, int dt) const {
+    if(!diagonal()) {
+      throw std::logic_error("diagonal coordinate shift requested for an orthogonal geometry");
+    }
+    coordinate.u += static_cast<std::int64_t>(gcd) * (dx - dy);
+    coordinate.v += 2 * w_space * dt - w_time * (dx + dy);
+    coordinate.w += static_cast<std::int64_t>(period) * (dx + dy) + 2LL * displacement * dt;
+    coordinate.v = floor_mod(coordinate.v, subtile_count);
+    return coordinate;
+  }
+
+  [[nodiscard]] Coordinate diagonal_cell(std::int64_t logical_u, std::int64_t flattened_depth) const {
+    if(!diagonal()) {
+      throw std::logic_error("diagonal cell requested for an orthogonal geometry");
+    }
+    const auto tile = floor_div(flattened_depth, subtile_count);
+    const auto phase = static_cast<std::size_t>(floor_mod(flattened_depth, subtile_count));
+    auto coordinate = spots.at(phase);
+    coordinate.u += static_cast<std::int64_t>(subtile_count) * logical_u;
+    coordinate.w += static_cast<std::int64_t>(subtile_count) * tile;
+    return coordinate;
+  }
+
+  [[nodiscard]] PhysicalCoordinate to_physical(Coordinate coordinate) const {
+    if(!diagonal()) {
+      throw std::logic_error("diagonal physical conversion requested for an orthogonal geometry");
+    }
+    const auto scale = static_cast<std::int64_t>(subtile_count);
+    const auto x_numerator = coordinate.u - static_cast<std::int64_t>(displacement) * coordinate.v + w_space * coordinate.w;
+    const auto y_numerator = -coordinate.u - static_cast<std::int64_t>(displacement) * coordinate.v + w_space * coordinate.w;
+    const auto t_numerator = static_cast<std::int64_t>(period) * coordinate.v + w_time * coordinate.w;
+    if(x_numerator % scale != 0 || y_numerator % scale != 0 || t_numerator % scale != 0) {
+      throw std::logic_error("diagonal lattice coordinate does not map to an integral physical cell");
+    }
+    return {x_numerator / scale, y_numerator / scale, t_numerator / scale};
+  }
+
+private:
+  static std::int64_t floor_div(std::int64_t numerator, std::int64_t denominator) {
+    auto quotient = numerator / denominator;
+    const auto remainder = numerator % denominator;
+    if(remainder < 0) {
+      --quotient;
+    }
+    return quotient;
+  }
+
+  static std::int64_t floor_mod(std::int64_t value, std::int64_t modulus) {
+    const auto remainder = value % modulus;
+    return remainder < 0 ? remainder + modulus : remainder;
+  }
+
+  // Return (g, x, y) with a*x + b*y = g and g >= 0.
+  static std::tuple<std::int64_t, std::int64_t, std::int64_t> extended_gcd(std::int64_t a, std::int64_t b) {
+    std::int64_t old_r = a;
+    std::int64_t r = b;
+    std::int64_t old_x = 1;
+    std::int64_t x = 0;
+    std::int64_t old_y = 0;
+    std::int64_t y = 1;
+    while(r != 0) {
+      const auto quotient = old_r / r;
+      std::tie(old_r, r) = std::pair{r, old_r - quotient * r};
+      std::tie(old_x, x) = std::pair{x, old_x - quotient * x};
+      std::tie(old_y, y) = std::pair{y, old_y - quotient * y};
+    }
+    if(old_r < 0) {
+      old_r = -old_r;
+      old_x = -old_x;
+      old_y = -old_y;
+    }
+    return {old_r, old_x, old_y};
+  }
+
+  void build_diagonal_spots() {
+    const auto modulus = static_cast<std::int64_t>(subtile_count);
+    const std::array<Coordinate, 3> generators = {
+        Coordinate{gcd, -w_time, period},
+        Coordinate{-gcd, -w_time, period},
+        Coordinate{0, 2 * w_space, 2LL * displacement},
+    };
+    auto normalized = [&](Coordinate coordinate) {
+      coordinate.u = floor_mod(coordinate.u, modulus);
+      coordinate.v = floor_mod(coordinate.v, modulus);
+      coordinate.w = floor_mod(coordinate.w, modulus);
+      return coordinate;
+    };
+
+    std::set<Coordinate> discovered;
+    std::vector<Coordinate> pending;
+    discovered.insert({});
+    pending.push_back({});
+    for(std::size_t cursor = 0; cursor < pending.size(); ++cursor) {
+      for(const auto generator : generators) {
+        const auto next = normalized({pending[cursor].u + generator.u, pending[cursor].v + generator.v, pending[cursor].w + generator.w});
+        if(discovered.insert(next).second) {
+          pending.push_back(next);
+        }
+      }
+    }
+    if(discovered.size() != static_cast<std::size_t>(subtile_count)) {
+      throw std::logic_error("diagonal lattice spot enumeration has the wrong determinant");
+    }
+    spots.assign(discovered.begin(), discovered.end());
   }
 };
 
@@ -163,9 +336,9 @@ inline void print_help(std::ostream& out) {
   out <<
       R"(rlife_llsss llsss [options] <geometry> <start>
 
-Orthogonal fixed-width LLSSS using succinct two-column slice trees.
+Orthogonal and diagonal fixed-width LLSSS using succinct two-column slice trees.
 
-  <geometry>                 c4-f2b, 2c5-f2b, ...
+  <geometry>                 c4-f2b, 2c5-f2b, c5d-f2b, ...
   <start>                    @bg(W), @bg:W, an RLE file, or an ASCII grid
 
   --rule RULE                isotropic B/S or Hensel rule (default S23/B3)
@@ -176,7 +349,7 @@ Orthogonal fixed-width LLSSS using succinct two-column slice trees.
   --filters bcaf             BCAF zero-background witness filter
   --ends default|none        zero-background completion detection (default)
   --[no-]halt-on-ends        halt after the first completion (default: halt)
-  --halts w_pos:N            stop at row-sequence height N
+  --halts w_pos:N            stop at logical W-tile position N
   --partials MODE            none, final, default, or every:N (default: final)
   --partial-output FILE      write RLE partials/completions to FILE
   --dump-slice-stats FILE    append per-height succinct-slice statistics
@@ -186,6 +359,8 @@ Orthogonal fixed-width LLSSS using succinct two-column slice trees.
   --threads N                reserved for future parallel DFS (currently serial)
   -h, --help                 show this help
 
+Diagonal geometries currently require background edges.  Their RLE/ASCII input
+rows are flattened logical-U lattice subtiles; @bg(W) needs no conversion.
 The implementation has no autochoke and stores no join endpoints or join DAG.
 )";
 }
@@ -344,10 +519,17 @@ struct StartGrid {
 class Solver {
 public:
   explicit Solver(Options options) : options_(std::move(options)), geometry_(Geometry::parse(options_.geometry)), rule_(RuleTable::parse(options_.rule)) {
-    configure_pair_history();
     build_pair_transition_table();
-    build_row_acceptance_table();
-    build_edge_acceptance_tables();
+    if(geometry_.diagonal()) {
+      if(options_.left_edge != EdgeMode::Background || options_.right_edge != EdgeMode::Background) {
+        throw std::runtime_error("diagonal geometries currently support background edges only; diagonal odd reflection is phase-staggered and even reflection is incompatible");
+      }
+      build_diagonal_acceptance_tables();
+    } else {
+      configure_pair_history();
+      build_row_acceptance_table();
+      build_edge_acceptance_tables();
+    }
     rule_.release_partial_lookup();
     if(!options_.partial_output.empty()) {
       partial_file_.open(options_.partial_output, std::ios::out | std::ios::trunc);
@@ -371,7 +553,8 @@ public:
   }
 
   int run() {
-    std::cout << "rlife_llsss: geom=" << geometry_.source << " p=" << geometry_.period << " k=" << geometry_.displacement << " rule=" << options_.rule
+    std::cout << "rlife_llsss: geom=" << geometry_.source << " lattice=" << (geometry_.diagonal() ? "diagonal" : "orthogonal") << " p=" << geometry_.period
+              << " k=" << geometry_.displacement << " subtiles=" << geometry_.subtile_count << " rule=" << options_.rule
               << " width=" << width_ << " left_edge=" << edge_name(options_.left_edge) << " right_edge=" << edge_name(options_.right_edge)
               << " bcaf=" << (options_.bcaf ? "yes" : "no") << " halt_on_ends=" << (options_.halt_on_ends ? "yes" : "no") << '\n';
     if(options_.reserved_threads != 1) {
@@ -384,7 +567,7 @@ public:
       std::cout << "search space is empty after initialization\n";
       return 0;
     }
-    if(options_.halt_height >= 0 && height_ >= static_cast<std::size_t>(options_.halt_height)) {
+    if(options_.halt_height >= 0 && geometry_.w_position(height_) >= static_cast<std::size_t>(options_.halt_height)) {
       emit_final_partial("halt");
       return 0;
     }
@@ -404,7 +587,11 @@ public:
 
       phase("support and filter sweeps");
       if(!prune_supported()) {
-        std::cout << "search exhausted at height " << height_ << '\n';
+        if(geometry_.diagonal()) {
+          std::cout << "search exhausted at flattened depth " << height_ << " (w_pos " << geometry_.position_string(height_) << ")\n";
+        } else {
+          std::cout << "search exhausted at height " << height_ << '\n';
+        }
         slices_.clear();
         return 0;
       }
@@ -420,7 +607,11 @@ public:
       if(options_.detect_ends) {
         phase("end-tag propagation");
         if(auto completion = find_completion()) {
-          std::cout << "completion at height " << height_ << '\n';
+          if(geometry_.diagonal()) {
+            std::cout << "completion at flattened depth " << height_ << " (w_pos " << geometry_.position_string(height_) << ")\n";
+          } else {
+            std::cout << "completion at height " << height_ << '\n';
+          }
           emit_board(*completion, "completion");
           if(options_.halt_on_ends) {
             return 0;
@@ -428,8 +619,12 @@ public:
         }
       }
 
-      if(options_.halt_height >= 0 && height_ >= static_cast<std::size_t>(options_.halt_height)) {
-        std::cout << "height halt at " << height_ << '\n';
+      if(options_.halt_height >= 0 && geometry_.w_position(height_) >= static_cast<std::size_t>(options_.halt_height)) {
+        if(geometry_.diagonal()) {
+          std::cout << "w_pos halt at " << geometry_.position_string(height_) << '\n';
+        } else {
+          std::cout << "height halt at " << height_ << '\n';
+        }
         emit_final_partial("halt");
         return 0;
       }
@@ -559,7 +754,7 @@ private:
   }
 
   StartGrid load_start() const {
-    if(auto grid = magic_background(options_.start, 2U * static_cast<std::size_t>(geometry_.period)); grid.width != 0) {
+    if(auto grid = magic_background(options_.start, geometry_.short_window()); grid.width != 0) {
       return grid;
     }
     const auto text = read_file(options_.start);
@@ -586,11 +781,15 @@ private:
   void initialize() {
     const auto start = load_start();
     if(start.width < 3) {
-      throw std::runtime_error("start width must be at least three physical columns");
+      throw std::runtime_error(geometry_.diagonal() ? "start width must be at least three logical U columns"
+                                                    : "start width must be at least three physical columns");
     }
-    const auto minimum_height = 2U * static_cast<std::size_t>(geometry_.period);
+    const auto minimum_height = geometry_.short_window();
     if(start.height < minimum_height) {
-      throw std::runtime_error("start height must be at least 2*p = " + std::to_string(minimum_height));
+      throw std::runtime_error("start height must cover the geometry lookback of " + std::to_string(minimum_height) + " flattened lattice rows");
+    }
+    if(!geometry_.complete_tile(start.height)) {
+      throw std::runtime_error("start height must end at a complete lattice tile (a multiple of " + std::to_string(geometry_.subtile_count) + ")");
     }
     width_ = start.width;
     height_ = start.height;
@@ -603,6 +802,168 @@ private:
     if(!prune_supported()) {
       slices_.clear();
     }
+  }
+
+  struct DiagonalRead {
+    enum class Kind : std::uint8_t { Unknown, Candidate, History };
+
+    Kind kind = Kind::Unknown;
+    std::size_t offset = 0;
+    std::uint8_t column = 0;
+  };
+
+  using DiagonalEquation = std::array<DiagonalRead, 10>;
+
+  struct DiagonalProjection {
+    std::vector<std::size_t> history_offsets;
+    std::vector<DiagonalEquation> equations;
+    std::vector<std::uint8_t> candidate_masks;
+
+    [[nodiscard]] std::size_t storage_bytes() const noexcept {
+      return history_offsets.capacity() * sizeof(history_offsets[0]) + equations.capacity() * sizeof(equations[0]) +
+             candidate_masks.capacity() * sizeof(candidate_masks[0]);
+    }
+  };
+
+  static constexpr std::array<std::array<int, 3>, 10> ca_offsets_ = {
+      std::array{-1, -1, 0}, std::array{0, -1, 0}, std::array{1, -1, 0}, std::array{-1, 0, 0}, std::array{0, 0, 0},
+      std::array{1, 0, 0},   std::array{-1, 1, 0}, std::array{0, 1, 0},  std::array{1, 1, 0},  std::array{0, 0, 1},
+  };
+
+  void build_diagonal_acceptance_tables() {
+    constexpr std::size_t maximum_projection_history_rows = 5;
+    const auto lookback = geometry_.short_window();
+    diagonal_acceptance_.resize(static_cast<std::size_t>(geometry_.subtile_count));
+
+    for(std::size_t phase = 0; phase < diagonal_acceptance_.size(); ++phase) {
+      std::map<Geometry::Coordinate, DiagonalRead> board;
+      for(std::uint8_t column = 0; column < 3; ++column) {
+        board.emplace(geometry_.diagonal_cell(column, static_cast<std::int64_t>(phase)),
+                      DiagonalRead{DiagonalRead::Kind::Candidate, 0, column});
+        for(std::size_t offset = 1; offset <= lookback; ++offset) {
+          const auto inserted = board.emplace(
+              geometry_.diagonal_cell(column, static_cast<std::int64_t>(phase) - static_cast<std::int64_t>(offset)),
+              DiagonalRead{DiagonalRead::Kind::History, offset, column});
+          if(!inserted.second) {
+            throw std::logic_error("diagonal history board aliases two lineage bits");
+          }
+        }
+      }
+
+      std::set<Geometry::Coordinate> centers;
+      for(std::uint8_t column = 0; column < 3; ++column) {
+        const auto candidate = geometry_.diagonal_cell(column, static_cast<std::int64_t>(phase));
+        for(const auto& delta : ca_offsets_) {
+          centers.insert(geometry_.shift(candidate, -delta[0], -delta[1], -delta[2]));
+        }
+      }
+
+      std::vector<DiagonalEquation> equations;
+      for(const auto center : centers) {
+        DiagonalEquation equation;
+        bool touches_candidate = false;
+        for(std::size_t bit = 0; bit < ca_offsets_.size(); ++bit) {
+          const auto& delta = ca_offsets_[bit];
+          const auto found = board.find(geometry_.shift(center, delta[0], delta[1], delta[2]));
+          if(found != board.end()) {
+            equation[bit] = found->second;
+            touches_candidate = touches_candidate || found->second.kind == DiagonalRead::Kind::Candidate;
+          }
+        }
+        if(touches_candidate) {
+          equations.push_back(equation);
+        }
+      }
+
+      auto& projections = diagonal_acceptance_[phase];
+      for(const auto& equation : equations) {
+        std::set<std::size_t> equation_offsets;
+        for(const auto read : equation) {
+          if(read.kind == DiagonalRead::Kind::History) {
+            equation_offsets.insert(read.offset);
+          }
+        }
+
+        DiagonalProjection* destination = nullptr;
+        for(auto& projection : projections) {
+          auto combined = std::set<std::size_t>(projection.history_offsets.begin(), projection.history_offsets.end());
+          combined.insert(equation_offsets.begin(), equation_offsets.end());
+          if(combined.size() <= maximum_projection_history_rows) {
+            projection.history_offsets.assign(combined.begin(), combined.end());
+            destination = &projection;
+            break;
+          }
+        }
+        if(destination == nullptr) {
+          projections.emplace_back();
+          projections.back().history_offsets.assign(equation_offsets.begin(), equation_offsets.end());
+          destination = &projections.back();
+        }
+        destination->equations.push_back(equation);
+      }
+
+      for(auto& projection : projections) {
+        const auto history_bits = 3U * projection.history_offsets.size();
+        const auto history_patterns = std::size_t{1} << history_bits;
+        projection.candidate_masks.resize(history_patterns, 0);
+        for(std::size_t history = 0; history < history_patterns; ++history) {
+          for(std::uint8_t position = 0; position < pair_triple_order_.size(); ++position) {
+            const auto candidate = pair_triple_order_[position];
+            bool accepted = true;
+            for(const auto& equation : projection.equations) {
+              std::uint16_t known = 0;
+              std::uint16_t value = 0;
+              for(std::size_t bit_index = 0; bit_index < equation.size(); ++bit_index) {
+                const auto read = equation[bit_index];
+                if(read.kind == DiagonalRead::Kind::Unknown) {
+                  continue;
+                }
+                bool state = false;
+                if(read.kind == DiagonalRead::Kind::Candidate) {
+                  state = ((candidate >> read.column) & 1U) != 0;
+                } else {
+                  const auto found = std::lower_bound(projection.history_offsets.begin(), projection.history_offsets.end(), read.offset);
+                  if(found == projection.history_offsets.end() || *found != read.offset) {
+                    throw std::logic_error("diagonal projection omitted a required history row");
+                  }
+                  const auto history_index = static_cast<std::size_t>(found - projection.history_offsets.begin());
+                  state = ((history >> (3U * history_index + read.column)) & 1U) != 0;
+                }
+                const auto bit = static_cast<std::uint16_t>(1U << bit_index);
+                known = static_cast<std::uint16_t>(known | bit);
+                if(state) {
+                  value = static_cast<std::uint16_t>(value | bit);
+                }
+              }
+              if(!rule_.accepts_partial(known, value)) {
+                accepted = false;
+                break;
+              }
+            }
+            if(accepted) {
+              projection.candidate_masks[history] =
+                  static_cast<std::uint8_t>(projection.candidate_masks[history] | (1U << position));
+            }
+          }
+        }
+      }
+    }
+  }
+
+  [[nodiscard]] std::uint8_t diagonal_history_all_accepts(const std::uint8_t* triples, std::size_t row) const {
+    if(row < geometry_.short_window()) {
+      return 0xffU;
+    }
+    std::uint8_t accepted = 0xffU;
+    const auto phase = geometry_.subtile_position(row);
+    for(const auto& projection : diagonal_acceptance_.at(phase)) {
+      std::size_t history = 0;
+      for(std::size_t index = 0; index < projection.history_offsets.size(); ++index) {
+        history |= static_cast<std::size_t>(triples[row - projection.history_offsets[index]] & 0b111U) << (3U * index);
+      }
+      accepted = static_cast<std::uint8_t>(accepted & projection.candidate_masks[history]);
+    }
+    return accepted;
   }
 
   [[nodiscard]] bool row_candidate_accepts(const std::array<std::uint8_t, 5>& history, std::uint8_t candidate) const {
@@ -666,6 +1027,7 @@ private:
   }
 
   void build_row_acceptance_table() {
+    row_acceptance_.resize(1U << 15U);
     for(std::size_t key = 0; key < row_acceptance_.size(); ++key) {
       auto remaining = key;
       std::array<std::uint8_t, 5> history{};
@@ -769,6 +1131,8 @@ private:
   }
 
   void build_edge_acceptance_tables() {
+    odd_edge_acceptance_.resize(1U << 10U);
+    even_edge_acceptance_.resize(1U << 10U);
     auto build = [&](EdgeMode mode, auto& table) {
       for(std::size_t key = 0; key < table.size(); ++key) {
         auto remaining = key;
@@ -797,6 +1161,9 @@ private:
   }
 
   [[nodiscard]] std::uint8_t history_all_accepts(const std::uint8_t* triples, std::size_t row) const {
+    if(geometry_.diagonal()) {
+      return diagonal_history_all_accepts(triples, row);
+    }
     if(row < pair_history_offsets_[0])
       return 0xffU;
     const auto key =
@@ -887,7 +1254,8 @@ private:
     bool any = false;
     const auto children = tree.child_block(node);
     auto child = children.first;
-    const auto acceptor = edge_history_all_accepts(history.data(), depth, edge);
+    const bool diagonal_background = geometry_.diagonal() && edge == EdgeMode::Background;
+    const auto acceptor = diagonal_background ? std::uint8_t{0xffU} : edge_history_all_accepts(history.data(), depth, edge);
     for(std::uint8_t label = 0; label < 4; ++label) {
       if((children.mask & (1U << label)) == 0)
         continue;
@@ -897,7 +1265,7 @@ private:
       // terminal slice therefore extend with zero.
       if(edge == EdgeMode::Background && label != 0)
         continue;
-      if(!(acceptor & (1U << canonical_edge_pair(label, left_side, edge))))
+      if(!diagonal_background && !(acceptor & (1U << canonical_edge_pair(label, left_side, edge))))
         continue;
       history[depth] = canonical_edge_pair(label, left_side, edge);
       if(boundary_dfs(tree, next, depth + 1, edge, left_side, history, tags)) {
@@ -1088,7 +1456,7 @@ private:
       normal.emplace_back(slice.node_count());
     account_tags(normal);
 
-    const auto bcaf_window = 2U * static_cast<std::size_t>(geometry_.period) + 1U;
+    const auto bcaf_window = geometry_.long_window();
     const bool bcaf_active = options_.bcaf && height_ >= bcaf_window;
     std::vector<TagPair> witness;
     if(bcaf_active) {
@@ -1212,8 +1580,9 @@ private:
 
       const bool cache_partial =
           (options_.partial_mode == PartialMode::Every && height_ % static_cast<std::size_t>(options_.partial_every) == 0) ||
-          (options_.partial_mode != PartialMode::None && options_.halt_height >= 0 && height_ >= static_cast<std::size_t>(options_.halt_height));
-      const bool cache_completion = options_.detect_ends;
+          (options_.partial_mode != PartialMode::None && options_.halt_height >= 0 &&
+           geometry_.w_position(height_) >= static_cast<std::size_t>(options_.halt_height));
+      const bool cache_completion = options_.detect_ends && geometry_.complete_tile(height_);
       std::vector<PackedTags> partial_suffix;
       std::vector<TagPair> completion_suffix;
       if(cache_partial) {
@@ -1235,7 +1604,7 @@ private:
       peak_tag_bytes_ =
           std::max(peak_tag_bytes_, tag_bytes(normal) + tag_bytes(witness) + tag_bytes(clean) + tag_bytes(completion_suffix) + reconstruction_tag_bytes);
 
-      const auto short_window = 2U * static_cast<std::size_t>(geometry_.period);
+      const auto short_window = geometry_.short_window();
       const auto short_start = height_ - short_window;
       const auto long_start = height_ - bcaf_window;
 
@@ -1492,10 +1861,12 @@ private:
   }
 
   std::optional<Board> find_completion() {
+    if(!geometry_.complete_tile(height_))
+      return std::nullopt;
     if(cached_completion_height_ == height_)
       return cached_completion_;
-    const auto short_window = 2U * static_cast<std::size_t>(geometry_.period);
-    const auto long_window = short_window + 1U;
+    const auto short_window = geometry_.short_window();
+    const auto long_window = geometry_.long_window();
     if(height_ < long_window)
       return std::nullopt;
 
@@ -1635,7 +2006,7 @@ private:
   Board reconstruct_partial() {
     if(cached_partial_)
       return *cached_partial_;
-    const auto bcaf_window = 2U * static_cast<std::size_t>(geometry_.period) + 1U;
+    const auto bcaf_window = geometry_.long_window();
     if(options_.bcaf && height_ >= bcaf_window) {
       return reconstruct_interesting(bcaf_window);
     }
@@ -1698,6 +2069,86 @@ private:
 
   Board render_phase_montage(const Board& row_sequence) const {
     constexpr std::size_t phase_spacing = 16;
+    if(geometry_.diagonal()) {
+      struct PhaseCell {
+        std::int64_t x = 0;
+        std::int64_t y = 0;
+        bool live = false;
+      };
+      struct PhaseImage {
+        std::vector<PhaseCell> cells;
+        std::int64_t min_x = std::numeric_limits<std::int64_t>::max();
+        std::int64_t max_x = std::numeric_limits<std::int64_t>::min();
+        std::int64_t min_y = std::numeric_limits<std::int64_t>::max();
+        std::int64_t max_y = std::numeric_limits<std::int64_t>::min();
+      };
+
+      const auto floor_div = [](std::int64_t numerator, std::int64_t denominator) {
+        auto quotient = numerator / denominator;
+        if(numerator % denominator < 0) {
+          --quotient;
+        }
+        return quotient;
+      };
+      std::vector<PhaseImage> phases(static_cast<std::size_t>(geometry_.period));
+      for(std::size_t depth = 0; depth < row_sequence.size(); ++depth) {
+        for(std::size_t logical_u = 0; logical_u < row_sequence[depth].size(); ++logical_u) {
+          auto physical = geometry_.to_physical(geometry_.diagonal_cell(static_cast<std::int64_t>(logical_u), static_cast<std::int64_t>(depth)));
+          const auto quotient = floor_div(physical.t, geometry_.period);
+          physical.x += quotient * geometry_.displacement;
+          physical.y += quotient * geometry_.displacement;
+          physical.t -= quotient * geometry_.period;
+          auto& phase = phases.at(static_cast<std::size_t>(physical.t));
+          phase.cells.push_back({physical.x, physical.y, row_sequence[depth][logical_u] != 0});
+          phase.min_x = std::min(phase.min_x, physical.x);
+          phase.max_x = std::max(phase.max_x, physical.x);
+          phase.min_y = std::min(phase.min_y, physical.y);
+          phase.max_y = std::max(phase.max_y, physical.y);
+        }
+      }
+
+      std::size_t montage_width = phase_spacing * (phases.size() - 1U);
+      std::size_t montage_height = 0;
+      std::vector<std::size_t> phase_x;
+      phase_x.reserve(phases.size());
+      for(const auto& phase : phases) {
+        if(phase.cells.empty()) {
+          throw std::logic_error("diagonal phase montage has an empty time phase");
+        }
+        phase_x.push_back(0);
+        const auto phase_width = static_cast<std::size_t>(phase.max_x - phase.min_x + 1);
+        const auto phase_height = static_cast<std::size_t>(phase.max_y - phase.min_y + 1);
+        montage_width += phase_width;
+        montage_height = std::max(montage_height, phase_height);
+      }
+
+      // Recompute simple cumulative origins; the first pass above only
+      // establishes the total dimensions without a second width vector.
+      std::size_t next_x = 0;
+      for(std::size_t index = 0; index < phases.size(); ++index) {
+        phase_x[index] = next_x;
+        next_x += static_cast<std::size_t>(phases[index].max_x - phases[index].min_x + 1);
+        if(index + 1U < phases.size()) {
+          next_x += phase_spacing;
+        }
+      }
+      if(next_x != montage_width) {
+        throw std::logic_error("diagonal phase montage width accounting failed");
+      }
+
+      Board montage(montage_height, std::vector<std::uint8_t>(montage_width, 0));
+      for(std::size_t index = 0; index < phases.size(); ++index) {
+        const auto& phase = phases[index];
+        for(const auto cell : phase.cells) {
+          if(cell.live) {
+            montage[static_cast<std::size_t>(cell.y - phase.min_y)]
+                   [phase_x[index] + static_cast<std::size_t>(cell.x - phase.min_x)] = 1;
+          }
+        }
+      }
+      return montage;
+    }
+
     const auto period = static_cast<std::size_t>(geometry_.period);
     std::vector<std::vector<std::uint8_t>> reflected;
     reflected.reserve(row_sequence.size());
@@ -1755,9 +2206,15 @@ private:
   void emit_board(const Board& row_sequence, std::string_view kind) {
     const auto board = render_phase_montage(row_sequence);
     std::ostream& output = partial_file_.is_open() ? static_cast<std::ostream&>(partial_file_) : static_cast<std::ostream&>(std::cout);
-    output << "#C llsss " << kind << " height=" << height_ << " geometry=" << geometry_.source << '\n'
-           << "#C phases 0.." << geometry_.period - 1 << " left-to-right; phase i uses rows i, p+i, 2p+i, ..."
-           << "; gap=16\n"
+    output << "#C llsss " << kind << ' ';
+    if(geometry_.diagonal()) {
+      output << "flattened_depth=" << height_ << " w_pos=" << geometry_.position_string(height_) << " geometry=" << geometry_.source << '\n';
+      output << "#C physical time phases 0.." << geometry_.period - 1 << " left-to-right; gap=16\n";
+    } else {
+      output << "height=" << height_ << " geometry=" << geometry_.source << '\n';
+      output << "#C phases 0.." << geometry_.period - 1 << " left-to-right; phase i uses rows i, p+i, 2p+i, ...; gap=16\n";
+    }
+    output
            << "x = " << board.front().size() << ", y = " << board.size() << ", rule = " << options_.rule << '\n'
            << encode_rle(board);
     output.flush();
@@ -1772,8 +2229,13 @@ private:
 
   void phase(std::string_view message) {
     if(running_) {
-      if(options_.phase_progress)
-        std::cout << "height=" << height_ << " " << message << '\n';
+      if(options_.phase_progress) {
+        if(geometry_.diagonal()) {
+          std::cout << "depth=" << height_ << " w_pos=" << geometry_.position_string(height_) << ' ' << message << '\n';
+        } else {
+          std::cout << "height=" << height_ << ' ' << message << '\n';
+        }
+      }
       if(options_.phase_timings) {
         static std::string last_phase;
         auto current = Clock::now();
@@ -1842,13 +2304,25 @@ private:
         pair_gate_bytes += gate.allocated_bytes();
       }
     }
-    const auto lookup_bytes = rule_.storage_bytes() + row_acceptance_.size() * sizeof(row_acceptance_[0]) +
-                              odd_edge_acceptance_.size() * sizeof(odd_edge_acceptance_[0]) + even_edge_acceptance_.size() * sizeof(even_edge_acceptance_[0]) +
+    std::size_t diagonal_lookup_bytes = 0;
+    for(const auto& phase : diagonal_acceptance_) {
+      for(const auto& projection : phase) {
+        diagonal_lookup_bytes += projection.storage_bytes();
+      }
+    }
+    const auto lookup_bytes = rule_.storage_bytes() + row_acceptance_.capacity() * sizeof(row_acceptance_[0]) +
+                              odd_edge_acceptance_.capacity() * sizeof(odd_edge_acceptance_[0]) +
+                              even_edge_acceptance_.capacity() * sizeof(even_edge_acceptance_[0]) + diagonal_lookup_bytes +
                               pair_transitions_.size() * sizeof(pair_transitions_[0]);
     const auto persistent_payload_bytes = allocated + pair_gate_bytes + lookup_bytes;
     std::ostringstream line;
     if(options_.verbose) {
-      line << "height=" << height_ << " label=" << label << " nodes=" << nodes << " leaves=" << leaves << " child_bytes=" << bitstream << " rank_bytes=" << rank
+      if(geometry_.diagonal()) {
+        line << "depth=" << height_ << " w_pos=" << geometry_.position_string(height_);
+      } else {
+        line << "height=" << height_;
+      }
+      line << " label=" << label << " nodes=" << nodes << " leaves=" << leaves << " child_bytes=" << bitstream << " rank_bytes=" << rank
            << " level_bytes=" << levels << " allocated_bytes=" << allocated << " pair_gate_bytes=" << pair_gate_bytes << " lookup_bytes=" << lookup_bytes
            << " persistent_payload_bytes=" << persistent_payload_bytes << " pair_candidates=" << pair_candidates << " pair_allowed=" << pair_allowed
            << " tag_peak_bytes=" << peak_tag_bytes_ << " pair_states=" << pair_states_ << " pair_leaves=" << pair_leaves_
@@ -1859,7 +2333,11 @@ private:
       std::string maxrss_display;
       if(maxrss)
         maxrss_display = integer_format(maxrss) + "iB RSS, ";
-      line << "Row " << height_ << ", " << nodes << " nodes, mem " << integer_format(persistent_payload_bytes) << "iB, " << maxrss_display << "sec "
+      line << "Row " << height_;
+      if(geometry_.subtile_count != 1) {
+        line << " (w_pos " << geometry_.position_string(height_) << ')';
+      }
+      line << ", " << nodes << " nodes, mem " << integer_format(persistent_payload_bytes) << "iB, " << maxrss_display << "sec "
            << std::fixed << std::setprecision(6) << seconds << ", cols: " << slice_state.str();
     }
     std::cerr << line.str() << '\n';
@@ -1872,9 +2350,10 @@ private:
   Options options_;
   Geometry geometry_;
   RuleTable rule_;
-  std::array<std::uint8_t, 1U << 15U> row_acceptance_{};
-  std::array<std::uint8_t, 1U << 10U> odd_edge_acceptance_{};
-  std::array<std::uint8_t, 1U << 10U> even_edge_acceptance_{};
+  std::vector<std::uint8_t> row_acceptance_;
+  std::vector<std::uint8_t> odd_edge_acceptance_;
+  std::vector<std::uint8_t> even_edge_acceptance_;
+  std::vector<std::vector<DiagonalProjection>> diagonal_acceptance_;
   std::array<PairTransitions, 1U << 8U> pair_transitions_{};
   std::array<std::size_t, 5> pair_history_offsets_{};
   std::size_t width_ = 0;

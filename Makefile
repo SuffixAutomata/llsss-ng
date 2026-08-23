@@ -8,7 +8,7 @@ TARGET := rlife_llsss
 SOURCES := src/main.cpp
 HEADERS := $(wildcard src/rlife/*.hpp)
 
-.PHONY: all clean
+.PHONY: all clean test
 
 all: $(TARGET)
 
@@ -17,3 +17,6 @@ $(TARGET): $(SOURCES) $(HEADERS)
 
 clean:
 	rm -f $(TARGET)
+
+test: $(TARGET)
+	bash tests/search_regression.sh ./$(TARGET)

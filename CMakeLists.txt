@@ -10,3 +10,12 @@ option(RLIFE_NATIVE "Optimize for the build host CPU" ON)
 if(RLIFE_NATIVE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(rlife_llsss PRIVATE -march=native)
 endif()
+
+include(CTest)
+if(BUILD_TESTING)
+  add_test(
+    NAME search_smoke
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/search_regression.sh $<TARGET_FILE:rlife_llsss> smoke
+  )
+  set_tests_properties(search_smoke PROPERTIES TIMEOUT 60 LABELS "smoke;regression")
+endif()
