@@ -50,56 +50,61 @@ For example:
 ```
 
 `<geometry>` is an orthogonal `cP-f2b` / `KcP-f2b` geometry or a diagonal
-`cPd-f2b` / `KcPd-f2b` geometry. Orthogonal non-coprime periods are not yet
-supported. Reducing the fraction searches only its primitive-period subset,
-not every solution of the unreduced geometry. Orthogonal geometry directly
-selects the row relation
+`cPd-f2b` / `KcPd-f2b` geometry. Non-coprime geometries retain their unreduced
+period rather than silently searching only a primitive-period subset. The
+physical velocity-period basis is
 
 ```text
-evolve(row[n-2P], row[n-P], row[n]) = row[n-P+K].
+orthogonal: U = (1,0,0),  V = (0,-K,P)
+diagonal:   U = (1,-1,0), V = (-K,-K,P)
 ```
 
-Diagonal geometry uses lattice basis
-
-```text
-U = (1,-1,0), V = (-K,-K,P).
-```
-
-If `g = gcd(K,P)`, each logical `W` tile contains `2g` subtiles. One flattened
-subtile is one trie level, so a node and child label remain exactly the same
-size as in an orthogonal search. For example, `c5d-f2b` alternates two subtiles
-and starts with a 20-level CA lookback:
+If `g = gcd(K,P)`, each logical `W` tile contains `g` orthogonal subtiles or
+`2g` diagonal subtiles. One flattened subtile is one trie level, so a node and
+child label remain exactly the same size in every geometry. For example,
+`c5d-f2b` alternates two subtiles and starts with a 20-level CA lookback:
 
 ```sh
 ./rlife_llsss llsss --rule 'B35678/S4678' \
   --left-edge bg --filters bcaf c5d-f2b '@bg(11)'
 ```
 
+Compatible geometries support both glide-odd (`gso`) and glide-even (`gse`)
+edges. For example, this bounded invocation exercises both `c6d` subtiles
+without running the much larger width-seven search:
+
+```sh
+./rlife_llsss llsss --rule 'B3578/S24678' \
+  --left-edge gse --filters bcaf --ends none --halts w_pos:14 \
+  --save none c6d-f2b '@bg(4)'
+```
+
 The start can be `@bg(W)` (also accepting the older `@bg:W` spelling), a
 standard Life RLE file, or an ASCII grid containing `.`, `*`, and independent
-`?` cells. File rows are internal search rows: ordinary rows orthogonally and
-flattened logical-`U` subtiles diagonally. A file must contain at least `2P`
-rows orthogonally or `4P` rows diagonally, and must end at a complete lattice
-tile. `@bg(W)` constructs this lookback automatically.
+`?` cells. File rows are flattened logical-`U` lattice subtiles. A file must
+contain at least `2P` rows orthogonally or `4P` rows diagonally, and must end at
+a complete lattice tile. `@bg(W)` constructs this lookback automatically.
 
 Run `./rlife_llsss llsss --help` for all supported options. Zero is currently
-the only background agar. Background, odd, and even edges can be selected
-independently; `--symmetry asymmetric|odd|even` is a convenience spelling.
-Odd and even reflection are currently orthogonal-only; diagonal searches must
-use background edges. (Diagonal odd reflection is phase-staggered, while
-diagonal even reflection is not compatible with the vanilla lattice.) The
-default end detector finds a nontrivial transition into a full zero lookback,
-prints the recovered configurations as RLE, and halts. `--symmetry odd|even`
+the only background agar. Background, odd, even, glide-odd (`gso`), and
+glide-even (`gse`) edges can be selected independently. Their compatibility is:
+
+| lattice | odd | even | GSO | GSE |
+| --- | --- | --- | --- | --- |
+| orthogonal | yes | yes | `K,P` even | `K,P` even |
+| diagonal | yes | no | `K,P` even | `K` odd, `P` even |
+
+The default end detector finds a nontrivial transition into a full zero
+lookback, prints the recovered configurations as RLE, and halts. `--symmetry`
 sets only the left edge; explicit `--left-edge` and `--right-edge` options can
 override it independently.
 
-RLE output places all `P` phases from left to right with 16 dead cells between
-them. Orthogonally, phase `i` contains sequence rows `i`, `P+i`, `2P+i`, and so
-on. Diagonal output maps the logical lattice cells back to physical `(x,y,t)`
-and renders physical time phases. Orthogonal odd and even edge conditions are
-reflected into the displayed pattern: odd reflection shares its boundary cell,
-while even reflection duplicates it. If both edges are symmetric, the
-left-expanded row is reflected once more at the right.
+RLE output maps quotient-lattice cells back to physical `(x,y,t)` and places
+all `P` time phases from left to right with 16 dead cells between them. Every
+reflected edge uses the same coordinate transform as its boundary checker,
+including the half-period spatial and temporal shift for glides. If both edges
+are symmetric, the left-expanded configuration is reflected once more at the
+right.
 
 ## Checkpoints
 
@@ -148,17 +153,17 @@ At an extension, every current leaf mask changes from `0000` to `1111` and its
 four zero-mask children are appended. Synchronized DFS over neighboring tries
 rechecks overlap at every flattened row. Each new three-cell row is tested
 against the same static 1024-entry CA table for every complete or partially
-known local equation it touches. Orthogonal geometry uses one `15 + 3`-bit row
-projection, stored as a 32 KiB read-only lookup shared by every traversal.
-Diagonal projections are generated from the lattice for each subtile phase.
-Checks are greedily grouped so a lookup reads at most five historical triples;
+known local equation it touches. Interior projections are generated from the
+quotient lattice for each subtile phase. Checks are greedily grouped so a
+lookup reads at most five historical triples;
 for `c5d-f2b`, the three projections use 32,768 + 4,096 + 512 bytes per phase,
 or 73 KiB total. This avoids a monolithic `2^27` lookup without adding anything
-to persistent search state. Orthogonal odd and even edges use two additional
-1 KiB projections. A compact transition table maps the two four-bit child
-masks directly to the possible overlapping child pairs, so a pair state
-performs one rank operation per trie and iterates only present, CA-accepted
-branches.
+to persistent search state. Odd, even, GSO, and GSE boundaries use the same
+coordinate-generated approach. They group by at most ten individual
+historical bits, so each table contains at most 1024 four-bit masks. A compact
+transition table maps the two four-bit child masks directly to the possible
+overlapping child pairs, so a pair state performs one rank operation per trie
+and iterates only present, CA-accepted branches.
 
 Without BCAF, one sweep starts at the left boundary and the opposite sweep
 intersects reachability from the right boundary. With BCAF, dependency order

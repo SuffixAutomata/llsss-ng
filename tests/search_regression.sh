@@ -31,6 +31,18 @@ run_search() {
     >"$stdout_file" 2>"$stderr_file"
 }
 
+run_tiny_edge() {
+  local edge=$1
+  local geometry=$2
+  local halt=$3
+  local stdout_file=$4
+  local stderr_file=$5
+  timeout "${RLIFE_TEST_TIMEOUT:-180}" "$binary" llsss \
+    --rule B3578/S24678 --left-edge "$edge" --filters bcaf \
+    --partials none --ends none --halts "w_pos:$halt" --save none \
+    "$geometry" '@bg(3)' >"$stdout_file" 2>"$stderr_file"
+}
+
 if [[ $mode == smoke ]]; then
   run_search c3d-f2b 7 "$test_tmp/diagonal.out" "$test_tmp/diagonal.err"
   grep -Fq 'search exhausted at flattened depth 16 (w_pos 8[0])' "$test_tmp/diagonal.out"
@@ -45,6 +57,24 @@ if [[ $mode == smoke ]]; then
   [[ $four_subtile_hash == 92692a524225d9f5d02253fc1e12459e06f958e4b7a876dfc6335d08be7bbc99 ]]
 
   timeout "${RLIFE_TEST_TIMEOUT:-180}" "$binary" llsss \
+    --rule B3578/S24678 --left-edge gse --filters bcaf \
+    --partials final --partial-output "$test_tmp/gse.rle" \
+    --ends none --halts w_pos:14 \
+    --save final --savefile "$test_tmp/gse-checkpoint" \
+    c6d-f2b '@bg:4' >"$test_tmp/gse.out" 2>"$test_tmp/gse.err"
+  grep -Fq 'w_pos halt at 14[0]' "$test_tmp/gse.out"
+  [[ $(grep -c 'cols:' "$test_tmp/gse.err") == 5 ]]
+  gse_hash=$(normalize_hash "$test_tmp/gse.err")
+  [[ $gse_hash == c97a1a13840c7c34d0f1b343a149e64fe919f0fa539877a2544aa0c33022de4a ]]
+  grep -Fq '#C physical time phases 0..5 left-to-right; gap=16' "$test_tmp/gse.rle"
+  grep -Eq '^x = [0-9]+, y = [0-9]+, rule = B3578/S24678$' "$test_tmp/gse.rle"
+  tail -n +4 "$test_tmp/gse.rle" | grep -q 'o'
+  test -s "$test_tmp/gse-checkpoint_28"
+  "$binary" llsss --load "$test_tmp/gse-checkpoint_28" --partials none --save none \
+    >"$test_tmp/gse-reload.out" 2>"$test_tmp/gse-reload.err"
+  grep -Fq 'left_edge=gse' "$test_tmp/gse-reload.out"
+
+  timeout "${RLIFE_TEST_TIMEOUT:-180}" "$binary" llsss \
     --rule B3/S23 --left-edge bg --filters bcaf --partials none \
     --save final --savefile "$test_tmp/completion-checkpoint" \
     --partial-output "$test_tmp/completion.rle" c4d-f2b '@bg(6)' \
@@ -57,6 +87,15 @@ if [[ $mode == smoke ]]; then
   "$binary" llsss --load "$test_tmp/completion-checkpoint_48" --partials none --save none \
     >"$test_tmp/completion-reload.out" 2>"$test_tmp/completion-reload.err"
   grep -Fq 'checkpoint row already contains a halting completion' "$test_tmp/completion-reload.out"
+
+  run_tiny_edge gse 2c4-f2b 8 "$test_tmp/orth-gse.out" "$test_tmp/orth-gse.err"
+  [[ $(normalize_hash "$test_tmp/orth-gse.err") == 5574b6a953ab5ddf891961447b8b8f5a198d045561a28d636f52709dfe1bacaf ]]
+  run_tiny_edge gso 2c4-f2b 8 "$test_tmp/orth-gso.out" "$test_tmp/orth-gso.err"
+  [[ $(normalize_hash "$test_tmp/orth-gso.err") == ccf8a4bfd40d1e50f4d88201d47ad60dca64264c4a9a73eabb51e7cf9400d4be ]]
+  run_tiny_edge odd c3d-f2b 8 "$test_tmp/diagonal-odd.out" "$test_tmp/diagonal-odd.err"
+  [[ $(normalize_hash "$test_tmp/diagonal-odd.err") == b0e1f800f8131e14205af4f90b65680d9c72e78543ae5ec0632ff5da8e305e2c ]]
+  run_tiny_edge gso 2c4d-f2b 6 "$test_tmp/diagonal-gso.out" "$test_tmp/diagonal-gso.err"
+  [[ $(normalize_hash "$test_tmp/diagonal-gso.err") == 0161efcfd3ca9130bab60f32e5cbee80768f616d52787adc5761ffa385a4e944 ]]
 else
   run_search c5-f2b 11 "$test_tmp/orth.out" "$test_tmp/orth.err"
   grep -Fq 'search exhausted at height 37' "$test_tmp/orth.out"
@@ -71,23 +110,29 @@ else
   [[ $diagonal_hash == e24f646987b57b50b3c16f0d066a33f48338f1c17b46a503abd98ad3679a6a28 ]]
 fi
 
-if "$binary" llsss --left-edge odd --partials none --ends none --save none c5d-f2b '@bg(5)' >"$test_tmp/edge.out" 2>"$test_tmp/edge.err"; then
-  echo 'diagonal odd edge unexpectedly succeeded' >&2
+if "$binary" llsss --left-edge even --partials none --ends none --save none c5d-f2b '@bg(5)' >"$test_tmp/edge.out" 2>"$test_tmp/edge.err"; then
+  echo 'diagonal even edge unexpectedly succeeded' >&2
   exit 1
 fi
-grep -Fq 'diagonal geometries currently support background edges only' "$test_tmp/edge.err"
+grep -Fq 'diagonal even symmetry is incompatible with the lattice' "$test_tmp/edge.err"
 
-if "$binary" llsss --partials none --ends none --save none 2c4-f2b '@bg(5)' >"$test_tmp/nonprimitive.out" 2>"$test_tmp/nonprimitive.err"; then
-  echo 'non-primitive orthogonal geometry unexpectedly succeeded' >&2
+if "$binary" llsss --left-edge gse --partials none --ends none --save none c5d-f2b '@bg(3)' >"$test_tmp/gse-odd.out" 2>"$test_tmp/gse-odd.err"; then
+  echo 'odd-period diagonal glide-even edge unexpectedly succeeded' >&2
   exit 1
 fi
-grep -Fq 'non-coprime orthogonal periods are not supported' "$test_tmp/nonprimitive.err"
+grep -Fq 'diagonal glide-even symmetry requires an even period and odd displacement' "$test_tmp/gse-odd.err"
+
+if "$binary" llsss --left-edge gso --partials none --ends none --save none c4-f2b '@bg(5)' >"$test_tmp/orth-glide.out" 2>"$test_tmp/orth-glide.err"; then
+  echo 'incompatible primitive orthogonal glide unexpectedly succeeded' >&2
+  exit 1
+fi
+grep -Fq 'orthogonal glide symmetry requires an even period and even displacement' "$test_tmp/orth-glide.err"
 
 if "$binary" llsss --partials none --ends none --save none 2147483647c2147483647d-f2b '@bg(3)' >"$test_tmp/huge.out" 2>"$test_tmp/huge.err"; then
   echo 'oversized diagonal geometry unexpectedly succeeded' >&2
   exit 1
 fi
-grep -Fq 'diagonal geometry has too many lattice subtiles' "$test_tmp/huge.err"
+grep -Fq 'geometry has too many lattice subtiles' "$test_tmp/huge.err"
 
 # Checkpoint/resume must reproduce the uninterrupted row-boundary state.  The
 # saved halt remains active unless explicitly replaced with a later one.
