@@ -101,6 +101,34 @@ reflected into the displayed pattern: odd reflection shares its boundary cell,
 while even reflection duplicates it. If both edges are symmetric, the
 left-expanded row is reflected once more at the right.
 
+## Checkpoints
+
+Checkpointing happens only after a row has finished and the tries and relation
+gates are back in their compact persistent form. By default a final checkpoint
+is written as `save_{row}` whenever the search exits normally. The policy and
+prefix can be changed with:
+
+```sh
+--save none|final|every:N
+--savefile FILE_PREFIX
+```
+
+If `FILE_PREFIX` names a directory, files in it are named `save_{row}`;
+otherwise the name is `FILE_PREFIX_{row}`. Existing checkpoint files are
+atomically replaced. Resume without geometry or a start grid using:
+
+```sh
+./rlife_llsss llsss --load FILE [runtime options]
+```
+
+The checkpoint's rule, geometry, start description, edges, and BCAF setting
+define the stored search tree and cannot be changed. Other saved configuration
+is used as a baseline and can be explicitly overridden, including `--halts`,
+`--threads`, end/partial controls, and the save policy. Thus reloading a
+checkpoint made at its configured halt exits immediately unless a later halt
+is supplied. Ctrl-C is noticed at the next completed row; when saving is
+enabled that row is checkpointed before the program exits.
+
 ## Representation and sweeps
 
 For node `n`, child label `i` exists exactly when bit `4*n+i` is one. Since
@@ -172,6 +200,16 @@ parent IDs nor cached join endpoints.
 End detection likewise uses one complete lookback (`2P` orthogonal or `4P`
 diagonal) as its zero suffix and the preceding logical tile as its interesting
 witness. It runs only at complete tile boundaries.
+
+The reported `persistent_payload_bytes` covers the allocated slice-tree child
+bits, rank directories and level boundaries, persistent relation gates, and
+rule/projection/transition lookup payloads. At a row boundary those are the
+large persistent state terms. It intentionally excludes small C++
+object/container overhead, allocator metadata, stream buffers, configuration,
+and a temporarily cached reconstructed board. `maxrss` is the process's
+lifetime resident-set high-water mark, so it also retains peaks from the
+expanded pre-compaction trees, the sweep tag planes, overlapping old/new gates,
+reconstruction data, and allocator high-water behavior after a row compacts.
 
 This version is serial. Pair-tree traversal is isolated from mutation of the
 persistent tries, leaving its top-level branch work suitable for later

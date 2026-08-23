@@ -4,10 +4,13 @@
 #include "succinct_slice_tree.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iomanip>
@@ -23,6 +26,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -273,6 +277,7 @@ private:
 };
 
 enum class PartialMode { None, Final, Every };
+enum class SaveMode { None, Final, Every };
 
 struct Options {
   std::string rule = "S23/B3";
@@ -292,6 +297,14 @@ struct Options {
   std::string stats_output;
   bool verbose = false;
   bool phase_timings = false;
+  SaveMode save_mode = SaveMode::Final;
+  int save_every = 1;
+  std::string savefile = "save";
+  std::string loadfile;
+  // Checkpoint loading uses saved configuration as its baseline.  This set
+  // distinguishes an invocation default from an option the user explicitly
+  // supplied, so mutable settings can be overridden intentionally.
+  std::set<std::string> explicitly_set;
 };
 
 // One bit for each CA-compatible neighboring leaf pair in deterministic
@@ -317,6 +330,184 @@ struct PairGate {
   [[nodiscard]] std::size_t allocated_bytes() const noexcept { return bits.allocated_bytes(); }
   [[nodiscard]] std::uint64_t count() const noexcept { return bits.size() == 0 ? bit_count : bits.count(0, bits.size()); }
 };
+
+inline constexpr std::array<std::uint8_t, 16> checkpoint_magic_ = {
+    'R', 'L', 'I', 'F', 'E', '-', 'L', 'L', 'S', 'S', 'S', '-', 'C', 'P', 0, 1,
+};
+inline constexpr std::uint32_t checkpoint_version_ = 1;
+
+class CheckpointWriter {
+public:
+  explicit CheckpointWriter(std::ostream& output) : output_(output) {}
+
+  void bytes(const void* data, std::size_t size) {
+    output_.write(static_cast<const char*>(data), static_cast<std::streamsize>(size));
+    if(!output_) {
+      throw std::runtime_error("failed while writing checkpoint");
+    }
+    const auto* input = static_cast<const std::uint8_t*>(data);
+    for(std::size_t i = 0; i < size; ++i) {
+      checksum_ = (checksum_ ^ input[i]) * 1099511628211ULL;
+    }
+  }
+
+  void u8(std::uint8_t value) { bytes(&value, sizeof(value)); }
+  void boolean(bool value) { u8(value ? 1U : 0U); }
+  void u32(std::uint32_t value) {
+    std::array<std::uint8_t, 4> encoded{};
+    for(std::size_t i = 0; i < encoded.size(); ++i)
+      encoded[i] = static_cast<std::uint8_t>(value >> (8U * i));
+    bytes(encoded.data(), encoded.size());
+  }
+  void u64(std::uint64_t value) {
+    std::array<std::uint8_t, 8> encoded{};
+    for(std::size_t i = 0; i < encoded.size(); ++i)
+      encoded[i] = static_cast<std::uint8_t>(value >> (8U * i));
+    bytes(encoded.data(), encoded.size());
+  }
+  void string(const std::string& value) {
+    u64(value.size());
+    bytes(value.data(), value.size());
+  }
+  void vector_u64(const std::vector<std::uint64_t>& values) {
+    u64(values.size());
+    std::array<std::uint8_t, 8192> encoded{};
+    for(std::size_t offset = 0; offset < values.size();) {
+      const auto count = std::min<std::size_t>(encoded.size() / sizeof(std::uint64_t), values.size() - offset);
+      for(std::size_t index = 0; index < count; ++index) {
+        const auto value = values[offset + index];
+        for(std::size_t byte = 0; byte < sizeof(std::uint64_t); ++byte)
+          encoded[index * sizeof(std::uint64_t) + byte] = static_cast<std::uint8_t>(value >> (8U * byte));
+      }
+      bytes(encoded.data(), count * sizeof(std::uint64_t));
+      offset += count;
+    }
+  }
+
+  void finish() {
+    const auto checksum = checksum_;
+    std::array<std::uint8_t, 8> encoded{};
+    for(std::size_t i = 0; i < encoded.size(); ++i)
+      encoded[i] = static_cast<std::uint8_t>(checksum >> (8U * i));
+    output_.write(reinterpret_cast<const char*>(encoded.data()), static_cast<std::streamsize>(encoded.size()));
+    if(!output_) {
+      throw std::runtime_error("failed while finishing checkpoint");
+    }
+  }
+
+private:
+  std::ostream& output_;
+  std::uint64_t checksum_ = 14695981039346656037ULL;
+};
+
+class CheckpointReader {
+public:
+  CheckpointReader(std::istream& input, std::uint64_t size) : input_(input), remaining_(size) {}
+
+  void bytes(void* data, std::size_t size) {
+    if(size > remaining_) {
+      throw std::runtime_error("checkpoint is truncated");
+    }
+    input_.read(static_cast<char*>(data), static_cast<std::streamsize>(size));
+    if(!input_) {
+      throw std::runtime_error("failed while reading checkpoint");
+    }
+    const auto* output = static_cast<const std::uint8_t*>(data);
+    for(std::size_t i = 0; i < size; ++i) {
+      checksum_ = (checksum_ ^ output[i]) * 1099511628211ULL;
+    }
+    remaining_ -= size;
+  }
+
+  [[nodiscard]] std::uint8_t u8() {
+    std::uint8_t value = 0;
+    bytes(&value, sizeof(value));
+    return value;
+  }
+  [[nodiscard]] bool boolean() {
+    const auto value = u8();
+    if(value > 1U)
+      throw std::runtime_error("invalid boolean in checkpoint");
+    return value != 0;
+  }
+  [[nodiscard]] std::uint32_t u32() {
+    std::array<std::uint8_t, 4> encoded{};
+    bytes(encoded.data(), encoded.size());
+    std::uint32_t value = 0;
+    for(std::size_t i = 0; i < encoded.size(); ++i)
+      value |= static_cast<std::uint32_t>(encoded[i]) << (8U * i);
+    return value;
+  }
+  [[nodiscard]] std::uint64_t u64() {
+    std::array<std::uint8_t, 8> encoded{};
+    bytes(encoded.data(), encoded.size());
+    std::uint64_t value = 0;
+    for(std::size_t i = 0; i < encoded.size(); ++i)
+      value |= static_cast<std::uint64_t>(encoded[i]) << (8U * i);
+    return value;
+  }
+  [[nodiscard]] std::string string() {
+    const auto size = u64();
+    if(size > remaining_ || size > std::numeric_limits<std::size_t>::max()) {
+      throw std::runtime_error("invalid string size in checkpoint");
+    }
+    std::string value(static_cast<std::size_t>(size), '\0');
+    bytes(value.data(), value.size());
+    return value;
+  }
+  [[nodiscard]] std::vector<std::uint64_t> vector_u64() {
+    const auto count = u64();
+    if(count > std::numeric_limits<std::size_t>::max() || count > remaining_ / sizeof(std::uint64_t)) {
+      throw std::runtime_error("invalid vector size in checkpoint");
+    }
+    std::vector<std::uint64_t> values(static_cast<std::size_t>(count));
+    std::array<std::uint8_t, 8192> encoded{};
+    for(std::size_t offset = 0; offset < values.size();) {
+      const auto chunk = std::min<std::size_t>(encoded.size() / sizeof(std::uint64_t), values.size() - offset);
+      bytes(encoded.data(), chunk * sizeof(std::uint64_t));
+      for(std::size_t index = 0; index < chunk; ++index) {
+        std::uint64_t value = 0;
+        for(std::size_t byte = 0; byte < sizeof(std::uint64_t); ++byte)
+          value |= static_cast<std::uint64_t>(encoded[index * sizeof(std::uint64_t) + byte]) << (8U * byte);
+        values[offset + index] = value;
+      }
+      offset += chunk;
+    }
+    return values;
+  }
+
+  void finish() {
+    if(remaining_ != sizeof(std::uint64_t)) {
+      throw std::runtime_error("checkpoint has trailing or missing data");
+    }
+    std::array<std::uint8_t, 8> encoded{};
+    input_.read(reinterpret_cast<char*>(encoded.data()), static_cast<std::streamsize>(encoded.size()));
+    if(!input_)
+      throw std::runtime_error("checkpoint checksum is truncated");
+    std::uint64_t expected = 0;
+    for(std::size_t i = 0; i < encoded.size(); ++i)
+      expected |= static_cast<std::uint64_t>(encoded[i]) << (8U * i);
+    remaining_ = 0;
+    if(expected != checksum_)
+      throw std::runtime_error("checkpoint checksum mismatch");
+  }
+
+private:
+  std::istream& input_;
+  std::uint64_t remaining_ = 0;
+  std::uint64_t checksum_ = 14695981039346656037ULL;
+};
+
+inline volatile std::sig_atomic_t checkpoint_interrupt_requested_ = 0;
+
+inline void checkpoint_interrupt_handler_(int) { checkpoint_interrupt_requested_ = 1; }
+
+inline void install_checkpoint_interrupt_handler() {
+  checkpoint_interrupt_requested_ = 0;
+  if(std::signal(SIGINT, checkpoint_interrupt_handler_) == SIG_ERR) {
+    throw std::runtime_error("cannot install Ctrl-C handler");
+  }
+}
 
 inline std::vector<std::string> split_words(std::string text) {
   for(char& ch : text) {
@@ -350,6 +541,9 @@ Orthogonal and diagonal fixed-width LLSSS using succinct two-column slice trees.
   --ends default|none        zero-background completion detection (default)
   --[no-]halt-on-ends        halt after the first completion (default: halt)
   --halts w_pos:N            stop at logical W-tile position N
+  --save MODE                none, final, or every:N (default: final)
+  --savefile FILE_PREFIX     save as FILE_PREFIX_{row} (default: save)
+  --load FILE                resume a checkpoint; geometry/start may be omitted
   --partials MODE            none, final, default, or every:N (default: final)
   --partial-output FILE      write RLE partials/completions to FILE
   --dump-slice-stats FILE    append per-height succinct-slice statistics
@@ -404,10 +598,13 @@ inline Options parse_cli(int argc, char** argv) {
     }
     if(current == "--rule") {
       options.rule = argument(current);
+      options.explicitly_set.insert("rule");
     } else if(current == "--left-edge") {
       explicit_left_edge = parse_edge(argument(current));
+      options.explicitly_set.insert("left_edge");
     } else if(current == "--right-edge") {
       explicit_right_edge = parse_edge(argument(current));
+      options.explicitly_set.insert("right_edge");
     } else if(current == "--symmetry") {
       const auto value = argument(current);
       if(value == "asymmetric" || value == "asym") {
@@ -417,11 +614,15 @@ inline Options parse_cli(int argc, char** argv) {
       } else {
         throw std::runtime_error("--symmetry must be asymmetric, odd, or even");
       }
+      options.explicitly_set.insert("left_edge");
+      options.explicitly_set.insert("right_edge");
     } else if(current == "--bg-agar") {
       if(argument(current) != "zero") {
         throw std::runtime_error("this rendition currently supports --bg-agar zero only");
       }
     } else if(current == "--filters") {
+      options.bcaf = false;
+      options.explicitly_set.insert("bcaf");
       for(const auto& filter : split_words(argument(current))) {
         if(filter == "bcaf") {
           options.bcaf = true;
@@ -430,6 +631,7 @@ inline Options parse_cli(int argc, char** argv) {
         }
       }
     } else if(current == "--ends") {
+      options.explicitly_set.insert("detect_ends");
       const auto value = argument(current);
       if(value == "default" || value == "bg") {
         options.detect_ends = true;
@@ -440,16 +642,48 @@ inline Options parse_cli(int argc, char** argv) {
       }
     } else if(current == "--halt-on-ends") {
       options.halt_on_ends = true;
+      options.explicitly_set.insert("halt_on_ends");
     } else if(current == "--no-halt-on-ends") {
       options.halt_on_ends = false;
+      options.explicitly_set.insert("halt_on_ends");
     } else if(current == "--halts") {
+      options.explicitly_set.insert("halt_height");
       const auto value = argument(current);
       std::smatch match;
       if(!std::regex_match(value, match, std::regex(R"(^w_pos:([0-9]+)$)"))) {
         throw std::runtime_error("--halts supports w_pos:N");
       }
       options.halt_height = std::stoi(match[1].str());
+    } else if(current == "--save") {
+      options.explicitly_set.insert("save");
+      const auto value = argument(current);
+      std::smatch match;
+      if(value == "none") {
+        options.save_mode = SaveMode::None;
+      } else if(value == "final") {
+        options.save_mode = SaveMode::Final;
+      } else if(std::regex_match(value, match, std::regex(R"(^every:([0-9]+)$)"))) {
+        options.save_mode = SaveMode::Every;
+        options.save_every = std::stoi(match[1].str());
+        if(options.save_every <= 0) {
+          throw std::runtime_error("save interval must be positive");
+        }
+      } else {
+        throw std::runtime_error("--save supports none, final, or every:N");
+      }
+    } else if(current == "--savefile") {
+      options.savefile = argument(current);
+      options.explicitly_set.insert("savefile");
+      if(options.savefile.empty()) {
+        throw std::runtime_error("--savefile must not be empty");
+      }
+    } else if(current == "--load") {
+      options.loadfile = argument(current);
+      if(options.loadfile.empty()) {
+        throw std::runtime_error("--load must not be empty");
+      }
     } else if(current == "--partials" || current == "--pre-partials") {
+      options.explicitly_set.insert("partials");
       const auto value = argument(current);
       if(value == "none" || value == "[]") {
         options.partial_mode = PartialMode::None;
@@ -469,16 +703,22 @@ inline Options parse_cli(int argc, char** argv) {
       }
     } else if(current == "--partial-output") {
       options.partial_output = argument(current);
+      options.explicitly_set.insert("partial_output");
     } else if(current == "--dump-slice-stats") {
       options.stats_output = argument(current);
+      options.explicitly_set.insert("stats_output");
     } else if(current == "--phase-progress") {
       options.phase_progress = true;
+      options.explicitly_set.insert("phase_progress");
     } else if(current == "--phase-timings") {
       options.phase_timings = true;
+      options.explicitly_set.insert("phase_timings");
     } else if(current == "--verbose") {
       options.verbose = true;
+      options.explicitly_set.insert("verbose");
     } else if(current == "--threads") {
       options.reserved_threads = std::stoi(argument(current));
+      options.explicitly_set.insert("threads");
       if(options.reserved_threads <= 0) {
         throw std::runtime_error("--threads must be positive");
       }
@@ -489,8 +729,11 @@ inline Options parse_cli(int argc, char** argv) {
     }
   }
 
-  if(positional.size() != 2) {
+  if(options.loadfile.empty() && positional.size() != 2) {
     throw std::runtime_error("expected exactly <geometry> <start>");
+  }
+  if(!options.loadfile.empty() && positional.size() != 0 && positional.size() != 2) {
+    throw std::runtime_error("with --load, omit <geometry> <start> or supply both for validation");
   }
   // The convenience option describes at most one symmetry boundary.  Direct
   // edge options are independent and override it regardless of CLI order.
@@ -502,8 +745,12 @@ inline Options parse_cli(int argc, char** argv) {
     options.left_edge = *explicit_left_edge;
   if(explicit_right_edge.has_value())
     options.right_edge = *explicit_right_edge;
-  options.geometry = positional[0];
-  options.start = positional[1];
+  if(!positional.empty()) {
+    options.geometry = positional[0];
+    options.start = positional[1];
+    options.explicitly_set.insert("geometry");
+    options.explicitly_set.insert("start");
+  }
   return options;
 }
 
@@ -518,7 +765,15 @@ struct StartGrid {
 
 class Solver {
 public:
-  explicit Solver(Options options) : options_(std::move(options)), geometry_(Geometry::parse(options_.geometry)), rule_(RuleTable::parse(options_.rule)) {
+  explicit Solver(Options options) : options_(std::move(options)) {
+    install_checkpoint_interrupt_handler();
+    const bool loading = !options_.loadfile.empty();
+    loaded_from_checkpoint_ = loading;
+    if(loading) {
+      load_checkpoint(options_.loadfile);
+    }
+    geometry_ = Geometry::parse(options_.geometry);
+    rule_ = RuleTable::parse(options_.rule);
     build_pair_transition_table();
     if(geometry_.diagonal()) {
       if(options_.left_edge != EdgeMode::Background || options_.right_edge != EdgeMode::Background) {
@@ -531,19 +786,28 @@ public:
       build_edge_acceptance_tables();
     }
     rule_.release_partial_lookup();
+    if(loading) {
+      validate_loaded_state();
+    }
     if(!options_.partial_output.empty()) {
-      partial_file_.open(options_.partial_output, std::ios::out | std::ios::trunc);
+      const auto mode = loading && !options_.explicitly_set.contains("partial_output") ? std::ios::app : std::ios::trunc;
+      partial_file_.open(options_.partial_output, std::ios::out | mode);
       if(!partial_file_) {
         throw std::runtime_error("cannot open partial output: " + options_.partial_output);
       }
     }
     if(!options_.stats_output.empty()) {
-      stats_file_.open(options_.stats_output, std::ios::out | std::ios::trunc);
+      const auto mode = loading && !options_.explicitly_set.contains("stats_output") ? std::ios::app : std::ios::trunc;
+      stats_file_.open(options_.stats_output, std::ios::out | mode);
       if(!stats_file_) {
         throw std::runtime_error("cannot open slice stats: " + options_.stats_output);
       }
     }
-    initialize();
+    if(loading) {
+      std::cout << "checkpoint loaded: " << options_.loadfile << " at row " << height_ << '\n';
+    } else {
+      initialize();
+    }
   }
 
   ~Solver() {
@@ -565,19 +829,32 @@ public:
 
     if(slices_.empty()) {
       std::cout << "search space is empty after initialization\n";
-      return 0;
+      return finish(0);
+    }
+    if(completion_at_current_row_ && options_.detect_ends && options_.halt_on_ends) {
+      std::cout << "checkpoint row already contains a halting completion\n";
+      return finish(0);
     }
     if(options_.halt_height >= 0 && geometry_.w_position(height_) >= static_cast<std::size_t>(options_.halt_height)) {
-      emit_final_partial("halt");
-      return 0;
+      if(!loaded_from_checkpoint_) {
+        emit_final_partial("halt");
+      }
+      return finish(0);
+    }
+    if(checkpoint_interrupt_requested_) {
+      return finish_interrupted();
     }
 
     for(;;) {
+      if(checkpoint_interrupt_requested_) {
+        return finish_interrupted();
+      }
       const auto started = Clock::now();
       pair_states_ = 0;
       pair_leaves_ = 0;
       boundary_states_ = 0;
       peak_tag_bytes_ = 0;
+      completion_at_current_row_ = false;
 
       phase("extend slice-tree tails");
       for(auto& slice : slices_) {
@@ -593,7 +870,10 @@ public:
           std::cout << "search exhausted at height " << height_ << '\n';
         }
         slices_.clear();
-        return 0;
+        pair_gates_.clear();
+        pair_gates_ready_ = false;
+        exhausted_ = true;
+        return finish(0);
       }
 
       const auto seconds = std::chrono::duration<double>(Clock::now() - started).count();
@@ -607,6 +887,7 @@ public:
       if(options_.detect_ends) {
         phase("end-tag propagation");
         if(auto completion = find_completion()) {
+          completion_at_current_row_ = true;
           if(geometry_.diagonal()) {
             std::cout << "completion at flattened depth " << height_ << " (w_pos " << geometry_.position_string(height_) << ")\n";
           } else {
@@ -614,7 +895,7 @@ public:
           }
           emit_board(*completion, "completion");
           if(options_.halt_on_ends) {
-            return 0;
+            return finish(0);
           }
         }
       }
@@ -626,7 +907,14 @@ public:
           std::cout << "height halt at " << height_ << '\n';
         }
         emit_final_partial("halt");
-        return 0;
+        return finish(0);
+      }
+
+      if(options_.save_mode == SaveMode::Every && height_ % static_cast<std::size_t>(options_.save_every) == 0) {
+        save_checkpoint();
+      }
+      if(checkpoint_interrupt_requested_) {
+        return finish_interrupted();
       }
     }
   }
@@ -635,6 +923,286 @@ private:
   using Clock = std::chrono::steady_clock;
   using Node = SuccinctSliceTree::Node;
   using Board = std::vector<std::vector<std::uint8_t>>;
+
+  static void write_config(CheckpointWriter& output, const Options& options) {
+    output.string(options.rule);
+    output.string(options.geometry);
+    output.string(options.start);
+    output.u8(static_cast<std::uint8_t>(options.left_edge));
+    output.u8(static_cast<std::uint8_t>(options.right_edge));
+    output.boolean(options.bcaf);
+    output.boolean(options.detect_ends);
+    output.boolean(options.halt_on_ends);
+    output.boolean(options.phase_progress);
+    output.u64(static_cast<std::uint64_t>(options.reserved_threads));
+    output.u64(options.halt_height < 0 ? 0U : static_cast<std::uint64_t>(options.halt_height) + 1U);
+    output.u8(static_cast<std::uint8_t>(options.partial_mode));
+    output.u64(static_cast<std::uint64_t>(options.partial_every));
+    output.string(options.partial_output);
+    output.string(options.stats_output);
+    output.boolean(options.verbose);
+    output.boolean(options.phase_timings);
+    output.u8(static_cast<std::uint8_t>(options.save_mode));
+    output.u64(static_cast<std::uint64_t>(options.save_every));
+    output.string(options.savefile);
+  }
+
+  static int checkpoint_positive_int(CheckpointReader& input, std::string_view field) {
+    const auto value = input.u64();
+    if(value == 0 || value > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
+      throw std::runtime_error("invalid " + std::string(field) + " in checkpoint");
+    }
+    return static_cast<int>(value);
+  }
+
+  static Options read_config(CheckpointReader& input) {
+    Options options;
+    options.rule = input.string();
+    options.geometry = input.string();
+    options.start = input.string();
+    const auto left_edge = input.u8();
+    const auto right_edge = input.u8();
+    if(left_edge > static_cast<std::uint8_t>(EdgeMode::Even) || right_edge > static_cast<std::uint8_t>(EdgeMode::Even)) {
+      throw std::runtime_error("invalid edge mode in checkpoint");
+    }
+    options.left_edge = static_cast<EdgeMode>(left_edge);
+    options.right_edge = static_cast<EdgeMode>(right_edge);
+    options.bcaf = input.boolean();
+    options.detect_ends = input.boolean();
+    options.halt_on_ends = input.boolean();
+    options.phase_progress = input.boolean();
+    options.reserved_threads = checkpoint_positive_int(input, "thread count");
+    const auto encoded_halt = input.u64();
+    if(encoded_halt > static_cast<std::uint64_t>(std::numeric_limits<int>::max()) + 1U) {
+      throw std::runtime_error("invalid halt in checkpoint");
+    }
+    options.halt_height = encoded_halt == 0 ? -1 : static_cast<int>(encoded_halt - 1U);
+    const auto partial_mode = input.u8();
+    if(partial_mode > static_cast<std::uint8_t>(PartialMode::Every)) {
+      throw std::runtime_error("invalid partial mode in checkpoint");
+    }
+    options.partial_mode = static_cast<PartialMode>(partial_mode);
+    options.partial_every = checkpoint_positive_int(input, "partial interval");
+    options.partial_output = input.string();
+    options.stats_output = input.string();
+    options.verbose = input.boolean();
+    options.phase_timings = input.boolean();
+    const auto save_mode = input.u8();
+    if(save_mode > static_cast<std::uint8_t>(SaveMode::Every)) {
+      throw std::runtime_error("invalid save mode in checkpoint");
+    }
+    options.save_mode = static_cast<SaveMode>(save_mode);
+    options.save_every = checkpoint_positive_int(input, "save interval");
+    options.savefile = input.string();
+    if(options.rule.empty() || options.geometry.empty() || options.start.empty() || options.savefile.empty()) {
+      throw std::runtime_error("checkpoint configuration has an empty required value");
+    }
+    return options;
+  }
+
+  template <class T> void merge_immutable(const Options& command_line, const Options& saved, std::string_view name, T Options::*member) {
+    if(command_line.explicitly_set.contains(std::string(name)) && command_line.*member != saved.*member) {
+      throw std::runtime_error("cannot alter checkpoint search-tree option " + std::string(name));
+    }
+    options_.*member = saved.*member;
+  }
+
+  template <class T> void merge_mutable(const Options& command_line, const Options& saved, std::string_view name, T Options::*member) {
+    if(!command_line.explicitly_set.contains(std::string(name))) {
+      options_.*member = saved.*member;
+    }
+  }
+
+  void merge_checkpoint_config(const Options& saved) {
+    const auto command_line = options_;
+    merge_immutable(command_line, saved, "rule", &Options::rule);
+    merge_immutable(command_line, saved, "geometry", &Options::geometry);
+    merge_immutable(command_line, saved, "start", &Options::start);
+    merge_immutable(command_line, saved, "left_edge", &Options::left_edge);
+    merge_immutable(command_line, saved, "right_edge", &Options::right_edge);
+    merge_immutable(command_line, saved, "bcaf", &Options::bcaf);
+
+    merge_mutable(command_line, saved, "detect_ends", &Options::detect_ends);
+    merge_mutable(command_line, saved, "halt_on_ends", &Options::halt_on_ends);
+    merge_mutable(command_line, saved, "phase_progress", &Options::phase_progress);
+    merge_mutable(command_line, saved, "threads", &Options::reserved_threads);
+    merge_mutable(command_line, saved, "halt_height", &Options::halt_height);
+    if(!command_line.explicitly_set.contains("partials")) {
+      options_.partial_mode = saved.partial_mode;
+      options_.partial_every = saved.partial_every;
+    }
+    merge_mutable(command_line, saved, "partial_output", &Options::partial_output);
+    merge_mutable(command_line, saved, "stats_output", &Options::stats_output);
+    merge_mutable(command_line, saved, "verbose", &Options::verbose);
+    merge_mutable(command_line, saved, "phase_timings", &Options::phase_timings);
+    if(!command_line.explicitly_set.contains("save")) {
+      options_.save_mode = saved.save_mode;
+      options_.save_every = saved.save_every;
+    }
+    merge_mutable(command_line, saved, "savefile", &Options::savefile);
+  }
+
+  static std::size_t checkpoint_size(std::uint64_t value, std::string_view field) {
+    if(value > std::numeric_limits<std::size_t>::max()) {
+      throw std::runtime_error("checkpoint " + std::string(field) + " does not fit this platform");
+    }
+    return static_cast<std::size_t>(value);
+  }
+
+  void load_checkpoint(const std::string& path) {
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    if(!input) {
+      throw std::runtime_error("cannot open checkpoint: " + path);
+    }
+    const auto end = input.tellg();
+    if(end < 0) {
+      throw std::runtime_error("cannot determine checkpoint size: " + path);
+    }
+    input.seekg(0);
+    CheckpointReader reader(input, static_cast<std::uint64_t>(end));
+    std::array<std::uint8_t, checkpoint_magic_.size()> magic{};
+    reader.bytes(magic.data(), magic.size());
+    if(magic != checkpoint_magic_ || reader.u32() != checkpoint_version_) {
+      throw std::runtime_error("unsupported checkpoint format: " + path);
+    }
+
+    merge_checkpoint_config(read_config(reader));
+    exhausted_ = reader.boolean();
+    completion_at_current_row_ = reader.boolean();
+    width_ = checkpoint_size(reader.u64(), "width");
+    height_ = checkpoint_size(reader.u64(), "height");
+    const auto slice_count = checkpoint_size(reader.u64(), "slice count");
+    if(width_ < 3 || (!exhausted_ && slice_count != width_ - 1U) || (exhausted_ && slice_count != 0)) {
+      throw std::runtime_error("checkpoint slice count does not match its width/state");
+    }
+    slices_.clear();
+    slices_.reserve(slice_count);
+    for(std::size_t index = 0; index < slice_count; ++index) {
+      const auto depth = checkpoint_size(reader.u64(), "tree depth");
+      const auto nodes = reader.u64();
+      auto levels = reader.vector_u64();
+      auto words = reader.vector_u64();
+      slices_.push_back(SuccinctSliceTree::from_checkpoint(std::move(words), std::move(levels), nodes, depth));
+    }
+
+    pair_gates_ready_ = reader.boolean();
+    pair_gate_depth_ = checkpoint_size(reader.u64(), "pair-gate depth");
+    const auto gate_count = checkpoint_size(reader.u64(), "pair-gate count");
+    const auto expected_gates = pair_gates_ready_ && !slices_.empty() ? slices_.size() - 1U : 0U;
+    if(gate_count != expected_gates || (!exhausted_ && !pair_gates_ready_)) {
+      throw std::runtime_error("checkpoint pair gates do not match its slices");
+    }
+    pair_gates_.clear();
+    pair_gates_.reserve(gate_count);
+    for(std::size_t index = 0; index < gate_count; ++index) {
+      PairGate gate;
+      gate.bit_count = reader.u64();
+      const auto stored_bits = reader.u64();
+      auto words = reader.vector_u64();
+      if(stored_bits != 0 && stored_bits != gate.bit_count) {
+        throw std::runtime_error("checkpoint pair gate has inconsistent length");
+      }
+      gate.bits = PackedTags::from_checkpoint(stored_bits, std::move(words));
+      pair_gates_.push_back(std::move(gate));
+    }
+    reader.finish();
+  }
+
+  void validate_loaded_state() const {
+    if(height_ < geometry_.short_window()) {
+      throw std::runtime_error("checkpoint height is shorter than its geometry lookback");
+    }
+    if(exhausted_) {
+      if(completion_at_current_row_ || !slices_.empty() || pair_gates_ready_ || !pair_gates_.empty()) {
+        throw std::runtime_error("exhausted checkpoint contains live search state");
+      }
+      return;
+    }
+    if(slices_.size() != width_ - 1U || pair_gates_.size() + 1U != slices_.size() || pair_gate_depth_ != height_) {
+      throw std::runtime_error("checkpoint search-state dimensions are inconsistent");
+    }
+    for(const auto& slice : slices_) {
+      if(slice.depth() != height_) {
+        throw std::runtime_error("checkpoint slice depth does not match its row");
+      }
+    }
+  }
+
+  [[nodiscard]] std::filesystem::path checkpoint_path() const {
+    const std::filesystem::path prefix(options_.savefile);
+    std::error_code error;
+    const bool directory = std::filesystem::is_directory(prefix, error) || options_.savefile.ends_with('/') || options_.savefile.ends_with('\\');
+    if(directory) {
+      return prefix / ("save_" + std::to_string(height_));
+    }
+    return std::filesystem::path(options_.savefile + "_" + std::to_string(height_));
+  }
+
+  void save_checkpoint() {
+    if(options_.save_mode == SaveMode::None || last_checkpoint_height_ == height_) {
+      return;
+    }
+    const auto path = checkpoint_path();
+    auto temporary = path;
+    temporary += ".tmp";
+    {
+      std::ofstream output(temporary, std::ios::binary | std::ios::out | std::ios::trunc);
+      if(!output) {
+        throw std::runtime_error("cannot open checkpoint for writing: " + temporary.string());
+      }
+      CheckpointWriter writer(output);
+      writer.bytes(checkpoint_magic_.data(), checkpoint_magic_.size());
+      writer.u32(checkpoint_version_);
+      write_config(writer, options_);
+      writer.boolean(exhausted_);
+      writer.boolean(completion_at_current_row_);
+      writer.u64(width_);
+      writer.u64(height_);
+      writer.u64(slices_.size());
+      for(const auto& slice : slices_) {
+        writer.u64(slice.depth());
+        writer.u64(slice.node_count());
+        writer.vector_u64(slice.checkpoint_levels());
+        writer.vector_u64(slice.checkpoint_words());
+      }
+      writer.boolean(pair_gates_ready_);
+      writer.u64(pair_gate_depth_);
+      writer.u64(pair_gates_.size());
+      for(const auto& gate : pair_gates_) {
+        writer.u64(gate.bit_count);
+        writer.u64(gate.bits.size());
+        writer.vector_u64(gate.bits.checkpoint_words());
+      }
+      writer.finish();
+      output.close();
+      if(!output) {
+        throw std::runtime_error("cannot finish checkpoint: " + temporary.string());
+      }
+    }
+    std::error_code error;
+    std::filesystem::rename(temporary, path, error);
+    if(error) {
+      throw std::runtime_error("cannot replace checkpoint " + path.string() + ": " + error.message());
+    }
+    last_checkpoint_height_ = height_;
+    std::cout << "checkpoint saved: " << path.string() << '\n';
+  }
+
+  int finish(int status) {
+    if(options_.save_mode != SaveMode::None) {
+      save_checkpoint();
+    }
+    return status;
+  }
+
+  int finish_interrupted() {
+    if(options_.save_mode == SaveMode::None) {
+      std::cout << "interrupt requested after completed row " << height_ << "; exiting without checkpoint\n";
+    } else {
+      std::cout << "interrupt requested; saving completed row " << height_ << " and exiting\n";
+    }
+    return finish(130);
+  }
 
   static StartGrid magic_background(const std::string& source, std::size_t height) {
     std::smatch match;
@@ -801,6 +1369,9 @@ private:
     }
     if(!prune_supported()) {
       slices_.clear();
+      pair_gates_.clear();
+      pair_gates_ready_ = false;
+      exhausted_ = true;
     }
   }
 
@@ -2362,6 +2933,10 @@ private:
   std::vector<PairGate> pair_gates_;
   std::size_t pair_gate_depth_ = 0;
   bool pair_gates_ready_ = false;
+  bool exhausted_ = false;
+  bool completion_at_current_row_ = false;
+  bool loaded_from_checkpoint_ = false;
+  std::optional<std::size_t> last_checkpoint_height_;
   std::ofstream partial_file_;
   std::ofstream stats_file_;
   std::uint64_t pair_states_ = 0;

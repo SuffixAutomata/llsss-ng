@@ -90,6 +90,24 @@ public:
 
   [[nodiscard]] std::size_t allocated_bytes() const noexcept { return words_.capacity() * sizeof(std::uint64_t); }
 
+  [[nodiscard]] const std::vector<std::uint64_t>& checkpoint_words() const noexcept { return words_; }
+
+  static PackedTags from_checkpoint(std::uint64_t bit_count, std::vector<std::uint64_t> words) {
+    if(words.size() != word_count(bit_count)) {
+      throw std::runtime_error("invalid packed tags in checkpoint");
+    }
+    if(!words.empty() && (bit_count & 63U) != 0) {
+      const auto used = static_cast<unsigned>(bit_count & 63U);
+      if((words.back() >> used) != 0) {
+        throw std::runtime_error("packed checkpoint tags have nonzero padding");
+      }
+    }
+    PackedTags result;
+    result.bit_count_ = bit_count;
+    result.words_ = std::move(words);
+    return result;
+  }
+
 private:
   static std::size_t word_count(std::uint64_t bits) { return static_cast<std::size_t>((bits + 63U) / 64U); }
 
@@ -291,6 +309,48 @@ public:
   [[nodiscard]] std::size_t allocated_bytes() const noexcept {
     return words_.capacity() * sizeof(std::uint64_t) + absolute_rank_.capacity() * sizeof(std::uint64_t) + relative_rank_.capacity() * sizeof(std::uint16_t) +
            level_begin_.capacity() * sizeof(Node);
+  }
+
+  // The child bitstream and level boundaries are the complete non-derived
+  // representation of a slice tree.  Checkpoints store these two arrays and
+  // rebuild the rank directory on load.
+  [[nodiscard]] const std::vector<std::uint64_t>& checkpoint_words() const noexcept { return words_; }
+  [[nodiscard]] const std::vector<Node>& checkpoint_levels() const noexcept { return level_begin_; }
+
+  static SuccinctSliceTree from_checkpoint(std::vector<std::uint64_t> words, std::vector<Node> levels, Node node_count, std::size_t depth) {
+    if(node_count == 0 || depth > std::numeric_limits<std::size_t>::max() - 2U || levels.size() != depth + 2U || levels.front() != 0 ||
+       levels[1] != 1 || levels.back() != node_count || words.size() != word_count_for_nodes(node_count)) {
+      throw std::runtime_error("invalid slice tree in checkpoint");
+    }
+    for(std::size_t level = 0; level + 1U < levels.size(); ++level) {
+      if(levels[level] > levels[level + 1U] || levels[level + 1U] > node_count) {
+        throw std::runtime_error("invalid slice-tree levels in checkpoint");
+      }
+    }
+
+    SuccinctSliceTree result;
+    result.words_ = std::move(words);
+    result.level_begin_ = std::move(levels);
+    result.node_count_ = node_count;
+    result.depth_ = depth;
+    result.clear_unused_tail();
+    result.rebuild_rank_directory();
+
+    for(std::size_t level = 0; level < depth; ++level) {
+      Node child_count = 0;
+      for(Node node = result.level_begin_[level]; node < result.level_begin_[level + 1U]; ++node) {
+        child_count += static_cast<Node>(std::popcount(result.child_mask(node)));
+      }
+      if(child_count != result.level_begin_[level + 2U] - result.level_begin_[level + 1U]) {
+        throw std::runtime_error("slice-tree level contents do not match checkpoint boundaries");
+      }
+    }
+    for(Node leaf = result.leaf_begin(); leaf < result.leaf_end(); ++leaf) {
+      if(result.child_mask(leaf) != 0) {
+        throw std::runtime_error("slice-tree checkpoint leaf has children");
+      }
+    }
+    return result;
   }
 
 private:
