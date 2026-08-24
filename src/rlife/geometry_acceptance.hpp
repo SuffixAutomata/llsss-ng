@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
+#include <cstring>
 #include <cstdint>
 #include <map>
 #include <set>
@@ -12,6 +14,14 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+
+#if defined(__BMI2__)
+#include <immintrin.h>
+#endif
+
+#ifndef RLIFE_ENABLE_P7_GATHER
+#define RLIFE_ENABLE_P7_GATHER 1
+#endif
 
 namespace rlife::llsss {
 
@@ -50,10 +60,118 @@ public:
     }
   }
 
-  [[nodiscard]] std::uint8_t interior_mask(const std::uint8_t* triples, std::size_t row) const {
+  // Coprime orthogonal geometries compile to one five-row projection.  Keep
+  // that overwhelmingly common search path compact: the generic loop used to
+  // leave a division, bounds check, and two dynamic loops at every visited
+  // pair state.  Keep this out of line because the pair DFS has many callback
+  // specializations and duplicating the lookup kernel bloats its hot code.
+#if defined(__GNUC__) || defined(__clang__)
+  [[gnu::noinline]]
+#endif
+  [[nodiscard]] inline std::uint8_t interior_mask(const std::uint8_t* triples, std::size_t row) const {
     if(row < short_window_) {
       return 0xffU;
     }
+    if(fast_interior_masks_ != nullptr) {
+#if RLIFE_ENABLE_P7_GATHER && defined(__BMI2__) && defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+      if(fast_p7_gather_mask_ != 0)
+        return fast_p7_one_projection_mask(triples, row);
+#endif
+      return fast_one_projection_mask(triples, row);
+    }
+    if(fast_three_projection_two_phase_) {
+      return fast_three_projection_mask(triples, row);
+    }
+    return generic_interior_mask(triples, row);
+  }
+
+#if defined(RLIFE_GEOMETRY_ACCEPTANCE_TESTING)
+  [[nodiscard]] bool debug_p7_gather_enabled() const noexcept {
+#if RLIFE_ENABLE_P7_GATHER && defined(__BMI2__) && defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return fast_p7_gather_mask_ != 0;
+#else
+    return false;
+#endif
+  }
+
+  [[nodiscard]] std::pair<std::uint8_t, std::uint64_t> debug_p7_gather_parameters() const noexcept {
+#if RLIFE_ENABLE_P7_GATHER && defined(__BMI2__) && defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return {fast_p7_block_offset_, fast_p7_gather_mask_};
+#else
+    return {};
+#endif
+  }
+
+  [[nodiscard]] std::uint8_t debug_scalar_one_projection_mask(const std::uint8_t* triples, std::size_t row) const noexcept {
+    assert(fast_interior_masks_ != nullptr);
+    return fast_one_projection_mask(triples, row);
+  }
+
+#if RLIFE_ENABLE_P7_GATHER && defined(__BMI2__) && defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  [[nodiscard]] std::uint8_t debug_p7_one_projection_mask(const std::uint8_t* triples, std::size_t row) const noexcept {
+    assert(fast_p7_gather_mask_ != 0);
+    return fast_p7_one_projection_mask(triples, row);
+  }
+#endif
+#endif
+
+private:
+#if RLIFE_ENABLE_P7_GATHER && defined(__BMI2__) && defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#if defined(__GNUC__) || defined(__clang__)
+  [[gnu::noinline]]
+#endif
+  [[nodiscard]] std::uint8_t fast_p7_one_projection_mask(const std::uint8_t* triples, std::size_t row) const noexcept {
+    // With P=7 and 1<=K<=3, the canonical five-triple key is
+    //   a=row-14, b=row-(7+K), c=row-7, d=row-K, e=row-(7-K).
+    // A qword beginning at b contains b/c/e/d at byte offsets 0/K/2K/7.
+    std::uint64_t block = 0;
+    std::memcpy(&block, triples + row - fast_p7_block_offset_, sizeof(block));
+    const auto raw = _pext_u64(block, fast_p7_gather_mask_);
+    const auto key = static_cast<std::size_t>(triples[row - 14U]) |
+                     (static_cast<std::size_t>(raw & 0x03fU) << 3U) |
+                     static_cast<std::size_t>(raw & 0xe00U) |
+                     (static_cast<std::size_t>(raw & 0x1c0U) << 6U);
+    return fast_interior_masks_[key];
+  }
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+  [[gnu::noinline]]
+#endif
+  [[nodiscard]] std::uint8_t fast_one_projection_mask(const std::uint8_t* triples, std::size_t row) const noexcept {
+    const auto key = static_cast<std::size_t>(triples[row - fast_interior_offsets_[0]]) |
+                     (static_cast<std::size_t>(triples[row - fast_interior_offsets_[1]]) << 3U) |
+                     (static_cast<std::size_t>(triples[row - fast_interior_offsets_[2]]) << 6U) |
+                     (static_cast<std::size_t>(triples[row - fast_interior_offsets_[3]]) << 9U) |
+                     (static_cast<std::size_t>(triples[row - fast_interior_offsets_[4]]) << 12U);
+    return fast_interior_masks_[key];
+  }
+
+#if defined(__GNUC__) || defined(__clang__)
+  [[gnu::noinline]]
+#endif
+  [[nodiscard]] std::uint8_t fast_three_projection_mask(const std::uint8_t* triples, std::size_t row) const noexcept {
+    const auto& projection = fast_three_projection_[row & 1U];
+    const auto* offsets = projection.offsets.data();
+    const auto a = static_cast<std::size_t>(triples[row - offsets[0]]);
+    const auto b = static_cast<std::size_t>(triples[row - offsets[1]]);
+    const auto c = static_cast<std::size_t>(triples[row - offsets[2]]);
+    const auto d = static_cast<std::size_t>(triples[row - offsets[3]]);
+    const auto e = static_cast<std::size_t>(triples[row - offsets[4]]);
+    const auto f = static_cast<std::size_t>(triples[row - offsets[5]]);
+    const auto g = static_cast<std::size_t>(triples[row - offsets[6]]);
+    const auto h = static_cast<std::size_t>(triples[row - offsets[7]]);
+    const auto i = static_cast<std::size_t>(triples[row - offsets[8]]);
+    const auto first_key = a | (b << 3U) | (c << 6U) | (d << 9U) | (e << 12U);
+    const auto second_key = f | (a << 3U) | (c << 6U) | (d << 9U);
+    const auto third_key = g | (h << 3U) | (i << 6U);
+    return static_cast<std::uint8_t>(projection.masks[0][first_key] & projection.masks[1][second_key] & projection.masks[2][third_key]);
+  }
+
+#if defined(__GNUC__) || defined(__clang__)
+  [[gnu::noinline]]
+#endif
+  [[nodiscard]] std::uint8_t generic_interior_mask(const std::uint8_t* triples, std::size_t row) const {
     std::uint8_t accepted = 0xffU;
     const auto phase = row % subtile_count_;
     for(const auto& projection : interior_acceptance_.at(phase)) {
@@ -65,6 +183,8 @@ public:
     }
     return accepted;
   }
+
+public:
 
   [[nodiscard]] BoundaryStep boundary_step(const std::uint8_t* pairs,
                                            std::size_t row,
@@ -288,6 +408,79 @@ private:
         }
       }
     }
+
+    fast_interior_masks_ = nullptr;
+#if RLIFE_ENABLE_P7_GATHER && defined(__BMI2__) && defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    fast_p7_gather_mask_ = 0;
+    fast_p7_block_offset_ = 0;
+#endif
+    fast_three_projection_two_phase_ = false;
+    if(interior_acceptance_.size() == 1U && interior_acceptance_.front().size() == 1U) {
+      auto& projection = interior_acceptance_.front().front();
+      if(projection.history_offsets.size() == fast_interior_offsets_.size() && projection.candidate_masks.size() == (1U << 15U)) {
+        const auto period = static_cast<std::size_t>(geometry.period);
+        const auto displacement = static_cast<std::size_t>(geometry.displacement);
+        const std::array<std::size_t, 5> locality_order = {
+            2U * period, period + displacement, period, displacement, period - displacement,
+        };
+        if(std::is_permutation(projection.history_offsets.begin(), projection.history_offsets.end(), locality_order.begin(), locality_order.end())) {
+          std::vector<std::uint8_t> reordered(projection.candidate_masks.size());
+          for(std::size_t key = 0; key < reordered.size(); ++key) {
+            std::size_t original_key = 0;
+            for(std::size_t index = 0; index < locality_order.size(); ++index) {
+              const auto original = std::find(projection.history_offsets.begin(), projection.history_offsets.end(), locality_order[index]);
+              const auto original_index = static_cast<std::size_t>(original - projection.history_offsets.begin());
+              original_key |= ((key >> (3U * index)) & 0b111U) << (3U * original_index);
+            }
+            reordered[key] = projection.candidate_masks[original_key];
+          }
+          projection.candidate_masks.swap(reordered);
+          fast_interior_offsets_ = locality_order;
+        } else {
+          std::copy(projection.history_offsets.begin(), projection.history_offsets.end(), fast_interior_offsets_.begin());
+        }
+        fast_interior_masks_ = projection.candidate_masks.data();
+#if RLIFE_ENABLE_P7_GATHER && defined(__BMI2__) && defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+        if(period == 7U && displacement >= 1U && displacement <= 3U) {
+          const std::array<std::size_t, 5> p7_offsets = {
+              14U, 7U + displacement, 7U, displacement, 7U - displacement,
+          };
+          if(fast_interior_offsets_ == p7_offsets) {
+            fast_p7_block_offset_ = static_cast<std::uint8_t>(7U + displacement);
+            fast_p7_gather_mask_ = std::uint64_t{0x07U} |
+                                   (std::uint64_t{0x07U} << (8U * displacement)) |
+                                   (std::uint64_t{0x07U} << (16U * displacement)) |
+                                   (std::uint64_t{0x07U} << 56U);
+          }
+        }
+#endif
+      }
+    }
+
+    if(interior_acceptance_.size() == 2U) {
+      bool compatible = true;
+      for(std::size_t phase = 0; phase < 2U; ++phase) {
+        const auto& projections = interior_acceptance_[phase];
+        if(projections.size() != 3U || projections[0].history_offsets.size() != 5U || projections[0].candidate_masks.size() != (1U << 15U) ||
+           projections[1].history_offsets.size() != 4U || projections[1].candidate_masks.size() != (1U << 12U) ||
+           projections[2].history_offsets.size() != 3U || projections[2].candidate_masks.size() != (1U << 9U) ||
+           projections[1].history_offsets[1] != projections[0].history_offsets[0] ||
+           projections[1].history_offsets[2] != projections[0].history_offsets[2] ||
+           projections[1].history_offsets[3] != projections[0].history_offsets[3]) {
+          compatible = false;
+          break;
+        }
+        auto& fast = fast_three_projection_[phase];
+        for(std::size_t index = 0; index < 5U; ++index)
+          fast.offsets[index] = projections[0].history_offsets[index];
+        fast.offsets[5] = projections[1].history_offsets[0];
+        for(std::size_t index = 0; index < 3U; ++index)
+          fast.offsets[6U + index] = projections[2].history_offsets[index];
+        for(std::size_t index = 0; index < 3U; ++index)
+          fast.masks[index] = projections[index].candidate_masks.data();
+      }
+      fast_three_projection_two_phase_ = compatible;
+    }
   }
 
   void build_boundary(const Geometry& geometry, const RuleTable& rule, EdgeMode mode, Side side) {
@@ -466,6 +659,18 @@ private:
 
   std::size_t short_window_ = 0;
   std::size_t subtile_count_ = 1;
+  std::array<std::size_t, 5> fast_interior_offsets_{};
+  const std::uint8_t* fast_interior_masks_ = nullptr;
+#if RLIFE_ENABLE_P7_GATHER && defined(__BMI2__) && defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  std::uint64_t fast_p7_gather_mask_ = 0;
+  std::uint8_t fast_p7_block_offset_ = 0;
+#endif
+  struct FastThreeProjection {
+    std::array<std::size_t, 9> offsets{};
+    std::array<const std::uint8_t*, 3> masks{};
+  };
+  std::array<FastThreeProjection, 2> fast_three_projection_{};
+  bool fast_three_projection_two_phase_ = false;
   std::vector<std::vector<InteriorProjection>> interior_acceptance_;
   std::array<std::array<std::vector<std::vector<BoundaryProjection>>, 2>, edge_mode_count_> boundary_acceptance_{};
   std::array<std::array<bool, 2>, edge_mode_count_> boundary_built_{};

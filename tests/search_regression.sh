@@ -88,6 +88,16 @@ if [[ $mode == smoke ]]; then
     >"$test_tmp/completion-reload.out" 2>"$test_tmp/completion-reload.err"
   grep -Fq 'checkpoint row already contains a halting completion' "$test_tmp/completion-reload.out"
 
+  # The indexed implicit walk carries only the three-state completion class;
+  # it must reproduce the serial exact-summary completion byte-for-byte.
+  timeout "${RLIFE_TEST_TIMEOUT:-180}" "$binary" llsss \
+    --rule B3/S23 --left-edge bg --filters bcaf --threads 4 \
+    --partials final --partial-output "$test_tmp/completion-indexed.rle" \
+    --save none c4d-f2b '@bg(6)' \
+    >"$test_tmp/completion-indexed.out" 2>"$test_tmp/completion-indexed.err"
+  grep -Fq 'completion at flattened depth 48 (w_pos 24[0])' "$test_tmp/completion-indexed.out"
+  cmp "$test_tmp/completion.rle" "$test_tmp/completion-indexed.rle"
+
   run_tiny_edge gse 2c4-f2b 8 "$test_tmp/orth-gse.out" "$test_tmp/orth-gse.err"
   [[ $(normalize_hash "$test_tmp/orth-gse.err") == 5574b6a953ab5ddf891961447b8b8f5a198d045561a28d636f52709dfe1bacaf ]]
   run_tiny_edge gso 2c4-f2b 8 "$test_tmp/orth-gso.out" "$test_tmp/orth-gso.err"
