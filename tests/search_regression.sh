@@ -74,6 +74,19 @@ if [[ $mode == smoke ]]; then
     >"$test_tmp/gse-reload.out" 2>"$test_tmp/gse-reload.err"
   grep -Fq 'left_edge=gse' "$test_tmp/gse-reload.out"
 
+  # An explicit partial request on an already-halted checkpoint prints the
+  # current row without advancing it.  Ordinary reloads still avoid appending
+  # a duplicate inherited partial.
+  "$binary" llsss --load "$test_tmp/gse-checkpoint_28" --partials every:1 \
+    --partial-output "$test_tmp/gse-reloaded.rle" --save none \
+    >"$test_tmp/gse-print-current.out" 2>"$test_tmp/gse-print-current.err"
+  cmp "$test_tmp/gse.rle" "$test_tmp/gse-reloaded.rle"
+  [[ $(grep -c '^#C llsss halt ' "$test_tmp/gse-reloaded.rle") == 1 ]]
+  if grep -Eq '^Row (29|[3-9][0-9])' "$test_tmp/gse-print-current.err"; then
+    echo 'printing a loaded partial unexpectedly advanced the search' >&2
+    exit 1
+  fi
+
   timeout "${RLIFE_TEST_TIMEOUT:-180}" "$binary" llsss \
     --rule B3/S23 --left-edge bg --filters bcaf --partials none \
     --save final --savefile "$test_tmp/completion-checkpoint" \
@@ -97,6 +110,21 @@ if [[ $mode == smoke ]]; then
     >"$test_tmp/completion-indexed.out" 2>"$test_tmp/completion-indexed.err"
   grep -Fq 'completion at flattened depth 48 (w_pos 24[0])' "$test_tmp/completion-indexed.out"
   cmp "$test_tmp/completion.rle" "$test_tmp/completion-indexed.rle"
+
+  # Capturing a scheduled partial inside the indexed left sweep must preserve
+  # the serial DFS choice byte-for-byte.
+  timeout "${RLIFE_TEST_TIMEOUT:-180}" "$binary" llsss \
+    --rule B35678/S4678 --left-edge bg --filters bcaf --threads 1 \
+    --partials every:1 --partial-output "$test_tmp/partials-serial.rle" \
+    --save none c3d-f2b '@bg(7)' \
+    >"$test_tmp/partials-serial.out" 2>"$test_tmp/partials-serial.err"
+  timeout "${RLIFE_TEST_TIMEOUT:-180}" "$binary" llsss \
+    --rule B35678/S4678 --left-edge bg --filters bcaf --threads 4 \
+    --partials every:1 --partial-output "$test_tmp/partials-indexed.rle" \
+    --save none c3d-f2b '@bg(7)' \
+    >"$test_tmp/partials-indexed.out" 2>"$test_tmp/partials-indexed.err"
+  [[ $(grep -c '^#C llsss partial ' "$test_tmp/partials-indexed.rle") == 3 ]]
+  cmp "$test_tmp/partials-serial.rle" "$test_tmp/partials-indexed.rle"
 
   run_tiny_edge gse 2c4-f2b 8 "$test_tmp/orth-gse.out" "$test_tmp/orth-gse.err"
   [[ $(normalize_hash "$test_tmp/orth-gse.err") == 5574b6a953ab5ddf891961447b8b8f5a198d045561a28d636f52709dfe1bacaf ]]

@@ -269,7 +269,20 @@ struct PairGate {
     if(index_words_per_path == 0) {
       reset_index(segment.index_depth);
     }
-    if((bit_count != 0 && !index_ready(index_depth)) || !segment.index_ready(index_depth) || index_depth != segment.index_depth ||
+    // The destination was fully validated after its index was built, and each
+    // append below preserves ordering by offsetting a validated segment by the
+    // old bit count.  Re-running index_ready() here would rescan the entire
+    // accumulated destination for every segment, making an ordered merge
+    // quadratic in the number of restart ranges on deep rows.
+    const bool destination_shape_valid = [&]() {
+      if(bit_count == 0)
+        return index_starts.empty() && index_paths.empty();
+      if(index_words_per_path == 0 || index_starts.empty() || index_starts.front() != 0 || index_starts.back() >= bit_count ||
+         index_starts.size() > std::numeric_limits<std::size_t>::max() / index_words_per_path)
+        return false;
+      return index_paths.size() == index_starts.size() * index_words_per_path;
+    }();
+    if(!destination_shape_valid || !segment.index_ready(index_depth) || index_depth != segment.index_depth ||
        index_words_per_path != segment.index_words_per_path) {
       throw std::logic_error("cannot append incompatible indexed pair gates");
     }
@@ -796,9 +809,11 @@ public:
   }
 
   ~Solver() {
-    if(options_.phase_timings)
+    if(options_.phase_timings) {
+      finish_phase_timing();
       for(auto [phase, seconds] : phase_timings_)
         std::cerr << phase << " >> " << std::fixed << std::setprecision(6) << seconds << '\n';
+    }
   }
 
   int run() {
@@ -821,7 +836,7 @@ public:
       return finish(0);
     }
     if(options_.halt_height >= 0 && geometry_.w_position(height_) >= static_cast<std::size_t>(options_.halt_height)) {
-      if(!loaded_from_checkpoint_) {
+      if(!loaded_from_checkpoint_ || options_.explicitly_set.contains("partials")) {
         emit_final_partial("halt");
       }
       return finish(0);
@@ -840,6 +855,15 @@ public:
       boundary_states_ = 0;
       peak_tag_bytes_ = 0;
       completion_at_current_row_ = false;
+      bool row_reported = false;
+      auto report_row = [&]() {
+        if(row_reported)
+          return;
+        finish_phase_timing();
+        const auto seconds = std::chrono::duration<double>(Clock::now() - started).count();
+        print_stats("step", seconds);
+        row_reported = true;
+      };
 
       phase("extend slice-tree tails");
       expand_slice_tails();
@@ -863,12 +887,11 @@ public:
       expanded_uniform_tail_ = false;
       phase("row accounting");
 
-      const auto seconds = std::chrono::duration<double>(Clock::now() - started).count();
-      print_stats("step", seconds);
-
+      bool partial_emitted = false;
       if(options_.partial_mode == PartialMode::Every && height_ % static_cast<std::size_t>(options_.partial_every) == 0) {
         phase("partial reconstruction/output");
         emit_board(reconstruct_partial(), "partial");
+        partial_emitted = true;
       }
 
       if(options_.detect_ends) {
@@ -882,6 +905,7 @@ public:
           }
           emit_board(*completion, "completion");
           if(options_.halt_on_ends) {
+            report_row();
             return finish(0);
           }
         }
@@ -893,10 +917,13 @@ public:
         } else {
           std::cout << "height halt at " << height_ << '\n';
         }
-        emit_final_partial("halt");
+        if(!partial_emitted)
+          emit_final_partial("halt");
+        report_row();
         return finish(0);
       }
 
+      report_row();
       if(options_.save_mode == SaveMode::Every && height_ % static_cast<std::size_t>(options_.save_every) == 0) {
         save_checkpoint();
       }
@@ -919,6 +946,7 @@ private:
 
     [[nodiscard]] bool get(Node node) const noexcept { return bits.get(node - first); }
     void set(Node node) noexcept { bits.set(node - first); }
+    void atomic_set(Node node) noexcept { bits.atomic_set(node - first); }
     void set(Node node, bool value) noexcept { bits.set(node - first, value); }
     void clear() noexcept { bits.clear(); }
     [[nodiscard]] std::uint8_t get_4(Node node) const noexcept { return bits.get_4(node - first); }
@@ -1857,7 +1885,7 @@ private:
     return static_cast<std::uint8_t>(((triple & 0b001U) << 2U) | (triple & 0b010U) | ((triple & 0b100U) >> 2U));
   }
 
-  template <bool VisitRejected, bool TrackSummary, bool TrackCompletion, bool ImplicitGate, class BatchCallback>
+  template <bool VisitRejected, bool TrackSummary, bool TrackCompletion, bool ImplicitGate, bool CurrentLeaves, class BatchCallback>
   void walk_indexed_gate_range(std::size_t position,
                                std::size_t checkpoint,
                                std::size_t worker,
@@ -1865,6 +1893,7 @@ private:
                                std::size_t short_start,
                                BatchCallback& batch_callback) {
     static_assert(!TrackSummary || !TrackCompletion);
+    static_assert(!CurrentLeaves || (!VisitRejected && TrackSummary && !TrackCompletion));
     const auto& left = slices_[position];
     const auto& right = slices_[position + 1U];
     const auto& gate = pair_gates_[position];
@@ -1987,8 +2016,18 @@ private:
 
     auto cursor = gate.index_starts[checkpoint];
     const auto end = checkpoint + 1U < gate.index_starts.size() ? gate.index_starts[checkpoint + 1U] : gate.size();
-    const auto left_leaf_bias = left.level_begin(parent_depth + 1U) - 4U * left.level_begin(parent_depth);
-    const auto right_leaf_bias = right.level_begin(parent_depth + 1U) - 4U * right.level_begin(parent_depth);
+    const auto left_leaf_bias = [&]() {
+      if constexpr(CurrentLeaves)
+        return Node{0};
+      else
+        return left.level_begin(parent_depth + 1U) - 4U * left.level_begin(parent_depth);
+    }();
+    const auto right_leaf_bias = [&]() {
+      if constexpr(CurrentLeaves)
+        return Node{0};
+      else
+        return right.level_begin(parent_depth + 1U) - 4U * right.level_begin(parent_depth);
+    }();
     auto gate_word_index = static_cast<std::uint64_t>(-1);
     std::uint64_t gate_word = ~std::uint64_t{0};
     while(cursor < end) {
@@ -2001,29 +2040,34 @@ private:
       const bool ancestry_allowed =
           ImplicitGate || ((gate_word >> (cursor & 63U)) & 1U) != 0;
       ++cursor;
-      const auto active = history_all_accepts(history.data(), parent_depth);
+      if constexpr(CurrentLeaves) {
+        if(ancestry_allowed)
+          batch_callback(left_node, right_node, history, summary, checkpoint, worker);
+      } else {
+        const auto active = history_all_accepts(history.data(), parent_depth);
 #ifndef NDEBUG
-      if constexpr(TrackCompletion)
-        verify_completion_path_state(completion_state, history.data(), parent_depth, long_start, short_start);
+        if constexpr(TrackCompletion)
+          verify_completion_path_state(completion_state, history.data(), parent_depth, long_start, short_start);
 #endif
-      if constexpr(VisitRejected) {
-        if(active != 0) {
-          if constexpr(TrackCompletion) {
-            batch_callback(left_leaf_bias + 4U * left_node, right_leaf_bias + 4U * right_node, active, ancestry_allowed, completion_state, parent_depth,
-                           history, checkpoint, worker);
-          } else {
-            batch_callback(left_leaf_bias + 4U * left_node, right_leaf_bias + 4U * right_node, active, ancestry_allowed, summary, parent_depth, history,
-                           checkpoint, worker);
+        if constexpr(VisitRejected) {
+          if(active != 0) {
+            if constexpr(TrackCompletion) {
+              batch_callback(left_leaf_bias + 4U * left_node, right_leaf_bias + 4U * right_node, active, ancestry_allowed, completion_state, parent_depth,
+                             history, checkpoint, worker);
+            } else {
+              batch_callback(left_leaf_bias + 4U * left_node, right_leaf_bias + 4U * right_node, active, ancestry_allowed, summary, parent_depth, history,
+                             checkpoint, worker);
+            }
           }
-        }
-      } else if(ancestry_allowed) {
-        if(active != 0) {
-          if constexpr(TrackCompletion) {
-            batch_callback(left_leaf_bias + 4U * left_node, right_leaf_bias + 4U * right_node, active, true, completion_state, parent_depth, history,
-                           checkpoint, worker);
-          } else {
-            batch_callback(left_leaf_bias + 4U * left_node, right_leaf_bias + 4U * right_node, active, true, summary, parent_depth, history, checkpoint,
-                           worker);
+        } else if(ancestry_allowed) {
+          if(active != 0) {
+            if constexpr(TrackCompletion) {
+              batch_callback(left_leaf_bias + 4U * left_node, right_leaf_bias + 4U * right_node, active, true, completion_state, parent_depth, history,
+                             checkpoint, worker);
+            } else {
+              batch_callback(left_leaf_bias + 4U * left_node, right_leaf_bias + 4U * right_node, active, true, summary, parent_depth, history, checkpoint,
+                             worker);
+            }
           }
         }
       }
@@ -2040,10 +2084,10 @@ private:
     BatchCallback* callback = nullptr;
   };
 
-  template <bool VisitRejected, bool TrackSummary, bool TrackCompletion, bool ImplicitGate, class BatchCallback>
+  template <bool VisitRejected, bool TrackSummary, bool TrackCompletion, bool ImplicitGate, bool CurrentLeaves, class BatchCallback>
   static void execute_indexed_gate_range(void* opaque, std::size_t checkpoint, std::size_t worker) {
     auto& context = *static_cast<IndexedGateWalkContext<VisitRejected, TrackSummary, TrackCompletion, BatchCallback>*>(opaque);
-    context.solver->template walk_indexed_gate_range<VisitRejected, TrackSummary, TrackCompletion, ImplicitGate>(
+    context.solver->template walk_indexed_gate_range<VisitRejected, TrackSummary, TrackCompletion, ImplicitGate, CurrentLeaves>(
         context.position, checkpoint, worker, context.long_start, context.short_start, *context.callback);
   }
 
@@ -2131,7 +2175,7 @@ private:
     auto callback = std::forward<BatchCallback>(batch_callback);
     IndexedGateWalkContext<VisitRejected, TrackSummary, false, decltype(callback)> context{this, position, 0, 0, &callback};
     execute_indexed_tasks(gate.index_starts.size(), options_.worker_count, &context,
-                          &execute_indexed_gate_range<VisitRejected, TrackSummary, false, ImplicitGate, decltype(callback)>);
+                          &execute_indexed_gate_range<VisitRejected, TrackSummary, false, ImplicitGate, false, decltype(callback)>);
   }
 
   template <bool VisitRejected = true, bool ImplicitGate = false, class BatchCallback>
@@ -2161,11 +2205,49 @@ private:
     auto callback = std::forward<BatchCallback>(batch_callback);
     IndexedGateWalkContext<VisitRejected, false, true, decltype(callback)> context{this, position, long_start, short_start, &callback};
     execute_indexed_tasks(gate.index_starts.size(), options_.worker_count, &context,
-                          &execute_indexed_gate_range<VisitRejected, false, true, ImplicitGate, decltype(callback)>);
+                          &execute_indexed_gate_range<VisitRejected, false, true, ImplicitGate, false, decltype(callback)>);
+  }
+
+  template <class LeafCallback> void walk_current_edges_parallel(std::size_t position, LeafCallback&& leaf_callback) {
+    const auto& gate = pair_gates_.at(position);
+    if(!gate.index_ready(pair_gate_depth_) || pair_gate_depth_ != slices_[position].depth() ||
+       slices_[position].depth() != slices_[position + 1U].depth()) {
+      throw std::logic_error("parallel current-edge walk requires an indexed leaf gate");
+    }
+    const auto workers = static_cast<std::size_t>(options_.worker_count);
+    if(parallel_gate_scratch_.size() != workers)
+      parallel_gate_scratch_.resize(workers);
+    const auto required_depth = static_cast<std::size_t>(gate.index_depth);
+    for(auto& scratch : parallel_gate_scratch_) {
+      if(scratch.history.size() < required_depth)
+        scratch.history.resize(required_depth);
+      if(scratch.frames.size() < required_depth)
+        scratch.frames.resize(required_depth);
+    }
+    auto callback = std::forward<LeafCallback>(leaf_callback);
+    auto run = [&]<bool ImplicitGate>() {
+      if constexpr(ImplicitGate) {
+        if(gate.bits.size() != 0)
+          throw std::logic_error("implicit current-edge walk has a dense gate payload");
+      }
+      IndexedGateWalkContext<false, true, false, decltype(callback)> context{this, position, 0, 0, &callback};
+      execute_indexed_tasks(gate.index_starts.size(), options_.worker_count, &context,
+                            &execute_indexed_gate_range<false, true, false, ImplicitGate, true, decltype(callback)>);
+    };
+    if(implicit_relations_)
+      run.template operator()<true>();
+    else
+      run.template operator()<false>();
   }
 
   [[nodiscard]] bool can_walk_candidate_pair_batches_parallel(std::size_t position) const noexcept {
     return options_.worker_count > 1 && !options_.verbose && expanded_uniform_tail_ && position < pair_gates_.size() &&
+           pair_gates_[position].index_ready(pair_gate_depth_);
+  }
+
+  [[nodiscard]] bool can_walk_current_edges_parallel(std::size_t position) const noexcept {
+    return options_.worker_count > 1 && !options_.verbose && pair_gates_ready_ && position < pair_gates_.size() &&
+           pair_gate_depth_ == slices_[position].depth() && slices_[position].depth() == slices_[position + 1U].depth() &&
            pair_gates_[position].index_ready(pair_gate_depth_);
   }
 
@@ -2418,6 +2500,10 @@ private:
 
     const auto bcaf_window = geometry_.long_window();
     const bool bcaf_active = options_.bcaf && height_ >= bcaf_window;
+    const bool cache_partial =
+        (options_.partial_mode == PartialMode::Every && height_ % static_cast<std::size_t>(options_.partial_every) == 0) ||
+        (options_.partial_mode != PartialMode::None && options_.halt_height >= 0 &&
+         geometry_.w_position(height_) >= static_cast<std::size_t>(options_.halt_height));
     std::vector<LeafTagPair> witness;
     if(bcaf_active) {
       witness.reserve(slices_.size());
@@ -2516,6 +2602,22 @@ private:
       const bool supported = normal[position][0].get(leaf) && normal[position][1].get(leaf);
       return supported && (!bcaf_active || witness[position][0].get(leaf) || witness[position][1].get(leaf));
     };
+    Node partial_current = slices_.front().leaf_end();
+    std::vector<std::vector<std::uint8_t>> partial_lineages;
+    bool partial_seen = false;
+    if(cache_partial) {
+      for(Node leaf = slices_.front().leaf_begin(); leaf < slices_.front().leaf_end(); ++leaf) {
+        if(live_leaf(0, leaf)) {
+          partial_current = leaf;
+          break;
+        }
+      }
+      if(partial_current == slices_.front().leaf_end())
+        return false;
+      partial_lineages.reserve(slices_.size());
+      partial_lineages.push_back(slices_.front().lineage(partial_current));
+      partial_seen = !bcaf_active || labels_prefix_interesting(partial_lineages.back(), bcaf_window);
+    }
     if(cache_completion) {
       for(Node leaf = slices_.front().leaf_begin(); leaf < slices_.front().leaf_end(); ++leaf) {
         if(live_leaf(0, leaf))
@@ -2550,6 +2652,23 @@ private:
 
     phase(bcaf_active ? "  implicit relation: left reach + bcaf prefix/index" : "  implicit relation: left reach/index");
     for(std::size_t i = 0; i < adjacency_count; ++i) {
+      const auto absent_partial = slices_[i + 1U].leaf_end();
+      auto partial_next = absent_partial;
+      auto consider_partial_batch = [&](Node left_first, Node right_first, std::uint8_t final_edges, Node& candidate) {
+        if(candidate != absent_partial || partial_current < left_first || partial_current >= left_first + 4U)
+          return;
+        const auto left_offset = static_cast<unsigned>(partial_current - left_first);
+        auto remaining = static_cast<std::uint8_t>(final_edges & (0x03U << (2U * left_offset)));
+        while(remaining != 0) {
+          const auto position = static_cast<std::uint8_t>(std::countr_zero(static_cast<unsigned>(remaining)));
+          const auto right_leaf = right_first + (position & 0b11U);
+          if(!bcaf_active || partial_seen || witness[i + 1U][1].get(right_leaf)) {
+            candidate = right_leaf;
+            return;
+          }
+          remaining = static_cast<std::uint8_t>(remaining & (remaining - 1U));
+        }
+      };
       auto visit_batch = [&]<bool AtomicWrites>(Node left_first, Node right_first, std::uint8_t active, const CompletionPathState* path_state,
                                                 std::size_t final_depth) {
         const auto reaches_left = static_cast<std::uint8_t>(active & expand_left_edges(get_leaf_four(normal[i][0], left_first)));
@@ -2616,21 +2735,40 @@ private:
         std::vector<PairGate> segments(pair_gates_[i].index_starts.size());
         for(auto& segment : segments)
           segment.reset_index(height_);
-        if(cache_completion) {
-          walk_candidate_pair_batches_parallel_completion<false, true>(
-              i, long_start, short_start,
-              [&](Node left_first, Node right_first, std::uint8_t active, bool, CompletionPathState path_state, std::size_t depth,
-                     const auto& history, std::size_t checkpoint, std::size_t) {
-                const auto final_edges = visit_batch.template operator()<true>(left_first, right_first, active, &path_state, depth);
-                append_final_edges(segments[checkpoint], final_edges, history.data(), depth);
-              });
-        } else {
-          walk_candidate_pair_batches_parallel<false, false, true>(
-              i, [&](Node left_first, Node right_first, std::uint8_t active, bool, const PairPathSummary&, std::size_t depth, const auto& history,
-                     std::size_t checkpoint, std::size_t) {
-                const auto final_edges = visit_batch.template operator()<true>(left_first, right_first, active, nullptr, depth);
-                append_final_edges(segments[checkpoint], final_edges, history.data(), depth);
-              });
+        std::vector<Node> partial_candidates(cache_partial ? segments.size() : 0, absent_partial);
+        auto run_parallel = [&]<bool CapturePartial>() {
+          if(cache_completion) {
+            walk_candidate_pair_batches_parallel_completion<false, true>(
+                i, long_start, short_start,
+                [&](Node left_first, Node right_first, std::uint8_t active, bool, CompletionPathState path_state, std::size_t depth,
+                       const auto& history, std::size_t checkpoint, std::size_t) {
+                  const auto final_edges = visit_batch.template operator()<true>(left_first, right_first, active, &path_state, depth);
+                  if constexpr(CapturePartial)
+                    consider_partial_batch(left_first, right_first, final_edges, partial_candidates[checkpoint]);
+                  append_final_edges(segments[checkpoint], final_edges, history.data(), depth);
+                });
+          } else {
+            walk_candidate_pair_batches_parallel<false, false, true>(
+                i, [&](Node left_first, Node right_first, std::uint8_t active, bool, const PairPathSummary&, std::size_t depth, const auto& history,
+                       std::size_t checkpoint, std::size_t) {
+                  const auto final_edges = visit_batch.template operator()<true>(left_first, right_first, active, nullptr, depth);
+                  if constexpr(CapturePartial)
+                    consider_partial_batch(left_first, right_first, final_edges, partial_candidates[checkpoint]);
+                  append_final_edges(segments[checkpoint], final_edges, history.data(), depth);
+                });
+          }
+        };
+        if(cache_partial)
+          run_parallel.template operator()<true>();
+        else
+          run_parallel.template operator()<false>();
+        if(cache_partial) {
+          for(const auto candidate : partial_candidates) {
+            if(candidate != absent_partial) {
+              partial_next = candidate;
+              break;
+            }
+          }
         }
         next_gates[i].reset_index(height_);
         std::size_t output_index_entries = 0;
@@ -2640,24 +2778,34 @@ private:
         for(auto& segment : segments)
           next_gates[i].append(std::move(segment));
       } else if(expanded_uniform_tail_ && !build_output_index) {
-        if(cache_completion) {
-          walk_candidate_pair_batches_completion<false>(
-              i, long_start, short_start,
-              [&](Node left_first, Node right_first, std::uint8_t active, bool, CompletionPathState path_state, std::size_t depth) {
-                const auto final_edges = visit_batch.template operator()<false>(left_first, right_first, active, &path_state, depth);
-                next_gates[i].append_implicit_ones(static_cast<unsigned>(std::popcount(static_cast<unsigned>(final_edges))));
-              });
-        } else {
-          walk_candidate_pair_batches<false>(
-              i, [&](Node left_first, Node right_first, std::uint8_t active, bool, const PairPathSummary&, std::size_t depth) {
-                const auto final_edges = visit_batch.template operator()<false>(left_first, right_first, active, nullptr, depth);
-                next_gates[i].append_implicit_ones(static_cast<unsigned>(std::popcount(static_cast<unsigned>(final_edges))));
-              });
-        }
+        auto run_serial_batches = [&]<bool CapturePartial>() {
+          if(cache_completion) {
+            walk_candidate_pair_batches_completion<false>(
+                i, long_start, short_start,
+                [&](Node left_first, Node right_first, std::uint8_t active, bool, CompletionPathState path_state, std::size_t depth) {
+                  const auto final_edges = visit_batch.template operator()<false>(left_first, right_first, active, &path_state, depth);
+                  if constexpr(CapturePartial)
+                    consider_partial_batch(left_first, right_first, final_edges, partial_next);
+                  next_gates[i].append_implicit_ones(static_cast<unsigned>(std::popcount(static_cast<unsigned>(final_edges))));
+                });
+          } else {
+            walk_candidate_pair_batches<false>(
+                i, [&](Node left_first, Node right_first, std::uint8_t active, bool, const PairPathSummary&, std::size_t depth) {
+                  const auto final_edges = visit_batch.template operator()<false>(left_first, right_first, active, nullptr, depth);
+                  if constexpr(CapturePartial)
+                    consider_partial_batch(left_first, right_first, final_edges, partial_next);
+                  next_gates[i].append_implicit_ones(static_cast<unsigned>(std::popcount(static_cast<unsigned>(final_edges))));
+                });
+          }
+        };
+        if(cache_partial)
+          run_serial_batches.template operator()<true>();
+        else
+          run_serial_batches.template operator()<false>();
       } else {
         if(build_output_index)
           next_gates[i].reset_index(height_);
-        auto visit_edge = [&](Node left_leaf, Node right_leaf, const auto& history, const PairPathSummary* summary) {
+        auto visit_edge = [&]<bool CapturePartial>(Node left_leaf, Node right_leaf, const auto& history, const PairPathSummary* summary) {
           if(!normal[i][0].get(left_leaf))
             return;
           normal[i + 1U][0].set(right_leaf);
@@ -2685,22 +2833,45 @@ private:
           if(build_output_index && next_gates[i].size() % PairGate::index_quantum == 0)
             next_gates[i].add_index_path(next_gates[i].size(), history.data(), height_);
           next_gates[i].push_back(true);
+          if constexpr(CapturePartial) {
+            if(partial_next == absent_partial && left_leaf == partial_current &&
+               (!bcaf_active || partial_seen || witness[i + 1U][1].get(right_leaf)))
+              partial_next = right_leaf;
+          }
         };
-        if(cache_completion) {
-          walk_candidate_pairs<false, true>(i, [&](Node left_leaf, Node right_leaf, const auto& history, bool, const PairPathSummary& summary) {
-            visit_edge(left_leaf, right_leaf, history, &summary);
-          });
-        } else {
-          walk_candidate_pairs<false>(i, [&](Node left_leaf, Node right_leaf, const auto& history, bool) {
-            visit_edge(left_leaf, right_leaf, history, nullptr);
-          });
-        }
+        auto run_edges = [&]<bool CapturePartial>() {
+          if(cache_completion) {
+            walk_candidate_pairs<false, true>(i, [&](Node left_leaf, Node right_leaf, const auto& history, bool, const PairPathSummary& summary) {
+              visit_edge.template operator()<CapturePartial>(left_leaf, right_leaf, history, &summary);
+            });
+          } else {
+            walk_candidate_pairs<false>(i, [&](Node left_leaf, Node right_leaf, const auto& history, bool) {
+              visit_edge.template operator()<CapturePartial>(left_leaf, right_leaf, history, nullptr);
+            });
+          }
+        };
+        if(cache_partial)
+          run_edges.template operator()<true>();
+        else
+          run_edges.template operator()<false>();
       }
       seed_prefix(i + 1U);
       if(next_gates[i].size() == 0)
         return false;
       if(build_output_index && !next_gates[i].index_ready(height_))
         throw std::logic_error("implicit pair-gate emission produced an invalid sparse index");
+      if(cache_partial) {
+        if(partial_next == absent_partial)
+          throw std::logic_error("interesting-path reconstruction lost its edge");
+        partial_current = partial_next;
+        partial_lineages.push_back(slices_[i + 1U].lineage(partial_current));
+        partial_seen = partial_seen || !bcaf_active || labels_prefix_interesting(partial_lineages.back(), bcaf_window);
+      }
+    }
+    if(cache_partial) {
+      if(bcaf_active && !partial_seen)
+        throw std::logic_error("interesting-path reconstruction lost its witness");
+      cached_partial_ = board_from_lineages(partial_lineages);
     }
     bool completion_found = false;
     if(cache_completion) {
@@ -3695,22 +3866,32 @@ private:
   }
 
   template <class Predicate> std::pair<Node, std::vector<std::uint8_t>> find_current_right(std::size_t position, Node left_leaf, Predicate&& predicate) {
-    Node result = slices_[position + 1U].leaf_end();
-    std::vector<std::uint8_t> result_labels;
+    const auto absent = slices_[position + 1U].leaf_end();
+    Node result = absent;
     auto actual = std::forward<Predicate>(predicate);
-    walk_current_edges(position, [&](Node candidate_left, Node candidate_right, const auto&, const auto&) {
-      if(result != slices_[position + 1U].leaf_end() || candidate_left != left_leaf)
-        return;
-      auto labels = slices_[position + 1U].lineage(candidate_right);
-      if(actual(candidate_right, labels)) {
-        result = candidate_right;
-        result_labels = std::move(labels);
+    if(can_walk_current_edges_parallel(position)) {
+      std::vector<Node> candidates(pair_gates_[position].index_starts.size(), absent);
+      walk_current_edges_parallel(position, [&](Node candidate_left, Node candidate_right, const auto&, const PairPathSummary&, std::size_t checkpoint,
+                                                std::size_t) {
+        if(candidates[checkpoint] == absent && candidate_left == left_leaf && actual(candidate_right))
+          candidates[checkpoint] = candidate_right;
+      });
+      for(const auto candidate : candidates) {
+        if(candidate != absent) {
+          result = candidate;
+          break;
+        }
       }
-    });
-    if(result == slices_[position + 1U].leaf_end()) {
+    } else {
+      walk_current_edges(position, [&](Node candidate_left, Node candidate_right, const auto&, const auto&) {
+        if(result == absent && candidate_left == left_leaf && actual(candidate_right))
+          result = candidate_right;
+      });
+    }
+    if(result == absent) {
       throw std::logic_error("supported slice has no allowed successor");
     }
-    return {result, std::move(result_labels)};
+    return {result, slices_[position + 1U].lineage(result)};
   }
 
   Board board_from_lineages(const std::vector<std::vector<std::uint8_t>>& lineages) const {
@@ -3731,7 +3912,7 @@ private:
     Node current = slices_.front().leaf_begin();
     lineages.push_back(slices_.front().lineage(current));
     for(std::size_t i = 1; i < slices_.size(); ++i) {
-      auto [node, labels] = find_current_right(i - 1U, current, [](Node, const auto&) { return true; });
+      auto [node, labels] = find_current_right(i - 1U, current, [](Node) { return true; });
       current = node;
       lineages.push_back(std::move(labels));
     }
@@ -3739,27 +3920,36 @@ private:
   }
 
   Board reconstruct_interesting(std::size_t window) {
-    std::vector<TagPair> suffix;
+    std::vector<LeafTags> suffix;
     suffix.reserve(slices_.size());
     for(const auto& slice : slices_)
-      suffix.emplace_back(slice.node_count());
-    account_tags(suffix);
+      suffix.emplace_back(slice.leaf_begin(), slice.leaf_count());
+    std::size_t suffix_bytes = 0;
+    for(const auto& tags : suffix)
+      suffix_bytes += tags.allocated_bytes();
+    peak_tag_bytes_ = std::max(peak_tag_bytes_, suffix_bytes);
 
     walk_leaves(slices_.back(), [&](Node leaf, std::size_t first_nonzero, std::size_t) {
       if(first_nonzero < window)
-        suffix.back()[0].set(leaf);
+        suffix.back().set(leaf);
     });
     for(std::size_t i = slices_.size() - 1; i > 0; --i) {
-      walk_current_edges(i - 1U, [&](Node left_leaf, Node right_leaf, const auto&, const PairPathSummary& summary) {
-        if(suffix[i][0].get(right_leaf) || summary.first_left_nonzero < window) {
-          suffix[i - 1][0].set(left_leaf);
-        }
-      });
+      if(can_walk_current_edges_parallel(i - 1U)) {
+        walk_current_edges_parallel(i - 1U, [&](Node left_leaf, Node right_leaf, const auto&, const PairPathSummary& summary, std::size_t, std::size_t) {
+          if(suffix[i].get(right_leaf) || summary.first_left_nonzero < window)
+            suffix[i - 1U].atomic_set(left_leaf);
+        });
+      } else {
+        walk_current_edges(i - 1U, [&](Node left_leaf, Node right_leaf, const auto&, const PairPathSummary& summary) {
+          if(suffix[i].get(right_leaf) || summary.first_left_nonzero < window)
+            suffix[i - 1U].set(left_leaf);
+        });
+      }
     }
 
     Node first = slices_.front().leaf_end();
     for(Node leaf = slices_.front().leaf_begin(); leaf < slices_.front().leaf_end(); ++leaf) {
-      if(suffix.front()[0].get(leaf)) {
+      if(suffix.front().get(leaf)) {
         first = leaf;
         break;
       }
@@ -3774,7 +3964,7 @@ private:
     lineages.push_back(slices_.front().lineage(first));
     bool seen = labels_prefix_interesting(lineages.front(), window);
     for(std::size_t i = 1; i < slices_.size(); ++i) {
-      auto [node, labels] = find_current_right(i - 1U, current, [&](Node leaf, const auto&) { return seen || suffix[i][0].get(leaf); });
+      auto [node, labels] = find_current_right(i - 1U, current, [&](Node leaf) { return seen || suffix[i].get(leaf); });
       current = node;
       seen = seen || labels_prefix_interesting(labels, window);
       lineages.push_back(std::move(labels));
@@ -3803,7 +3993,7 @@ private:
     bool seen_interesting = labels_interesting(lineages.front(), long_window);
     for(std::size_t i = 1; i < slices_.size(); ++i) {
       const auto required_plane = seen_interesting ? 0U : 1U;
-      auto [node, labels] = find_current_right(i - 1U, current, [&](Node leaf, const auto&) { return suffix[i][required_plane].get(leaf); });
+      auto [node, labels] = find_current_right(i - 1U, current, [&](Node leaf) { return suffix[i][required_plane].get(leaf); });
       current = node;
       seen_interesting = seen_interesting || labels_interesting(labels, long_window);
       lineages.push_back(std::move(labels));
@@ -3879,17 +4069,19 @@ private:
         }
       }
       if(options_.phase_timings) {
-        static std::string last_phase;
-        auto current = Clock::now();
-        static decltype(current) last_timing;
-        if(last_phase.size()) {
-          const auto seconds = std::chrono::duration<double>(current - last_timing).count();
-          phase_timings_[last_phase] += seconds;
-        }
-        last_phase = message;
-        last_timing = current;
+        finish_phase_timing();
+        timed_phase_ = message;
+        timed_phase_started_ = Clock::now();
       }
     }
+  }
+
+  void finish_phase_timing() {
+    if(timed_phase_.empty())
+      return;
+    const auto seconds = std::chrono::duration<double>(Clock::now() - timed_phase_started_).count();
+    phase_timings_[timed_phase_] += seconds;
+    timed_phase_.clear();
   }
 
   template <class Pair> static std::size_t tag_bytes(const std::vector<Pair>& tags) {
@@ -4014,6 +4206,8 @@ private:
   std::vector<GateRangeScratch> parallel_gate_scratch_;
 
   std::map<std::string, double> phase_timings_;
+  std::string timed_phase_;
+  Clock::time_point timed_phase_started_{};
 };
 
 } // namespace rlife::llsss

@@ -714,3 +714,104 @@ case 3: 16.387296 -> 15.990350 s (-2.42%)
         combined relation 12.647408 -> 12.206668 s (-3.49%)
         maxRSS +260 KiB (noise)
 ```
+
+## Late-row continuation: quadratic merge and partial reporting
+
+The supplied `save_217` and `save_239` checkpoints are for the `c5d-f2b`,
+`B35678/S4678`, width-12 BCAF search.  They are flattened depths 217/239,
+corresponding to `w_pos 108[1]` / `119[1]`.
+
+### One-core valleys: repeated restart-index validation
+
+Instrumentation separated each ordered output merge from its preceding
+indexed walk.  The walks themselves used about 18--19 effective cores, but
+`PairGate::append()` called `index_ready()` on the entire accumulated output
+after every restart-range segment.  The destination therefore underwent an
+O(number_of_ranges^2) monotonicity scan on one core.  At Row 218, left walks
+summed about 11.16 s while this validation merge alone cost about 10.35 s;
+central relations each spent roughly 3.97 s at exactly one core.
+
+Every independently produced segment is still fully validated.  The
+accumulated destination now gets an O(1) structural check on each append,
+using the inductive invariant that a validated segment begins at zero and is
+offset beyond the prior valid destination.  The existing one full
+`index_ready(height_)` check remains after the complete ordered merge.
+
+Exact adjacent `save_217 -> Row 218` results:
+
+```text
+before: 46.793778 s solver row, 861% process CPU, 5033004 KiB maxRSS
+after:  23.685073 s solver row, 1533% process CPU, 5031576 KiB maxRSS
+left phase: 33.118305 -> 11.222047 s
+```
+
+A post-cleanup confirmation measured 23.508662 s with identical columns.
+
+`save_239` has 988,965 restart tasks; the sum of squared per-relation task
+counts is 18.954x Row 217's.  The old validation loop therefore predicted
+roughly 196--215 seconds of serial work, explaining the observed/anticipated
+seven-minute scale.  The fixed exact continuation instead measured:
+
+```text
+Row 240, 6760494684 nodes, 106.821271 s solver row
+right 42.669881, left 48.851045, grouped reify 10.842873 s
+1518% process CPU, 24719012 KiB maxRSS
+2:04.48 process elapsed including loading the 7.0 GiB checkpoint
+```
+
+No coarser restart quantum is needed for this failure; dynamic 16K tasks were
+well utilized once the quadratic serial epilogue was removed.
+
+### Partials without serial reconstruction
+
+The current implicit engine did not actually disable its parallel pruning
+when `--partials` was set.  It finished/printed the timed row first, then
+`reconstruct_interesting()` allocated two full-node tag planes and made two
+serial full relation passes: one backward suffix propagation and one forward
+path selection.  On a row that was both scheduled and halted, it repeated the
+entire reconstruction and emitted the same board as both `partial` and
+`halt`.  The legacy v1/v2 engine additionally disables grouped reification
+while caching a partial; that compatibility path is unchanged.
+
+Native v4 rows now capture the deterministic witness path inside the already
+required indexed left sweep.  Each restart range records only its first
+suitable successor, and reducing candidates in restart order preserves the
+old serial DFS choice byte-for-byte.  The path is materialized before stable
+reification changes node IDs.  This adds no relation pass; rows with partials
+disabled compile to a capture-free walker specialization.  A scheduled halt
+emits only its already-produced partial.
+
+Exact `save_217 -> Row 218` partial results:
+
+```text
+old: printed sec 51.472708 before reporting; first reconstruction 179.570503 s
+     then reconstructed/emitted it again; 6:54.16 elapsed, 189% process CPU
+new: sec 23.868316 includes reporting; reconstruction/output 0.000109 s
+     27.48 s elapsed including load, 1541% process CPU, one emitted board
+```
+
+An explicit partial override on an already-halted loaded checkpoint is now a
+read-only inspection operation.  For example:
+
+```sh
+./rlife_llsss llsss --load save_217 --save none --halts w_pos:108 \
+  --partials every:1 --partial-output partial.rle --threads 20
+```
+
+Ordinary loads without an explicit partial override still suppress duplicate
+inherited output.  The post-hoc fallback now uses one leaf-local suffix plane
+and indexed current-edge walks.  `save_217` inspection took 14.930155 s for
+reconstruction (18.53 s including load), used 1523% process CPU, and peaked
+at 1663112 KiB RSS instead of performing the old multi-minute serial scans.
+
+The per-row `sec` field is emitted after scheduled partial reporting and end
+propagation, so it measures the complete search/reporting row; checkpoint
+serialization remains intentionally outside it.  Phase timing state is now
+per solver and flushes the final phase.  `every:N` continues to count
+flattened depths, so on a two-subtile geometry `every:10` means every five
+logical `w_pos` positions.  Completion detection/output remains independent
+of partial mode and is still emitted with `--partials none`.
+
+Validation for this continuation includes byte-identical serial/indexed
+partials, exact deep-row columns, the full and smoke regressions, Release
+CMake/CTest, and non-native ASan/UBSan smoke tests.
