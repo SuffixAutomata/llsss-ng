@@ -140,7 +140,6 @@ struct Options {
 struct PairGate {
   static constexpr std::uint64_t index_quantum = 1U << 14U;
 
-  PackedTags bits;
   std::uint64_t bit_count = 0;
   std::uint32_t index_depth = 0;
   std::uint32_t index_words_per_path = 0;
@@ -148,44 +147,11 @@ struct PairGate {
   std::vector<std::uint64_t> index_paths;
 
   [[nodiscard]] std::uint64_t size() const noexcept { return bit_count; }
-  [[nodiscard]] bool get(std::uint64_t index) const noexcept { return bits.size() == 0 ? true : bits.get(index); }
+  [[nodiscard]] bool get(std::uint64_t) const noexcept { return true; }
   void push_back(bool value) {
-    if(bits.size() != 0) {
-      bits.push_back(value);
-    } else if(!value) {
-      bits.reset_size(bit_count + 1U);
-      bits.set_all();
-      bits.set(bit_count, false);
-    }
+    if(!value)
+      throw std::logic_error("implicit pair gate cannot store a rejected edge");
     ++bit_count;
-  }
-  void append_selected(std::uint8_t selected, std::uint8_t values) {
-    if(selected == 0)
-      return;
-    const auto count = static_cast<unsigned>(std::popcount(static_cast<unsigned>(selected)));
-    std::uint8_t packed = 0;
-#if defined(__BMI2__)
-    packed = static_cast<std::uint8_t>(_pext_u32(values, selected));
-#else
-    auto remaining = selected;
-    unsigned output = 0;
-    while(remaining != 0) {
-      const auto bit = static_cast<std::uint8_t>(std::countr_zero(static_cast<unsigned>(remaining)));
-      packed = static_cast<std::uint8_t>(packed | (((values >> bit) & 1U) << output++));
-      remaining = static_cast<std::uint8_t>(remaining & (remaining - 1U));
-    }
-#endif
-    const auto all = static_cast<std::uint8_t>((1U << count) - 1U);
-    if(bits.size() == 0) {
-      if(packed == all) {
-        bit_count += count;
-        return;
-      }
-      bits.reset_size(bit_count);
-      bits.set_all();
-    }
-    bits.append_low_bits(packed, count);
-    bit_count += count;
   }
   // The implicit relation builder emits only accepted edges, so its payload
   // remains all-one and only the logical length changes.
@@ -256,7 +222,6 @@ struct PairGate {
     }
     return true;
   }
-  void reserve_payload_bits(std::uint64_t count) { bits.reserve_bits(count); }
   void reserve_index_entries(std::size_t count) {
     if(index_words_per_path != 0 && count > std::numeric_limits<std::size_t>::max() / index_words_per_path)
       throw std::overflow_error("pair-gate index reservation is too large");
@@ -287,20 +252,7 @@ struct PairGate {
       throw std::logic_error("cannot append incompatible indexed pair gates");
     }
     const auto output_offset = bit_count;
-    if(bits.size() == 0 && segment.bits.size() == 0) {
-      bit_count += segment.bit_count;
-    } else {
-      if(bits.size() == 0) {
-        bits.reset_size(bit_count);
-        bits.set_all();
-      }
-      if(segment.bits.size() == 0) {
-        bits.append_ones(segment.bit_count);
-      } else {
-        bits.append(segment.bits);
-      }
-      bit_count += segment.bit_count;
-    }
+    bit_count += segment.bit_count;
     index_starts.reserve(index_starts.size() + segment.index_starts.size());
     for(const auto start : segment.index_starts)
       index_starts.push_back(output_offset + start);
@@ -308,202 +260,16 @@ struct PairGate {
     segment = PairGate{};
   }
   [[nodiscard]] std::size_t allocated_bytes() const noexcept {
-    return bits.allocated_bytes() + index_starts.capacity() * sizeof(index_starts[0]) + index_paths.capacity() * sizeof(index_paths[0]);
+    return index_starts.capacity() * sizeof(index_starts[0]) + index_paths.capacity() * sizeof(index_paths[0]);
   }
-  [[nodiscard]] std::uint64_t count() const noexcept { return bits.size() == 0 ? bit_count : bits.count(0, bits.size()); }
+  [[nodiscard]] std::uint64_t count() const noexcept { return bit_count; }
 };
 
-inline constexpr std::array<std::uint8_t, 16> checkpoint_magic_ = {
-    'R', 'L', 'I', 'F', 'E', '-', 'L', 'L', 'S', 'S', 'S', '-', 'C', 'P', 0, 1,
-};
-inline constexpr std::uint32_t checkpoint_version_ = 4;
+class CheckpointWriter;
+class CheckpointReader;
 
-class CheckpointWriter {
-public:
-  explicit CheckpointWriter(std::ostream& output) : output_(output) {}
-
-  void bytes(const void* data, std::size_t size) {
-    output_.write(static_cast<const char*>(data), static_cast<std::streamsize>(size));
-    if(!output_) {
-      throw std::runtime_error("failed while writing checkpoint");
-    }
-    const auto* input = static_cast<const std::uint8_t*>(data);
-    for(std::size_t i = 0; i < size; ++i) {
-      checksum_ = (checksum_ ^ input[i]) * 1099511628211ULL;
-    }
-  }
-
-  void u8(std::uint8_t value) { bytes(&value, sizeof(value)); }
-  void boolean(bool value) { u8(value ? 1U : 0U); }
-  void u32(std::uint32_t value) {
-    std::array<std::uint8_t, 4> encoded{};
-    for(std::size_t i = 0; i < encoded.size(); ++i)
-      encoded[i] = static_cast<std::uint8_t>(value >> (8U * i));
-    bytes(encoded.data(), encoded.size());
-  }
-  void u64(std::uint64_t value) {
-    std::array<std::uint8_t, 8> encoded{};
-    for(std::size_t i = 0; i < encoded.size(); ++i)
-      encoded[i] = static_cast<std::uint8_t>(value >> (8U * i));
-    bytes(encoded.data(), encoded.size());
-  }
-  void string(const std::string& value) {
-    u64(value.size());
-    bytes(value.data(), value.size());
-  }
-  void vector_u64(const std::vector<std::uint64_t>& values) {
-    u64(values.size());
-    std::array<std::uint8_t, 8192> encoded{};
-    for(std::size_t offset = 0; offset < values.size();) {
-      const auto count = std::min<std::size_t>(encoded.size() / sizeof(std::uint64_t), values.size() - offset);
-      for(std::size_t index = 0; index < count; ++index) {
-        const auto value = values[offset + index];
-        for(std::size_t byte = 0; byte < sizeof(std::uint64_t); ++byte)
-          encoded[index * sizeof(std::uint64_t) + byte] = static_cast<std::uint8_t>(value >> (8U * byte));
-      }
-      bytes(encoded.data(), count * sizeof(std::uint64_t));
-      offset += count;
-    }
-  }
-  void vector_u8(const std::vector<std::uint8_t>& values) {
-    u64(values.size());
-    if(!values.empty())
-      bytes(values.data(), values.size());
-  }
-
-  void finish() {
-    const auto checksum = checksum_;
-    std::array<std::uint8_t, 8> encoded{};
-    for(std::size_t i = 0; i < encoded.size(); ++i)
-      encoded[i] = static_cast<std::uint8_t>(checksum >> (8U * i));
-    output_.write(reinterpret_cast<const char*>(encoded.data()), static_cast<std::streamsize>(encoded.size()));
-    if(!output_) {
-      throw std::runtime_error("failed while finishing checkpoint");
-    }
-  }
-
-private:
-  std::ostream& output_;
-  std::uint64_t checksum_ = 14695981039346656037ULL;
-};
-
-class CheckpointReader {
-public:
-  CheckpointReader(std::istream& input, std::uint64_t size) : input_(input), remaining_(size) {}
-
-  void bytes(void* data, std::size_t size) {
-    if(size > remaining_) {
-      throw std::runtime_error("checkpoint is truncated");
-    }
-    input_.read(static_cast<char*>(data), static_cast<std::streamsize>(size));
-    if(!input_) {
-      throw std::runtime_error("failed while reading checkpoint");
-    }
-    const auto* output = static_cast<const std::uint8_t*>(data);
-    for(std::size_t i = 0; i < size; ++i) {
-      checksum_ = (checksum_ ^ output[i]) * 1099511628211ULL;
-    }
-    remaining_ -= size;
-  }
-
-  [[nodiscard]] std::uint8_t u8() {
-    std::uint8_t value = 0;
-    bytes(&value, sizeof(value));
-    return value;
-  }
-  [[nodiscard]] bool boolean() {
-    const auto value = u8();
-    if(value > 1U)
-      throw std::runtime_error("invalid boolean in checkpoint");
-    return value != 0;
-  }
-  [[nodiscard]] std::uint32_t u32() {
-    std::array<std::uint8_t, 4> encoded{};
-    bytes(encoded.data(), encoded.size());
-    std::uint32_t value = 0;
-    for(std::size_t i = 0; i < encoded.size(); ++i)
-      value |= static_cast<std::uint32_t>(encoded[i]) << (8U * i);
-    return value;
-  }
-  [[nodiscard]] std::uint64_t u64() {
-    std::array<std::uint8_t, 8> encoded{};
-    bytes(encoded.data(), encoded.size());
-    std::uint64_t value = 0;
-    for(std::size_t i = 0; i < encoded.size(); ++i)
-      value |= static_cast<std::uint64_t>(encoded[i]) << (8U * i);
-    return value;
-  }
-  [[nodiscard]] std::string string() {
-    const auto size = u64();
-    if(size > remaining_ || size > std::numeric_limits<std::size_t>::max()) {
-      throw std::runtime_error("invalid string size in checkpoint");
-    }
-    std::string value(static_cast<std::size_t>(size), '\0');
-    bytes(value.data(), value.size());
-    return value;
-  }
-  [[nodiscard]] std::vector<std::uint64_t> vector_u64() {
-    const auto count = u64();
-    if(count > std::numeric_limits<std::size_t>::max() || count > remaining_ / sizeof(std::uint64_t)) {
-      throw std::runtime_error("invalid vector size in checkpoint");
-    }
-    std::vector<std::uint64_t> values(static_cast<std::size_t>(count));
-    std::array<std::uint8_t, 8192> encoded{};
-    for(std::size_t offset = 0; offset < values.size();) {
-      const auto chunk = std::min<std::size_t>(encoded.size() / sizeof(std::uint64_t), values.size() - offset);
-      bytes(encoded.data(), chunk * sizeof(std::uint64_t));
-      for(std::size_t index = 0; index < chunk; ++index) {
-        std::uint64_t value = 0;
-        for(std::size_t byte = 0; byte < sizeof(std::uint64_t); ++byte)
-          value |= static_cast<std::uint64_t>(encoded[index * sizeof(std::uint64_t) + byte]) << (8U * byte);
-        values[offset + index] = value;
-      }
-      offset += chunk;
-    }
-    return values;
-  }
-  [[nodiscard]] std::vector<std::uint8_t> vector_u8() {
-    const auto count = u64();
-    if(count > remaining_ || count > std::numeric_limits<std::size_t>::max())
-      throw std::runtime_error("invalid byte-vector size in checkpoint");
-    std::vector<std::uint8_t> values(static_cast<std::size_t>(count));
-    if(!values.empty())
-      bytes(values.data(), values.size());
-    return values;
-  }
-
-  void finish() {
-    if(remaining_ != sizeof(std::uint64_t)) {
-      throw std::runtime_error("checkpoint has trailing or missing data");
-    }
-    std::array<std::uint8_t, 8> encoded{};
-    input_.read(reinterpret_cast<char*>(encoded.data()), static_cast<std::streamsize>(encoded.size()));
-    if(!input_)
-      throw std::runtime_error("checkpoint checksum is truncated");
-    std::uint64_t expected = 0;
-    for(std::size_t i = 0; i < encoded.size(); ++i)
-      expected |= static_cast<std::uint64_t>(encoded[i]) << (8U * i);
-    remaining_ = 0;
-    if(expected != checksum_)
-      throw std::runtime_error("checkpoint checksum mismatch");
-  }
-
-private:
-  std::istream& input_;
-  std::uint64_t remaining_ = 0;
-  std::uint64_t checksum_ = 14695981039346656037ULL;
-};
-
-inline volatile std::sig_atomic_t checkpoint_interrupt_requested_ = 0;
-
-inline void checkpoint_interrupt_handler_(int) { checkpoint_interrupt_requested_ = 1; }
-
-inline void install_checkpoint_interrupt_handler() {
-  checkpoint_interrupt_requested_ = 0;
-  if(std::signal(SIGINT, checkpoint_interrupt_handler_) == SIG_ERR) {
-    throw std::runtime_error("cannot install Ctrl-C handler");
-  }
-}
+extern volatile std::sig_atomic_t checkpoint_interrupt_requested_;
+void install_checkpoint_interrupt_handler();
 
 inline std::vector<std::string> split_words(std::string text) {
   for(char& ch : text) {
@@ -992,344 +758,20 @@ private:
     LeafTags planes[2];
   };
 
-  static void write_config(CheckpointWriter& output, const Options& options) {
-    output.string(options.rule);
-    output.string(options.geometry);
-    output.string(options.start);
-    output.u8(static_cast<std::uint8_t>(options.left_edge));
-    output.u8(static_cast<std::uint8_t>(options.right_edge));
-    output.boolean(options.bcaf);
-    output.boolean(options.detect_ends);
-    output.boolean(options.halt_on_ends);
-    output.boolean(options.phase_progress);
-    output.u64(static_cast<std::uint64_t>(options.worker_count));
-    output.u64(options.halt_height < 0 ? 0U : static_cast<std::uint64_t>(options.halt_height) + 1U);
-    output.u8(static_cast<std::uint8_t>(options.partial_mode));
-    output.u64(static_cast<std::uint64_t>(options.partial_every));
-    output.string(options.partial_output);
-    output.string(options.stats_output);
-    output.boolean(options.verbose);
-    output.boolean(options.phase_timings);
-    output.u8(static_cast<std::uint8_t>(options.save_mode));
-    output.u64(static_cast<std::uint64_t>(options.save_every));
-    output.string(options.savefile);
-  }
+  static void write_config(CheckpointWriter& output, const Options& options);
+  static int checkpoint_positive_int(CheckpointReader& input, std::string_view field);
+  static Options read_config(CheckpointReader& input);
 
-  static int checkpoint_positive_int(CheckpointReader& input, std::string_view field) {
-    const auto value = input.u64();
-    if(value == 0 || value > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
-      throw std::runtime_error("invalid " + std::string(field) + " in checkpoint");
-    }
-    return static_cast<int>(value);
-  }
-
-  static Options read_config(CheckpointReader& input) {
-    Options options;
-    options.rule = input.string();
-    options.geometry = input.string();
-    options.start = input.string();
-    const auto left_edge = input.u8();
-    const auto right_edge = input.u8();
-    if(left_edge > static_cast<std::uint8_t>(EdgeMode::GlideOdd) || right_edge > static_cast<std::uint8_t>(EdgeMode::GlideOdd)) {
-      throw std::runtime_error("invalid edge mode in checkpoint");
-    }
-    options.left_edge = static_cast<EdgeMode>(left_edge);
-    options.right_edge = static_cast<EdgeMode>(right_edge);
-    options.bcaf = input.boolean();
-    options.detect_ends = input.boolean();
-    options.halt_on_ends = input.boolean();
-    options.phase_progress = input.boolean();
-    options.worker_count = checkpoint_positive_int(input, "thread count");
-    const auto encoded_halt = input.u64();
-    if(encoded_halt > static_cast<std::uint64_t>(std::numeric_limits<int>::max()) + 1U) {
-      throw std::runtime_error("invalid halt in checkpoint");
-    }
-    options.halt_height = encoded_halt == 0 ? -1 : static_cast<int>(encoded_halt - 1U);
-    const auto partial_mode = input.u8();
-    if(partial_mode > static_cast<std::uint8_t>(PartialMode::Every)) {
-      throw std::runtime_error("invalid partial mode in checkpoint");
-    }
-    options.partial_mode = static_cast<PartialMode>(partial_mode);
-    options.partial_every = checkpoint_positive_int(input, "partial interval");
-    options.partial_output = input.string();
-    options.stats_output = input.string();
-    options.verbose = input.boolean();
-    options.phase_timings = input.boolean();
-    const auto save_mode = input.u8();
-    if(save_mode > static_cast<std::uint8_t>(SaveMode::Every)) {
-      throw std::runtime_error("invalid save mode in checkpoint");
-    }
-    options.save_mode = static_cast<SaveMode>(save_mode);
-    options.save_every = checkpoint_positive_int(input, "save interval");
-    options.savefile = input.string();
-    if(options.rule.empty() || options.geometry.empty() || options.start.empty() || options.savefile.empty()) {
-      throw std::runtime_error("checkpoint configuration has an empty required value");
-    }
-    return options;
-  }
-
-  template <class T> void merge_immutable(const Options& command_line, const Options& saved, std::string_view name, T Options::*member) {
-    if(command_line.explicitly_set.contains(std::string(name)) && command_line.*member != saved.*member) {
-      throw std::runtime_error("cannot alter checkpoint search-tree option " + std::string(name));
-    }
-    options_.*member = saved.*member;
-  }
-
-  template <class T> void merge_mutable(const Options& command_line, const Options& saved, std::string_view name, T Options::*member) {
-    if(!command_line.explicitly_set.contains(std::string(name))) {
-      options_.*member = saved.*member;
-    }
-  }
-
-  void merge_checkpoint_config(const Options& saved) {
-    const auto command_line = options_;
-    merge_immutable(command_line, saved, "rule", &Options::rule);
-    merge_immutable(command_line, saved, "geometry", &Options::geometry);
-    merge_immutable(command_line, saved, "start", &Options::start);
-    merge_immutable(command_line, saved, "left_edge", &Options::left_edge);
-    merge_immutable(command_line, saved, "right_edge", &Options::right_edge);
-    merge_immutable(command_line, saved, "bcaf", &Options::bcaf);
-
-    merge_mutable(command_line, saved, "detect_ends", &Options::detect_ends);
-    merge_mutable(command_line, saved, "halt_on_ends", &Options::halt_on_ends);
-    merge_mutable(command_line, saved, "phase_progress", &Options::phase_progress);
-    merge_mutable(command_line, saved, "threads", &Options::worker_count);
-    merge_mutable(command_line, saved, "halt_height", &Options::halt_height);
-    if(!command_line.explicitly_set.contains("partials")) {
-      options_.partial_mode = saved.partial_mode;
-      options_.partial_every = saved.partial_every;
-    }
-    merge_mutable(command_line, saved, "partial_output", &Options::partial_output);
-    merge_mutable(command_line, saved, "stats_output", &Options::stats_output);
-    merge_mutable(command_line, saved, "verbose", &Options::verbose);
-    merge_mutable(command_line, saved, "phase_timings", &Options::phase_timings);
-    if(!command_line.explicitly_set.contains("save")) {
-      options_.save_mode = saved.save_mode;
-      options_.save_every = saved.save_every;
-    }
-    merge_mutable(command_line, saved, "savefile", &Options::savefile);
-  }
-
-  static std::size_t checkpoint_size(std::uint64_t value, std::string_view field) {
-    if(value > std::numeric_limits<std::size_t>::max()) {
-      throw std::runtime_error("checkpoint " + std::string(field) + " does not fit this platform");
-    }
-    return static_cast<std::size_t>(value);
-  }
-
-  void load_checkpoint(const std::string& path) {
-    std::ifstream input(path, std::ios::binary | std::ios::ate);
-    if(!input) {
-      throw std::runtime_error("cannot open checkpoint: " + path);
-    }
-    const auto end = input.tellg();
-    if(end < 0) {
-      throw std::runtime_error("cannot determine checkpoint size: " + path);
-    }
-    input.seekg(0);
-    CheckpointReader reader(input, static_cast<std::uint64_t>(end));
-    std::array<std::uint8_t, checkpoint_magic_.size()> magic{};
-    reader.bytes(magic.data(), magic.size());
-    const auto checkpoint_version = reader.u32();
-    if(magic != checkpoint_magic_ || checkpoint_version == 0 || checkpoint_version > checkpoint_version_) {
-      throw std::runtime_error("unsupported checkpoint format: " + path);
-    }
-
-    merge_checkpoint_config(read_config(reader));
-    exhausted_ = reader.boolean();
-    completion_at_current_row_ = reader.boolean();
-    width_ = checkpoint_size(reader.u64(), "width");
-    height_ = checkpoint_size(reader.u64(), "height");
-    const auto slice_count = checkpoint_size(reader.u64(), "slice count");
-    if(checkpoint_version >= 3U) {
-      implicit_relations_ = reader.boolean();
-      bcaf_clause_begin_depth_ = checkpoint_size(reader.u64(), "first BCAF clause depth");
-    } else {
-      // A projected dense gate cannot in general be factored after the fact.
-      // Preserve v1/v2 searches exactly on the legacy engine.
-      implicit_relations_ = false;
-      bcaf_clause_begin_depth_ = 0;
-    }
-    if(width_ < 3 || (!exhausted_ && slice_count != width_ - 1U) || (exhausted_ && slice_count != 0)) {
-      throw std::runtime_error("checkpoint slice count does not match its width/state");
-    }
-    slices_.clear();
-    slices_.reserve(slice_count);
-    for(std::size_t index = 0; index < slice_count; ++index) {
-      const auto depth = checkpoint_size(reader.u64(), "tree depth");
-      const auto nodes = reader.u64();
-      auto levels = reader.vector_u64();
-      auto words = reader.vector_u64();
-      std::vector<std::uint64_t> bcaf_prefix_words;
-      std::vector<std::uint64_t> bcaf_suffix_words;
-      std::vector<std::uint8_t> bcaf_child_clauses;
-      if(checkpoint_version == 3U) {
-        bcaf_prefix_words = reader.vector_u64();
-        bcaf_suffix_words = reader.vector_u64();
-      } else if(checkpoint_version >= 4U) {
-        bcaf_child_clauses = reader.vector_u8();
-      }
-      auto slice = SuccinctSliceTree::from_checkpoint(std::move(words), std::move(levels), nodes, depth);
-      if(checkpoint_version == 3U)
-        slice.restore_bcaf_clauses_v3(bcaf_clause_begin_depth_, std::move(bcaf_prefix_words), std::move(bcaf_suffix_words));
-      else if(checkpoint_version >= 4U)
-        slice.restore_bcaf_clauses(bcaf_clause_begin_depth_, std::move(bcaf_child_clauses));
-      slices_.push_back(std::move(slice));
-    }
-
-    pair_gates_ready_ = reader.boolean();
-    pair_gate_depth_ = checkpoint_size(reader.u64(), "pair-gate depth");
-    const auto gate_count = checkpoint_size(reader.u64(), "pair-gate count");
-    const auto expected_gates = pair_gates_ready_ && !slices_.empty() ? slices_.size() - 1U : 0U;
-    if(gate_count != expected_gates || (!exhausted_ && !pair_gates_ready_)) {
-      throw std::runtime_error("checkpoint pair gates do not match its slices");
-    }
-    pair_gates_.clear();
-    pair_gates_.reserve(gate_count);
-    for(std::size_t index = 0; index < gate_count; ++index) {
-      PairGate gate;
-      gate.bit_count = reader.u64();
-      const auto stored_bits = reader.u64();
-      auto words = reader.vector_u64();
-      if(stored_bits != 0 && stored_bits != gate.bit_count) {
-        throw std::runtime_error("checkpoint pair gate has inconsistent length");
-      }
-      gate.bits = PackedTags::from_checkpoint(stored_bits, std::move(words));
-      if(checkpoint_version >= 2U) {
-        const auto index_depth = checkpoint_size(reader.u64(), "pair-gate index depth");
-        if(index_depth > std::numeric_limits<std::uint32_t>::max())
-          throw std::runtime_error("checkpoint pair-gate index depth is too large");
-        gate.index_depth = static_cast<std::uint32_t>(index_depth);
-        gate.index_words_per_path = static_cast<std::uint32_t>((3U * static_cast<std::size_t>(gate.index_depth) + 63U) / 64U);
-        gate.index_starts = reader.vector_u64();
-        gate.index_paths = reader.vector_u64();
-        const bool has_index = !gate.index_starts.empty() || !gate.index_paths.empty();
-        if(has_index && !gate.index_ready(gate.index_depth))
-          throw std::runtime_error("checkpoint pair gate has an invalid sparse index");
-      }
-      pair_gates_.push_back(std::move(gate));
-    }
-    reader.finish();
-  }
-
-  void validate_loaded_state() const {
-    if(height_ < geometry_.short_window()) {
-      throw std::runtime_error("checkpoint height is shorter than its geometry lookback");
-    }
-    if(exhausted_) {
-      if(completion_at_current_row_ || !slices_.empty() || pair_gates_ready_ || !pair_gates_.empty() || bcaf_clause_begin_depth_ != 0) {
-        throw std::runtime_error("exhausted checkpoint contains live search state");
-      }
-      return;
-    }
-    if(slices_.size() != width_ - 1U || pair_gates_.size() + 1U != slices_.size() || pair_gate_depth_ != height_) {
-      throw std::runtime_error("checkpoint search-state dimensions are inconsistent");
-    }
-    for(const auto& slice : slices_) {
-      if(slice.depth() != height_) {
-        throw std::runtime_error("checkpoint slice depth does not match its row");
-      }
-    }
-    if(!implicit_relations_) {
-      if(bcaf_clause_begin_depth_ != 0 || std::ranges::any_of(slices_, [](const SuccinctSliceTree& slice) { return slice.bcaf_clauses_present(); }))
-        throw std::runtime_error("legacy checkpoint contains implicit BCAF payloads");
-      return;
-    }
-    if(std::ranges::any_of(pair_gates_, [](const PairGate& gate) { return gate.bits.size() != 0; }))
-      throw std::runtime_error("implicit checkpoint contains a dense pair-gate payload");
-    if(bcaf_clause_begin_depth_ == 0) {
-      if(std::ranges::any_of(slices_, [](const SuccinctSliceTree& slice) { return slice.bcaf_clauses_present(); }))
-        throw std::runtime_error("implicit checkpoint has BCAF payloads without a first clause depth");
-    } else {
-      if(!options_.bcaf || bcaf_clause_begin_depth_ < geometry_.long_window() || bcaf_clause_begin_depth_ > height_ ||
-         std::ranges::any_of(slices_, [&](const SuccinctSliceTree& slice) {
-           return !slice.bcaf_clauses_present() || slice.bcaf_first_child_depth() != bcaf_clause_begin_depth_;
-         }))
-        throw std::runtime_error("implicit checkpoint has inconsistent BCAF clause payloads");
-    }
-  }
-
-  [[nodiscard]] std::filesystem::path checkpoint_path() const {
-    const std::filesystem::path prefix(options_.savefile);
-    std::error_code error;
-    const bool directory = std::filesystem::is_directory(prefix, error) || options_.savefile.ends_with('/') || options_.savefile.ends_with('\\');
-    if(directory) {
-      return prefix / ("save_" + std::to_string(height_));
-    }
-    return std::filesystem::path(options_.savefile + "_" + std::to_string(height_));
-  }
-
-  void save_checkpoint() {
-    if(options_.save_mode == SaveMode::None || last_checkpoint_height_ == height_) {
-      return;
-    }
-    const auto path = checkpoint_path();
-    auto temporary = path;
-    temporary += ".tmp";
-    {
-      std::ofstream output(temporary, std::ios::binary | std::ios::out | std::ios::trunc);
-      if(!output) {
-        throw std::runtime_error("cannot open checkpoint for writing: " + temporary.string());
-      }
-      CheckpointWriter writer(output);
-      writer.bytes(checkpoint_magic_.data(), checkpoint_magic_.size());
-      writer.u32(checkpoint_version_);
-      write_config(writer, options_);
-      writer.boolean(exhausted_);
-      writer.boolean(completion_at_current_row_);
-      writer.u64(width_);
-      writer.u64(height_);
-      writer.u64(slices_.size());
-      writer.boolean(implicit_relations_);
-      writer.u64(bcaf_clause_begin_depth_);
-      for(const auto& slice : slices_) {
-        writer.u64(slice.depth());
-        writer.u64(slice.node_count());
-        writer.vector_u64(slice.checkpoint_levels());
-        writer.vector_u64(slice.checkpoint_words());
-        writer.vector_u8(slice.bcaf_checkpoint_bytes());
-      }
-      writer.boolean(pair_gates_ready_);
-      writer.u64(pair_gate_depth_);
-      writer.u64(pair_gates_.size());
-      for(const auto& gate : pair_gates_) {
-        writer.u64(gate.bit_count);
-        writer.u64(gate.bits.size());
-        writer.vector_u64(gate.bits.checkpoint_words());
-        writer.u64(gate.index_depth);
-        writer.vector_u64(gate.index_starts);
-        writer.vector_u64(gate.index_paths);
-      }
-      writer.finish();
-      output.close();
-      if(!output) {
-        throw std::runtime_error("cannot finish checkpoint: " + temporary.string());
-      }
-    }
-    std::error_code error;
-    std::filesystem::rename(temporary, path, error);
-    if(error) {
-      throw std::runtime_error("cannot replace checkpoint " + path.string() + ": " + error.message());
-    }
-    last_checkpoint_height_ = height_;
-    std::cout << "checkpoint saved: " << path.string() << '\n';
-  }
-
-  int finish(int status) {
-    if(options_.save_mode != SaveMode::None) {
-      save_checkpoint();
-    }
-    return status;
-  }
-
-  int finish_interrupted() {
-    if(options_.save_mode == SaveMode::None) {
-      std::cout << "interrupt requested after completed row " << height_ << "; exiting without checkpoint\n";
-    } else {
-      std::cout << "interrupt requested; saving completed row " << height_ << " and exiting\n";
-    }
-    return finish(130);
-  }
+  template <class T> void merge_immutable(const Options& command_line, const Options& saved, std::string_view name, T Options::*member);
+  template <class T> void merge_mutable(const Options& command_line, const Options& saved, std::string_view name, T Options::*member);
+  void merge_checkpoint_config(const Options& saved);
+  static std::size_t checkpoint_size(std::uint64_t value, std::string_view field);
+  void load_checkpoint(const std::string& path);
+  void validate_loaded_state() const;
+  [[nodiscard]] std::filesystem::path checkpoint_path() const;
+  void save_checkpoint();
+  int finish(int status);
+  int finish_interrupted();
 
   static StartGrid magic_background(const std::string& source, std::size_t height) {
     std::smatch match;
@@ -1667,7 +1109,7 @@ private:
   }
 
   [[nodiscard]] bool historical_pair_clause_active(std::size_t child_depth) const noexcept {
-    return implicit_relations_ && bcaf_clause_begin_depth_ != 0 && child_depth >= bcaf_clause_begin_depth_ && child_depth <= pair_gate_depth_;
+    return bcaf_clause_begin_depth_ != 0 && child_depth >= bcaf_clause_begin_depth_ && child_depth <= pair_gate_depth_;
   }
 
   // The persistent byte is already scattered to raw child labels.
@@ -1885,13 +1327,13 @@ private:
     return static_cast<std::uint8_t>(((triple & 0b001U) << 2U) | (triple & 0b010U) | ((triple & 0b100U) >> 2U));
   }
 
-  template <bool VisitRejected, bool TrackSummary, bool TrackCompletion, bool ImplicitGate, bool CurrentLeaves, class BatchCallback>
+  template <bool VisitRejected, bool TrackSummary, bool TrackCompletion, bool CurrentLeaves, class BatchCallback>
   void walk_indexed_gate_range(std::size_t position,
                                std::size_t checkpoint,
                                std::size_t worker,
                                std::size_t long_start,
-                               std::size_t short_start,
-                               BatchCallback& batch_callback) {
+                                std::size_t short_start,
+                                BatchCallback& batch_callback) {
     static_assert(!TrackSummary || !TrackCompletion);
     static_assert(!CurrentLeaves || (!VisitRejected && TrackSummary && !TrackCompletion));
     const auto& left = slices_[position];
@@ -2028,17 +1470,8 @@ private:
       else
         return right.level_begin(parent_depth + 1U) - 4U * right.level_begin(parent_depth);
     }();
-    auto gate_word_index = static_cast<std::uint64_t>(-1);
-    std::uint64_t gate_word = ~std::uint64_t{0};
     while(cursor < end) {
-      if constexpr(!ImplicitGate) {
-        if((cursor >> 6U) != gate_word_index) {
-          gate_word_index = cursor >> 6U;
-          gate_word = gate.bits.word(static_cast<std::size_t>(gate_word_index));
-        }
-      }
-      const bool ancestry_allowed =
-          ImplicitGate || ((gate_word >> (cursor & 63U)) & 1U) != 0;
+      constexpr bool ancestry_allowed = true;
       ++cursor;
       if constexpr(CurrentLeaves) {
         if(ancestry_allowed)
@@ -2084,10 +1517,10 @@ private:
     BatchCallback* callback = nullptr;
   };
 
-  template <bool VisitRejected, bool TrackSummary, bool TrackCompletion, bool ImplicitGate, bool CurrentLeaves, class BatchCallback>
+  template <bool VisitRejected, bool TrackSummary, bool TrackCompletion, bool CurrentLeaves, class BatchCallback>
   static void execute_indexed_gate_range(void* opaque, std::size_t checkpoint, std::size_t worker) {
     auto& context = *static_cast<IndexedGateWalkContext<VisitRejected, TrackSummary, TrackCompletion, BatchCallback>*>(opaque);
-    context.solver->template walk_indexed_gate_range<VisitRejected, TrackSummary, TrackCompletion, ImplicitGate, CurrentLeaves>(
+    context.solver->template walk_indexed_gate_range<VisitRejected, TrackSummary, TrackCompletion, CurrentLeaves>(
         context.position, checkpoint, worker, context.long_start, context.short_start, *context.callback);
   }
 
@@ -2145,16 +1578,12 @@ private:
     }
   }
 
-  template <bool VisitRejected = true, bool TrackSummary = false, bool ImplicitGate = false, class BatchCallback>
+  template <bool VisitRejected = true, bool TrackSummary = false, class BatchCallback>
   void walk_candidate_pair_batches_parallel(std::size_t position, BatchCallback&& batch_callback) {
     const auto& gate = pair_gates_.at(position);
     if(!expanded_uniform_tail_ || !gate.index_ready(pair_gate_depth_) || pair_gate_depth_ + 1U != slices_[position].depth() ||
        slices_[position].depth() != slices_[position + 1U].depth()) {
       throw std::logic_error("parallel pair walk requires an indexed freshly expanded parent gate");
-    }
-    if constexpr(ImplicitGate) {
-      if(gate.bits.size() != 0)
-        throw std::logic_error("implicit parallel pair walk has a dense gate payload");
     }
     const auto workers = static_cast<std::size_t>(options_.worker_count);
     if(parallel_gate_scratch_.size() != workers) {
@@ -2175,10 +1604,10 @@ private:
     auto callback = std::forward<BatchCallback>(batch_callback);
     IndexedGateWalkContext<VisitRejected, TrackSummary, false, decltype(callback)> context{this, position, 0, 0, &callback};
     execute_indexed_tasks(gate.index_starts.size(), options_.worker_count, &context,
-                          &execute_indexed_gate_range<VisitRejected, TrackSummary, false, ImplicitGate, false, decltype(callback)>);
+                          &execute_indexed_gate_range<VisitRejected, TrackSummary, false, false, decltype(callback)>);
   }
 
-  template <bool VisitRejected = true, bool ImplicitGate = false, class BatchCallback>
+  template <bool VisitRejected = true, class BatchCallback>
   void walk_candidate_pair_batches_parallel_completion(std::size_t position,
                                                        std::size_t long_start,
                                                        std::size_t short_start,
@@ -2187,10 +1616,6 @@ private:
     if(!expanded_uniform_tail_ || !gate.index_ready(pair_gate_depth_) || pair_gate_depth_ + 1U != slices_[position].depth() ||
        slices_[position].depth() != slices_[position + 1U].depth()) {
       throw std::logic_error("parallel completion walk requires an indexed freshly expanded parent gate");
-    }
-    if constexpr(ImplicitGate) {
-      if(gate.bits.size() != 0)
-        throw std::logic_error("implicit parallel completion walk has a dense gate payload");
     }
     const auto workers = static_cast<std::size_t>(options_.worker_count);
     if(parallel_gate_scratch_.size() != workers)
@@ -2205,7 +1630,7 @@ private:
     auto callback = std::forward<BatchCallback>(batch_callback);
     IndexedGateWalkContext<VisitRejected, false, true, decltype(callback)> context{this, position, long_start, short_start, &callback};
     execute_indexed_tasks(gate.index_starts.size(), options_.worker_count, &context,
-                          &execute_indexed_gate_range<VisitRejected, false, true, ImplicitGate, false, decltype(callback)>);
+                          &execute_indexed_gate_range<VisitRejected, false, true, false, decltype(callback)>);
   }
 
   template <class LeafCallback> void walk_current_edges_parallel(std::size_t position, LeafCallback&& leaf_callback) {
@@ -2225,19 +1650,9 @@ private:
         scratch.frames.resize(required_depth);
     }
     auto callback = std::forward<LeafCallback>(leaf_callback);
-    auto run = [&]<bool ImplicitGate>() {
-      if constexpr(ImplicitGate) {
-        if(gate.bits.size() != 0)
-          throw std::logic_error("implicit current-edge walk has a dense gate payload");
-      }
-      IndexedGateWalkContext<false, true, false, decltype(callback)> context{this, position, 0, 0, &callback};
-      execute_indexed_tasks(gate.index_starts.size(), options_.worker_count, &context,
-                            &execute_indexed_gate_range<false, true, false, ImplicitGate, true, decltype(callback)>);
-    };
-    if(implicit_relations_)
-      run.template operator()<true>();
-    else
-      run.template operator()<false>();
+    IndexedGateWalkContext<false, true, false, decltype(callback)> context{this, position, 0, 0, &callback};
+    execute_indexed_tasks(gate.index_starts.size(), options_.worker_count, &context,
+                          &execute_indexed_gate_range<false, true, false, true, decltype(callback)>);
   }
 
   [[nodiscard]] bool can_walk_candidate_pair_batches_parallel(std::size_t position) const noexcept {
@@ -2471,12 +1886,6 @@ private:
     }
   }
 
-  bool prune_supported() {
-    if(implicit_relations_)
-      return prune_supported_implicit();
-    return prune_supported_legacy();
-  }
-
   // In the native representation, support pruning is an induced subgraph
   // operation.  Ordinary support therefore needs no binary payload after the
   // endpoint tries are reified.  Once BCAF is active, its only additional
@@ -2484,7 +1893,7 @@ private:
   // stored on the corresponding nodes of the two slice tries.  The sparse
   // PairGate that remains is only an ordered restart index over accepted
   // parent paths.
-  bool prune_supported_implicit() {
+  bool prune_supported() {
     if(slices_.empty())
       return false;
     cached_partial_.reset();
@@ -2567,7 +1976,7 @@ private:
           }
         };
         if(can_walk_candidate_pair_batches_parallel(relation)) {
-          walk_candidate_pair_batches_parallel<false, false, true>(
+          walk_candidate_pair_batches_parallel<false, false>(
               relation, [&](Node left_first, Node right_first, std::uint8_t active, bool, const PairPathSummary&, std::size_t, const auto&, std::size_t,
                             std::size_t) { visit.template operator()<true>(left_first, right_first, active); });
         } else {
@@ -2738,7 +2147,7 @@ private:
         std::vector<Node> partial_candidates(cache_partial ? segments.size() : 0, absent_partial);
         auto run_parallel = [&]<bool CapturePartial>() {
           if(cache_completion) {
-            walk_candidate_pair_batches_parallel_completion<false, true>(
+            walk_candidate_pair_batches_parallel_completion<false>(
                 i, long_start, short_start,
                 [&](Node left_first, Node right_first, std::uint8_t active, bool, CompletionPathState path_state, std::size_t depth,
                        const auto& history, std::size_t checkpoint, std::size_t) {
@@ -2748,7 +2157,7 @@ private:
                   append_final_edges(segments[checkpoint], final_edges, history.data(), depth);
                 });
           } else {
-            walk_candidate_pair_batches_parallel<false, false, true>(
+            walk_candidate_pair_batches_parallel<false, false>(
                 i, [&](Node left_first, Node right_first, std::uint8_t active, bool, const PairPathSummary&, std::size_t depth, const auto& history,
                        std::size_t checkpoint, std::size_t) {
                   const auto final_edges = visit_batch.template operator()<true>(left_first, right_first, active, nullptr, depth);
@@ -2984,727 +2393,6 @@ private:
     return true;
   }
 
-  bool prune_supported_legacy() {
-    if(slices_.empty())
-      return false;
-    cached_partial_.reset();
-    cached_completion_.reset();
-    cached_completion_height_ = std::numeric_limits<std::size_t>::max();
-    const auto adjacency_count = slices_.size() - 1U;
-    std::vector<TagPair> normal;
-    normal.reserve(slices_.size());
-    for(const auto& slice : slices_)
-      normal.emplace_back(slice.node_count());
-    account_tags(normal);
-
-    const auto bcaf_window = geometry_.long_window();
-    const bool bcaf_active = options_.bcaf && height_ >= bcaf_window;
-    std::vector<LeafTagPair> witness;
-    if(bcaf_active) {
-      witness.reserve(slices_.size());
-      for(const auto& slice : slices_)
-        witness.emplace_back(slice.leaf_begin(), slice.leaf_count());
-      peak_tag_bytes_ = std::max(peak_tag_bytes_, tag_bytes(normal) + tag_bytes(witness));
-    }
-
-    // The two planes remain pure boundary reachability.  Pair-gate bits
-    // ensure that a compatibility removed at an earlier height cannot be
-    // recreated merely because both endpoint slices still exist.
-    mark_boundary(slices_.front(), options_.left_edge, true, normal.front()[0]);
-    mark_boundary(slices_.back(), options_.right_edge, false, normal.back()[1]);
-    if(bcaf_active) {
-      // Right reachability is sufficient to build the suffix witness:
-      // once a left-to-right path reaches such a node, its witnessed
-      // suffix completes a full path.  Symmetrically, left reachability
-      // is sufficient for the prefix witness.  Computing the two in
-      // dependency order lets the normal left-to-right sweep also be the
-      // BCAF prefix and cleanup sweep.
-      auto seed_suffix = [&](std::size_t position) {
-        walk_leaves(slices_[position], [&](Node leaf, std::size_t first_nonzero, std::size_t) {
-          if(normal[position][1].get(leaf) && first_nonzero < bcaf_window) {
-            witness[position][1].set(leaf);
-          }
-        });
-      };
-
-      phase("  relation sweep: right to left + bcaf suffix");
-      seed_suffix(slices_.size() - 1U);
-      for(std::size_t i = adjacency_count; i > 0; --i) {
-        normal[i - 1U][1].clear();
-        if(expanded_uniform_tail_) {
-          auto visit = [&]<bool AtomicWrites>(Node left_first, Node right_first, std::uint8_t active) {
-            const auto reaches_right = static_cast<std::uint8_t>(active & expand_right_edges(get_leaf_four(normal[i][1], right_first)));
-            const auto normal_output = project_left_edges(reaches_right);
-            const auto witnessed = static_cast<std::uint8_t>(reaches_right & expand_right_edges(get_leaf_four(witness[i][1], right_first)));
-            const auto witness_output = project_left_edges(witnessed);
-            if constexpr(AtomicWrites) {
-              if(normal_output != 0)
-                atomic_set_leaf_four(normal[i - 1U][1], left_first, normal_output);
-              if(witness_output != 0)
-                atomic_set_leaf_four(witness[i - 1U][1], left_first, witness_output);
-            } else {
-              set_leaf_four(normal[i - 1U][1], left_first, normal_output);
-              set_leaf_four(witness[i - 1U][1], left_first, witness_output);
-            }
-          };
-          if(can_walk_candidate_pair_batches_parallel(i - 1U)) {
-            walk_candidate_pair_batches_parallel<false>(
-                i - 1U, [&](Node left_first, Node right_first, std::uint8_t active, bool, const PairPathSummary&, std::size_t, const auto&, std::size_t,
-                            std::size_t) { visit.template operator()<true>(left_first, right_first, active); });
-          } else {
-            walk_candidate_pair_batches<false>(
-                i - 1U, [&](Node left_first, Node right_first, std::uint8_t active, bool, const PairPathSummary&, std::size_t) {
-                  visit.template operator()<false>(left_first, right_first, active);
-                });
-          }
-        } else {
-          walk_candidate_pairs<false>(i - 1U, [&](Node left_leaf, Node right_leaf, const auto&, bool ancestry_allowed) {
-            const bool reaches_right = ancestry_allowed && normal[i][1].get(right_leaf);
-            if(reaches_right) {
-              normal[i - 1U][1].set(left_leaf);
-              if(witness[i][1].get(right_leaf)) {
-                witness[i - 1U][1].set(left_leaf);
-              }
-            }
-          });
-        }
-        seed_suffix(i - 1U);
-      }
-
-      peak_tag_bytes_ = std::max(peak_tag_bytes_, tag_bytes(normal) + tag_bytes(witness));
-
-      auto seed_prefix = [&](std::size_t position) {
-        walk_leaves(slices_[position], [&](Node leaf, std::size_t first_nonzero, std::size_t) {
-          if(normal[position][0].get(leaf) && first_nonzero < bcaf_window) {
-            witness[position][0].set(leaf);
-          }
-        });
-      };
-
-      seed_prefix(0);
-      phase("  relation sweep: left to right + bcaf prefix");
-      for(std::size_t i = 0; i < adjacency_count; ++i) {
-        normal[i + 1U][0].clear();
-        if(expanded_uniform_tail_) {
-          auto visit = [&]<bool AtomicWrites>(Node left_first, Node right_first, std::uint8_t active) {
-            const auto reaches_left = static_cast<std::uint8_t>(active & expand_left_edges(get_leaf_four(normal[i][0], left_first)));
-            const auto normal_output = project_right_edges(reaches_left);
-            const auto normal_edges =
-                static_cast<std::uint8_t>(reaches_left & expand_right_edges(get_leaf_four(normal[i + 1U][1], right_first)));
-            const auto interesting_prefix = expand_left_edges(get_leaf_four(witness[i][0], left_first));
-            const auto witness_output = project_right_edges(static_cast<std::uint8_t>(normal_edges & interesting_prefix));
-            if constexpr(AtomicWrites) {
-              if(normal_output != 0)
-                atomic_set_leaf_four(normal[i + 1U][0], right_first, normal_output);
-              if(witness_output != 0)
-                atomic_set_leaf_four(witness[i + 1U][0], right_first, witness_output);
-            } else {
-              set_leaf_four(normal[i + 1U][0], right_first, normal_output);
-              set_leaf_four(witness[i + 1U][0], right_first, witness_output);
-            }
-          };
-          if(can_walk_candidate_pair_batches_parallel(i)) {
-            walk_candidate_pair_batches_parallel<false>(
-                i, [&](Node left_first, Node right_first, std::uint8_t active, bool, const PairPathSummary&, std::size_t, const auto&, std::size_t,
-                       std::size_t) { visit.template operator()<true>(left_first, right_first, active); });
-          } else {
-            walk_candidate_pair_batches<false>(
-                i, [&](Node left_first, Node right_first, std::uint8_t active, bool, const PairPathSummary&, std::size_t) {
-                  visit.template operator()<false>(left_first, right_first, active);
-                });
-          }
-        } else {
-          walk_candidate_pairs<false>(i, [&](Node left_leaf, Node right_leaf, const auto&, bool ancestry_allowed) {
-            const bool reaches_left = ancestry_allowed && normal[i][0].get(left_leaf);
-            if(reaches_left) {
-              normal[i + 1U][0].set(right_leaf);
-            }
-            const bool normal_edge = reaches_left && normal[i + 1U][1].get(right_leaf);
-            const bool interesting_prefix = witness[i][0].get(left_leaf);
-            if(normal_edge && interesting_prefix) {
-              witness[i + 1U][0].set(right_leaf);
-            }
-          });
-        }
-        seed_prefix(i + 1U);
-      }
-    } else {
-      phase("  relation sweep: left to right");
-      for(std::size_t i = 0; i < adjacency_count; ++i) {
-        normal[i + 1U][0].clear();
-        if(expanded_uniform_tail_) {
-          auto visit = [&]<bool AtomicWrites>(Node left_first, Node right_first, std::uint8_t active) {
-            const auto edges = static_cast<std::uint8_t>(active & expand_left_edges(get_leaf_four(normal[i][0], left_first)));
-            const auto output = project_right_edges(edges);
-            if constexpr(AtomicWrites) {
-              if(output != 0)
-                atomic_set_leaf_four(normal[i + 1U][0], right_first, output);
-            } else {
-              set_leaf_four(normal[i + 1U][0], right_first, output);
-            }
-          };
-          if(can_walk_candidate_pair_batches_parallel(i)) {
-            walk_candidate_pair_batches_parallel<false>(
-                i, [&](Node left_first, Node right_first, std::uint8_t active, bool, const PairPathSummary&, std::size_t, const auto&, std::size_t,
-                       std::size_t) { visit.template operator()<true>(left_first, right_first, active); });
-          } else {
-            walk_candidate_pair_batches<false>(
-                i, [&](Node left_first, Node right_first, std::uint8_t active, bool, const PairPathSummary&, std::size_t) {
-                  visit.template operator()<false>(left_first, right_first, active);
-                });
-          }
-        } else {
-          walk_candidate_pairs<false>(i, [&](Node left_leaf, Node right_leaf, const auto&, bool ancestry_allowed) {
-            if(ancestry_allowed && normal[i][0].get(left_leaf)) {
-              normal[i + 1U][0].set(right_leaf);
-            }
-          });
-        }
-      }
-
-      phase("  relation sweep: right to left");
-      for(std::size_t i = adjacency_count; i > 0; --i) {
-        normal[i - 1U][1].clear();
-        if(expanded_uniform_tail_) {
-          auto visit = [&]<bool AtomicWrites>(Node left_first, Node right_first, std::uint8_t active) {
-            const auto edges = static_cast<std::uint8_t>(active & expand_right_edges(get_leaf_four(normal[i][1], right_first)));
-            const auto output = project_left_edges(edges);
-            if constexpr(AtomicWrites) {
-              if(output != 0)
-                atomic_set_leaf_four(normal[i - 1U][1], left_first, output);
-            } else {
-              set_leaf_four(normal[i - 1U][1], left_first, output);
-            }
-          };
-          if(can_walk_candidate_pair_batches_parallel(i - 1U)) {
-            walk_candidate_pair_batches_parallel<false>(
-                i - 1U, [&](Node left_first, Node right_first, std::uint8_t active, bool, const PairPathSummary&, std::size_t, const auto&, std::size_t,
-                            std::size_t) { visit.template operator()<true>(left_first, right_first, active); });
-          } else {
-            walk_candidate_pair_batches<false>(
-                i - 1U, [&](Node left_first, Node right_first, std::uint8_t active, bool, const PairPathSummary&, std::size_t) {
-                  visit.template operator()<false>(left_first, right_first, active);
-                });
-          }
-        } else {
-          walk_candidate_pairs<false>(i - 1U, [&](Node left_leaf, Node right_leaf, const auto&, bool ancestry_allowed) {
-            if(ancestry_allowed && normal[i][1].get(right_leaf)) {
-              normal[i - 1U][1].set(left_leaf);
-            }
-          });
-        }
-      }
-    }
-
-    auto normally_live = [&](std::size_t position, Node leaf) { return normal[position][0].get(leaf) && normal[position][1].get(leaf); };
-
-    if(normal.front()[0].count(slices_.front().leaf_begin(), slices_.front().leaf_end()) == 0 ||
-       normal.front()[1].count(slices_.front().leaf_begin(), slices_.front().leaf_end()) == 0) {
-      return false;
-    }
-
-    std::vector<PairGate> next_gates(adjacency_count);
-    bool slices_reified = false;
-
-    if(bcaf_active) {
-      phase("  bcaf relation gate");
-
-      const bool cache_partial =
-          (options_.partial_mode == PartialMode::Every && height_ % static_cast<std::size_t>(options_.partial_every) == 0) ||
-          (options_.partial_mode != PartialMode::None && options_.halt_height >= 0 &&
-           geometry_.w_position(height_) >= static_cast<std::size_t>(options_.halt_height));
-      const bool cache_completion = options_.detect_ends && geometry_.complete_tile(height_);
-      std::vector<PackedTags> partial_suffix;
-      std::vector<LeafTagPair> completion_suffix;
-      if(cache_partial) {
-        partial_suffix.reserve(slices_.size());
-        for(const auto& slice : slices_) {
-          partial_suffix.emplace_back(slice.node_count());
-        }
-      }
-      if(cache_completion) {
-        completion_suffix.reserve(slices_.size());
-        for(const auto& slice : slices_) {
-          completion_suffix.emplace_back(slice.leaf_begin(), slice.leaf_count());
-        }
-      }
-      std::size_t reconstruction_tag_bytes = 0;
-      for(const auto& tags : partial_suffix) {
-        reconstruction_tag_bytes += tags.allocated_bytes();
-      }
-      peak_tag_bytes_ =
-          std::max(peak_tag_bytes_, tag_bytes(normal) + tag_bytes(witness) + tag_bytes(completion_suffix) + reconstruction_tag_bytes);
-
-      const auto short_window = geometry_.short_window();
-      const auto short_start = height_ - short_window;
-      const auto long_start = height_ - bcaf_window;
-      auto live_four = [&](std::size_t position, Node first) {
-        return static_cast<std::uint8_t>(get_leaf_four(normal[position][0], first) & get_leaf_four(normal[position][1], first) &
-                                         (get_leaf_four(witness[position][0], first) | get_leaf_four(witness[position][1], first)));
-      };
-      auto live_leaf = [&](std::size_t position, Node leaf) {
-        return normal[position][0].get(leaf) && normal[position][1].get(leaf) &&
-               (witness[position][0].get(leaf) || witness[position][1].get(leaf));
-      };
-
-      if(cache_partial || cache_completion) {
-        walk_leaves(slices_.back(), [&](Node leaf, std::size_t first_nonzero, std::size_t last_nonzero) {
-          const bool live = normal.back()[0].get(leaf) && normal.back()[1].get(leaf) &&
-                            (witness.back()[0].get(leaf) || witness.back()[1].get(leaf));
-          if(!live)
-            return;
-          if(cache_partial && first_nonzero < bcaf_window) {
-            partial_suffix.back().set(leaf);
-          }
-          if(cache_completion) {
-            const bool valid = last_nonzero == std::numeric_limits<std::size_t>::max() || last_nonzero < short_start;
-            if(valid)
-              completion_suffix.back()[0].set(leaf);
-            if(valid && last_nonzero != std::numeric_limits<std::size_t>::max() && last_nonzero >= long_start) {
-              completion_suffix.back()[1].set(leaf);
-            }
-          }
-        });
-      }
-      for(std::size_t i = adjacency_count; i > 0; --i) {
-        const auto relation = i - 1U;
-        if(expanded_uniform_tail_) {
-          const bool parallel_emit = can_walk_candidate_pair_batches_parallel(relation);
-          std::vector<PairGate> segments;
-          if(parallel_emit) {
-            segments.resize(pair_gates_[relation].index_starts.size());
-            for(auto& segment : segments)
-              segment.reset_index(height_);
-          }
-          auto visit_batch = [&]<bool AtomicWrites>(Node left_first, Node right_first, std::uint8_t active, bool ancestry_allowed,
-                                                    const PairPathSummary* summary, std::size_t final_depth) {
-            const auto normal_edges = ancestry_allowed
-                                          ? static_cast<std::uint8_t>(active & expand_left_edges(get_leaf_four(normal[i - 1U][0], left_first)) &
-                                                                      expand_right_edges(get_leaf_four(normal[i][1], right_first)))
-                                          : std::uint8_t{0};
-            const auto interesting_edges = static_cast<std::uint8_t>(
-                expand_left_edges(get_leaf_four(witness[i - 1U][0], left_first)) | expand_right_edges(get_leaf_four(witness[i][1], right_first)));
-            const auto eligible = static_cast<std::uint8_t>(normal_edges & interesting_edges);
-            if(summary == nullptr || eligible == 0)
-              return eligible;
-
-            const auto partial_right = cache_partial ? get_leaf_four(partial_suffix[i], right_first) : std::uint8_t{0};
-            const auto completion_valid_right = cache_completion ? get_leaf_four(completion_suffix[i][0], right_first) : std::uint8_t{0};
-            const auto completion_interesting_right = cache_completion ? get_leaf_four(completion_suffix[i][1], right_first) : std::uint8_t{0};
-            std::uint8_t partial_edges = 0;
-            std::uint8_t completion_valid_edges = 0;
-            std::uint8_t completion_interesting_edges = 0;
-            auto remaining = eligible;
-            while(remaining != 0) {
-              const auto position = static_cast<std::uint8_t>(std::countr_zero(static_cast<unsigned>(remaining)));
-              const auto triple = geometry_pair_triple_order[position];
-              auto first = summary->first_left_nonzero;
-              auto last = summary->last_left_nonzero;
-              if((triple & 0b011U) != 0) {
-                if(first == std::numeric_limits<std::size_t>::max())
-                  first = final_depth;
-                last = final_depth;
-              }
-              const auto edge_bit = static_cast<std::uint8_t>(1U << position);
-              const auto right_bit = static_cast<std::uint8_t>(1U << (position & 0b11U));
-              if(cache_partial && ((partial_right & right_bit) != 0 || first < bcaf_window)) {
-                partial_edges = static_cast<std::uint8_t>(partial_edges | edge_bit);
-              }
-              if(cache_completion) {
-                const bool zero_tail = last == std::numeric_limits<std::size_t>::max() || last < short_start;
-                if((completion_valid_right & right_bit) != 0 && zero_tail) {
-                  completion_valid_edges = static_cast<std::uint8_t>(completion_valid_edges | edge_bit);
-                  if((completion_interesting_right & right_bit) != 0 ||
-                     (last != std::numeric_limits<std::size_t>::max() && last >= long_start)) {
-                    completion_interesting_edges = static_cast<std::uint8_t>(completion_interesting_edges | edge_bit);
-                  }
-                }
-              }
-              remaining = static_cast<std::uint8_t>(remaining & (remaining - 1U));
-            }
-            if(cache_partial) {
-              const auto partial_output = project_left_edges(partial_edges);
-              if constexpr(AtomicWrites) {
-                if(partial_output != 0)
-                  atomic_set_leaf_four(partial_suffix[i - 1U], left_first, partial_output);
-              } else {
-                set_leaf_four(partial_suffix[i - 1U], left_first, partial_output);
-              }
-            }
-            if(cache_completion) {
-              const auto valid_output = project_left_edges(completion_valid_edges);
-              const auto interesting_output = project_left_edges(completion_interesting_edges);
-              if constexpr(AtomicWrites) {
-                if(valid_output != 0)
-                  atomic_set_leaf_four(completion_suffix[i - 1U][0], left_first, valid_output);
-                if(interesting_output != 0)
-                  atomic_set_leaf_four(completion_suffix[i - 1U][1], left_first, interesting_output);
-              } else {
-                set_leaf_four(completion_suffix[i - 1U][0], left_first, valid_output);
-                set_leaf_four(completion_suffix[i - 1U][1], left_first, interesting_output);
-              }
-            }
-            return eligible;
-          };
-          auto emit_batch = [&](PairGate& output, Node left_first, Node right_first, std::uint8_t active, std::uint8_t final_edges,
-                                auto&& record_index_path) {
-            const auto keep_edges = static_cast<std::uint8_t>(active & expand_left_edges(live_four(relation, left_first)) &
-                                                              expand_right_edges(live_four(i, right_first)));
-            auto remaining = keep_edges;
-            while(remaining != 0) {
-              const auto position = static_cast<std::uint8_t>(std::countr_zero(static_cast<unsigned>(remaining)));
-              record_index_path(output, position);
-              output.push_back((final_edges & (1U << position)) != 0);
-              remaining = static_cast<std::uint8_t>(remaining & (remaining - 1U));
-            }
-          };
-          if(cache_partial || cache_completion) {
-            if(parallel_emit) {
-              walk_candidate_pair_batches_parallel<true, true>(
-                  relation,
-                  [&](Node left_first, Node right_first, std::uint8_t active, bool ancestry_allowed, const PairPathSummary& summary, std::size_t depth,
-                      const auto& history, std::size_t checkpoint, std::size_t) {
-                    const auto final_edges =
-                        visit_batch.template operator()<true>(left_first, right_first, active, ancestry_allowed, &summary, depth);
-                    emit_batch(segments[checkpoint], left_first, right_first, active, final_edges, [&](PairGate& output, std::uint8_t position) {
-                      if(output.size() % PairGate::index_quantum == 0)
-                        output.add_index_path_with_final(output.size(), history.data(), depth, geometry_pair_triple_order[position]);
-                    });
-                  });
-            } else {
-              walk_candidate_pair_batches<true, true>(
-                  relation, [&](Node left_first, Node right_first, std::uint8_t active, bool ancestry_allowed, const PairPathSummary& summary,
-                                std::size_t depth) {
-                    const auto final_edges =
-                        visit_batch.template operator()<false>(left_first, right_first, active, ancestry_allowed, &summary, depth);
-                    emit_batch(next_gates[relation], left_first, right_first, active, final_edges, [](PairGate&, std::uint8_t) {});
-                  });
-            }
-          } else {
-            if(parallel_emit) {
-              walk_candidate_pair_batches_parallel<true>(
-                  relation,
-                  [&](Node left_first, Node right_first, std::uint8_t active, bool ancestry_allowed, const PairPathSummary&, std::size_t depth,
-                      const auto& history, std::size_t checkpoint, std::size_t) {
-                    const auto final_edges = visit_batch.template operator()<true>(left_first, right_first, active, ancestry_allowed, nullptr, depth);
-                    emit_batch(segments[checkpoint], left_first, right_first, active, final_edges, [&](PairGate& output, std::uint8_t position) {
-                      if(output.size() % PairGate::index_quantum == 0)
-                        output.add_index_path_with_final(output.size(), history.data(), depth, geometry_pair_triple_order[position]);
-                    });
-                  });
-            } else {
-              walk_candidate_pair_batches<true>(
-                  relation, [&](Node left_first, Node right_first, std::uint8_t active, bool ancestry_allowed, const PairPathSummary&, std::size_t depth) {
-                    const auto final_edges = visit_batch.template operator()<false>(left_first, right_first, active, ancestry_allowed, nullptr, depth);
-                    emit_batch(next_gates[relation], left_first, right_first, active, final_edges, [](PairGate&, std::uint8_t) {});
-                  });
-            }
-          }
-          if(parallel_emit) {
-            std::uint64_t output_size = 0;
-            bool explicit_payload = false;
-            for(const auto& segment : segments) {
-              output_size += segment.size();
-              explicit_payload = explicit_payload || segment.bits.size() != 0;
-            }
-            next_gates[relation].reset_index(height_);
-            if(explicit_payload)
-              next_gates[relation].reserve_payload_bits(output_size);
-            for(auto& segment : segments)
-              next_gates[relation].append(std::move(segment));
-            if(output_size != 0 && !next_gates[relation].index_ready(height_))
-              throw std::logic_error("fused pair-gate emission produced an invalid index");
-          }
-          continue;
-        }
-        auto visit_edge = [&](Node left_leaf, Node right_leaf, bool ancestry_allowed, const PairPathSummary* summary) {
-          const bool normal_edge = ancestry_allowed && normal[i - 1U][0].get(left_leaf) && normal[i][1].get(right_leaf);
-          const bool interesting_path = witness[i - 1U][0].get(left_leaf) || witness[i][1].get(right_leaf);
-          const bool edge = normal_edge && interesting_path;
-          if(live_leaf(i - 1U, left_leaf) && live_leaf(i, right_leaf))
-            next_gates[i - 1U].push_back(edge);
-          if(edge) {
-            if(cache_partial && (partial_suffix[i].get(right_leaf) || summary->first_left_nonzero < bcaf_window)) {
-              partial_suffix[i - 1U].set(left_leaf);
-            }
-            if(cache_completion) {
-              const auto last = summary->last_left_nonzero;
-              const bool zero_tail = last == std::numeric_limits<std::size_t>::max() || last < short_start;
-              if(completion_suffix[i][0].get(right_leaf) && zero_tail) {
-                completion_suffix[i - 1U][0].set(left_leaf);
-                if(completion_suffix[i][1].get(right_leaf) || (last != std::numeric_limits<std::size_t>::max() && last >= long_start)) {
-                  completion_suffix[i - 1U][1].set(left_leaf);
-                }
-              }
-            }
-          }
-        };
-        if(cache_partial || cache_completion) {
-          walk_candidate_pairs<true, true>(i - 1U, [&](Node left_leaf, Node right_leaf, const auto&, bool ancestry_allowed, const PairPathSummary& summary) {
-            visit_edge(left_leaf, right_leaf, ancestry_allowed, &summary);
-          });
-        } else {
-          walk_candidate_pairs<true>(i - 1U, [&](Node left_leaf, Node right_leaf, const auto&, bool ancestry_allowed) {
-            visit_edge(left_leaf, right_leaf, ancestry_allowed, nullptr);
-          });
-        }
-      }
-
-      phase("  slice reification");
-      bool any_bcaf_live = false;
-      for(Node leaf = slices_.front().leaf_begin(); leaf < slices_.front().leaf_end(); ++leaf) {
-        if(normal.front()[0].get(leaf) && normal.front()[1].get(leaf) && (witness.front()[0].get(leaf) || witness.front()[1].get(leaf))) {
-          any_bcaf_live = true;
-          break;
-        }
-      }
-      if(!any_bcaf_live) {
-        return false;
-      }
-
-      Node partial_current = slices_.front().leaf_end();
-      std::vector<std::vector<std::uint8_t>> partial_lineages;
-      bool partial_seen = false;
-      if(cache_partial) {
-        for(Node leaf = slices_.front().leaf_begin(); leaf < slices_.front().leaf_end(); ++leaf) {
-          if(partial_suffix.front().get(leaf)) {
-            partial_current = leaf;
-            break;
-          }
-        }
-        if(partial_current == slices_.front().leaf_end()) {
-          throw std::logic_error("bcaf-projected state has no interesting path");
-        }
-        partial_lineages.reserve(slices_.size());
-        partial_lineages.push_back(slices_.front().lineage(partial_current));
-        partial_seen = labels_prefix_interesting(partial_lineages.front(), bcaf_window);
-      }
-
-      Node completion_current = slices_.front().leaf_end();
-      std::vector<std::vector<std::uint8_t>> completion_lineages;
-      bool completion_seen = false;
-      bool completion_found = false;
-      if(cache_completion) {
-        for(Node leaf = slices_.front().leaf_begin(); leaf < slices_.front().leaf_end(); ++leaf) {
-          if(completion_suffix.front()[1].get(leaf)) {
-            completion_current = leaf;
-            completion_found = true;
-            break;
-          }
-        }
-        if(completion_found) {
-          completion_lineages.reserve(slices_.size());
-          completion_lineages.push_back(slices_.front().lineage(completion_current));
-          completion_seen = labels_interesting(completion_lineages.front(), bcaf_window);
-        }
-      }
-
-      // Gate bits were emitted during the right-to-left suffix traversal.
-      // Only a requested concrete witness needs another relation walk; the
-      // ordinary search path can reify immediately without replaying the
-      // paired tries a fourth time.
-      const bool parallel_reification = options_.worker_count > 1 && !options_.verbose && !cache_partial && !completion_found;
-      if(parallel_reification) {
-        if(pair_gates_ready_)
-          pair_gates_.clear();
-        std::vector<std::uint8_t> retained(slices_.size(), 0);
-        BcafReifyContext context{this, &normal, &witness, &retained};
-        execute_indexed_tasks(slices_.size(), options_.worker_count, &context, &execute_bcaf_reify);
-        if(std::ranges::find(retained, std::uint8_t{0}) != retained.end())
-          return false;
-        for(std::size_t i = 0; i < slices_.size(); ++i) {
-          normal[i] = TagPair{};
-          witness[i] = LeafTagPair{};
-        }
-      } else {
-        for(std::size_t i = 0; i < adjacency_count; ++i) {
-          bool partial_selected = false;
-          bool completion_selected = false;
-          if((cache_partial || completion_found) && expanded_uniform_tail_ && can_walk_candidate_pair_batches_parallel(i)) {
-          const auto task_count = pair_gates_[i].index_starts.size();
-          const auto absent = slices_[i + 1U].leaf_end();
-          std::vector<Node> partial_candidates(cache_partial ? task_count : 0, absent);
-          std::vector<Node> completion_candidates(completion_found ? task_count : 0, absent);
-          walk_candidate_pair_batches_parallel<false>(
-              i, [&](Node left_first, Node right_first, std::uint8_t active, bool, const PairPathSummary&, std::size_t, const auto&, std::size_t checkpoint,
-                     std::size_t) {
-                const auto normal_edges = static_cast<std::uint8_t>(active & expand_left_edges(get_leaf_four(normal[i][0], left_first)) &
-                                                                    expand_right_edges(get_leaf_four(normal[i + 1U][1], right_first)));
-                const auto interesting_edges = static_cast<std::uint8_t>(
-                    expand_left_edges(get_leaf_four(witness[i][0], left_first)) | expand_right_edges(get_leaf_four(witness[i + 1U][1], right_first)));
-                auto remaining = static_cast<std::uint8_t>(normal_edges & interesting_edges);
-                while(remaining != 0) {
-                  const auto position = static_cast<std::uint8_t>(std::countr_zero(static_cast<unsigned>(remaining)));
-                  const auto left_leaf = left_first + (position >> 1U);
-                  const auto right_leaf = right_first + (position & 0b11U);
-                  if(cache_partial && partial_candidates[checkpoint] == absent && left_leaf == partial_current &&
-                     (partial_seen || partial_suffix[i + 1U].get(right_leaf))) {
-                    partial_candidates[checkpoint] = right_leaf;
-                  }
-                  const auto completion_plane = completion_seen ? 0U : 1U;
-                  if(completion_found && completion_candidates[checkpoint] == absent && left_leaf == completion_current &&
-                     completion_suffix[i + 1U][completion_plane].get(right_leaf)) {
-                    completion_candidates[checkpoint] = right_leaf;
-                  }
-                  remaining = static_cast<std::uint8_t>(remaining & (remaining - 1U));
-                }
-              });
-
-          if(cache_partial) {
-            for(const auto candidate : partial_candidates) {
-              if(candidate == absent)
-                continue;
-              partial_current = candidate;
-              partial_lineages.push_back(slices_[i + 1U].lineage(candidate));
-              partial_seen = partial_seen || labels_prefix_interesting(partial_lineages.back(), bcaf_window);
-              partial_selected = true;
-              break;
-            }
-          }
-          if(completion_found) {
-            for(const auto candidate : completion_candidates) {
-              if(candidate == absent)
-                continue;
-              completion_current = candidate;
-              completion_lineages.push_back(slices_[i + 1U].lineage(candidate));
-              completion_seen = completion_seen || labels_interesting(completion_lineages.back(), bcaf_window);
-              completion_selected = true;
-              break;
-            }
-          }
-        } else if((cache_partial || completion_found) && expanded_uniform_tail_) {
-          walk_candidate_pair_batches<false>(
-              i, [&](Node left_first, Node right_first, std::uint8_t active, bool, const PairPathSummary&, std::size_t) {
-                const auto normal_edges = static_cast<std::uint8_t>(active & expand_left_edges(get_leaf_four(normal[i][0], left_first)) &
-                                                                    expand_right_edges(get_leaf_four(normal[i + 1U][1], right_first)));
-                const auto interesting_edges = static_cast<std::uint8_t>(
-                    expand_left_edges(get_leaf_four(witness[i][0], left_first)) | expand_right_edges(get_leaf_four(witness[i + 1U][1], right_first)));
-                auto remaining = static_cast<std::uint8_t>(normal_edges & interesting_edges);
-                while(remaining != 0) {
-                  const auto position = static_cast<std::uint8_t>(std::countr_zero(static_cast<unsigned>(remaining)));
-                  const auto left_leaf = left_first + (position >> 1U);
-                  const auto right_leaf = right_first + (position & 0b11U);
-                  if(cache_partial && !partial_selected && left_leaf == partial_current &&
-                     (partial_seen || partial_suffix[i + 1U].get(right_leaf))) {
-                    partial_current = right_leaf;
-                    partial_lineages.push_back(slices_[i + 1U].lineage(right_leaf));
-                    partial_seen = partial_seen || labels_prefix_interesting(partial_lineages.back(), bcaf_window);
-                    partial_selected = true;
-                  }
-                  const auto completion_plane = completion_seen ? 0U : 1U;
-                  if(!completion_selected && completion_found && left_leaf == completion_current &&
-                     completion_suffix[i + 1U][completion_plane].get(right_leaf)) {
-                    completion_current = right_leaf;
-                    completion_lineages.push_back(slices_[i + 1U].lineage(right_leaf));
-                    completion_seen = completion_seen || labels_interesting(completion_lineages.back(), bcaf_window);
-                    completion_selected = true;
-                  }
-                  remaining = static_cast<std::uint8_t>(remaining & (remaining - 1U));
-                }
-              });
-        } else if(cache_partial || completion_found) {
-          walk_candidate_pairs<false>(i, [&](Node left_leaf, Node right_leaf, const auto&, bool) {
-            const bool normal_edge = normal[i][0].get(left_leaf) && normal[i + 1U][1].get(right_leaf);
-            const bool interesting_path = witness[i][0].get(left_leaf) || witness[i + 1U][1].get(right_leaf);
-            if(normal_edge && interesting_path) {
-              if(cache_partial && !partial_selected && left_leaf == partial_current &&
-                 (partial_seen || partial_suffix[i + 1U].get(right_leaf))) {
-                partial_current = right_leaf;
-                partial_lineages.push_back(slices_[i + 1U].lineage(right_leaf));
-                partial_seen = partial_seen || labels_prefix_interesting(partial_lineages.back(), bcaf_window);
-                partial_selected = true;
-              }
-              const auto completion_plane = completion_seen ? 0U : 1U;
-              if(!completion_selected && completion_found && left_leaf == completion_current &&
-                 completion_suffix[i + 1U][completion_plane].get(right_leaf)) {
-                completion_current = right_leaf;
-                completion_lineages.push_back(slices_[i + 1U].lineage(right_leaf));
-                completion_seen = completion_seen || labels_interesting(completion_lineages.back(), bcaf_window);
-                completion_selected = true;
-              }
-            }
-          });
-        }
-        if(cache_partial && !partial_selected) {
-          throw std::logic_error("interesting-path reconstruction lost its edge");
-        }
-        if(completion_found && !completion_selected) {
-          throw std::logic_error("end reconstruction lost its edge");
-        }
-        if(pair_gates_ready_)
-          pair_gates_[i] = PairGate{};
-        auto& keep = normal[i][0];
-        for(Node leaf = slices_[i].leaf_begin(); leaf < slices_[i].leaf_end(); ++leaf)
-          keep.set(leaf, live_leaf(i, leaf));
-        if(!slices_[i].reify(keep))
-          return false;
-        normal[i] = TagPair{};
-        witness[i] = LeafTagPair{};
-        }
-      }
-      if(!parallel_reification) {
-        auto& keep_back = normal.back()[0];
-        for(Node leaf = slices_.back().leaf_begin(); leaf < slices_.back().leaf_end(); ++leaf)
-          keep_back.set(leaf, live_leaf(slices_.size() - 1U, leaf));
-        if(!slices_.back().reify(keep_back))
-          return false;
-        normal.back() = TagPair{};
-        witness.back() = LeafTagPair{};
-      }
-      if(cache_partial) {
-        if(!partial_seen) {
-          throw std::logic_error("interesting-path reconstruction lost its witness");
-        }
-        cached_partial_ = board_from_lineages(partial_lineages);
-      }
-      if(cache_completion) {
-        cached_completion_height_ = height_;
-        if(completion_found) {
-          if(!completion_seen) {
-            throw std::logic_error("end reconstruction lost its witness");
-          }
-          cached_completion_ = board_from_lineages(completion_lineages);
-        }
-      }
-      slices_reified = true;
-    } else {
-      for(std::size_t i = 0; i < adjacency_count; ++i) {
-        const bool build_output_index = options_.worker_count > 1 && !options_.verbose;
-        if(build_output_index)
-          next_gates[i].reset_index(height_);
-        walk_candidate_pairs(i, [&](Node left_leaf, Node right_leaf, const auto& history, bool ancestry_allowed) {
-          const bool keep_left = normally_live(i, left_leaf);
-          const bool keep_right = normally_live(i + 1U, right_leaf);
-          if(keep_left && keep_right) {
-            if(build_output_index && next_gates[i].size() % PairGate::index_quantum == 0)
-              next_gates[i].add_index_path(next_gates[i].size(), history.data(), height_);
-            const bool final_edge = ancestry_allowed && normal[i][0].get(left_leaf) && normal[i + 1U][1].get(right_leaf);
-            next_gates[i].push_back(final_edge);
-          }
-        });
-        if(build_output_index && next_gates[i].size() != 0 && !next_gates[i].index_ready(height_))
-          throw std::logic_error("non-BCAF pair-gate emission produced an invalid index");
-      }
-      phase("  slice reification");
-    }
-
-    if(!slices_reified) {
-      for(std::size_t i = 0; i < slices_.size(); ++i) {
-        auto& keep = normal[i][0];
-        for(Node leaf = slices_[i].leaf_begin(); leaf < slices_[i].leaf_end(); ++leaf) {
-          keep.set(leaf, normal[i][0].get(leaf) && normal[i][1].get(leaf));
-        }
-        if(!slices_[i].reify(keep))
-          return false;
-      }
-    }
-
-    pair_gates_ = std::move(next_gates);
-    pair_gate_depth_ = height_;
-    pair_gates_ready_ = true;
-    return true;
-  }
-
   template <class LeafCallback>
   void leaf_dfs(const SuccinctSliceTree& tree,
                 Node node,
@@ -3727,9 +2415,8 @@ private:
       auto next_first = first_nonzero;
       auto next_last = last_nonzero;
       if(label != 0) {
-        if(next_first == std::numeric_limits<std::size_t>::max()) {
+        if(next_first == std::numeric_limits<std::size_t>::max())
           next_first = depth;
-        }
         next_last = depth;
       }
       leaf_dfs(tree, next, depth + 1, next_first, next_last, child_cursor, callback);
@@ -4183,10 +2870,6 @@ private:
   std::vector<PairGate> pair_gates_;
   std::size_t pair_gate_depth_ = 0;
   bool pair_gates_ready_ = false;
-  // Native searches factor historical BCAF edge filters into two unary
-  // payload bits on each retained trie node.  Older checkpoints keep using
-  // the dense legacy relation exactly as serialized.
-  bool implicit_relations_ = true;
   std::size_t bcaf_clause_begin_depth_ = 0;
   bool exhausted_ = false;
   bool completion_at_current_row_ = false;
@@ -4211,3 +2894,5 @@ private:
 };
 
 } // namespace rlife::llsss
+
+#include "checkpoint.hpp"

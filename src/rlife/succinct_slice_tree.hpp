@@ -374,32 +374,6 @@ public:
     }
   }
 
-  // Convert a genuine v3 pair of node-indexed planes once while loading.
-  void restore_bcaf_clauses_v3(std::size_t first_child_depth,
-                               std::vector<std::uint64_t> prefix_words,
-                               std::vector<std::uint64_t> suffix_words) {
-    if(prefix_words.empty() != suffix_words.empty())
-      throw std::runtime_error("slice-tree checkpoint has only one BCAF payload");
-    if(prefix_words.empty()) {
-      if(first_child_depth != 0)
-        throw std::runtime_error("slice-tree checkpoint is missing its BCAF payload");
-      clear_bcaf_clauses();
-      return;
-    }
-    if(first_child_depth == 0 || first_child_depth > depth_)
-      throw std::runtime_error("slice-tree checkpoint has an invalid first BCAF clause depth");
-    const auto prefix = PackedTags::from_checkpoint(node_count_, std::move(prefix_words));
-    const auto suffix = PackedTags::from_checkpoint(node_count_, std::move(suffix_words));
-    initialize_bcaf_clauses(first_child_depth);
-    for(Node parent = bcaf_parent_begin_; parent < leaf_begin(); ++parent) {
-      const auto children = child_block(parent);
-      const auto fanout = static_cast<unsigned>(std::popcount(children.mask));
-      const auto raw_prefix = scatter_compact_bits(children.mask, prefix.get_low_bits(children.first, fanout));
-      const auto raw_suffix = scatter_compact_bits(children.mask, suffix.get_low_bits(children.first, fanout));
-      bcaf_child_clauses_[static_cast<std::size_t>(parent - bcaf_parent_begin_)] = static_cast<std::uint8_t>(raw_prefix | (raw_suffix << 4U));
-    }
-  }
-
   [[nodiscard]] std::uint8_t bcaf_child_clauses(Node parent) const {
     validate_bcaf_payload_parent(parent);
     return bcaf_child_clauses_unchecked(parent);
