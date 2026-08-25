@@ -276,8 +276,7 @@ private:
       return;
     }
     words_[first_word] |= ~std::uint64_t{0} << first_offset;
-    std::fill(words_.begin() + static_cast<std::ptrdiff_t>(first_word + 1U), words_.begin() + static_cast<std::ptrdiff_t>(last_word),
-              ~std::uint64_t{0});
+    std::fill(words_.begin() + static_cast<std::ptrdiff_t>(first_word + 1U), words_.begin() + static_cast<std::ptrdiff_t>(last_word), ~std::uint64_t{0});
     words_[last_word] |= last_offset == 0 ? ~std::uint64_t{0} : (std::uint64_t{1} << last_offset) - 1U;
   }
 
@@ -413,8 +412,8 @@ public:
   // can avoid two rank-directory lookups at their dominant final level.
   [[nodiscard]] ChildBlock expanded_leaf_child_block(Node node) const noexcept {
     return ChildBlock{
-        level_begin_[depth_] + 4U * (node - level_begin_[depth_ - 1U]),
-        0x0fU,
+      level_begin_[depth_] + 4U * (node - level_begin_[depth_ - 1U]),
+      0x0fU,
     };
   }
 
@@ -642,17 +641,17 @@ public:
       retained_clauses.assign(checked_byte_count(retained_leaf_begin - retained_bcaf_begin), 0);
     }
     ParallelEmitContext emit_context{
-        this,
-        &tags,
-        old_count,
-        &live_offsets,
-        &child_starts,
-        &output,
-        compact_bcaf ? &bcaf_child_clauses_ : nullptr,
-        compact_bcaf ? &retained_clauses : nullptr,
-        old_bcaf_begin,
-        old_leaf_begin,
-        retained_bcaf_begin,
+      this,
+      &tags,
+      old_count,
+      &live_offsets,
+      &child_starts,
+      &output,
+      compact_bcaf ? &bcaf_child_clauses_ : nullptr,
+      compact_bcaf ? &retained_clauses : nullptr,
+      old_bcaf_begin,
+      old_leaf_begin,
+      retained_bcaf_begin,
     };
     execute_indexed_tasks(task_count, requested_workers, &emit_context, &execute_parallel_emit);
 
@@ -683,9 +682,7 @@ public:
   // calling reify_parallel() once per tree repeatedly forms small OpenMP
   // teams.  This variant exposes word/range tasks from every tree to the same
   // team.  Per-tree prefix sums retain the original BFS order exactly.
-  static bool reify_parallel_group(const std::vector<SuccinctSliceTree*>& trees,
-                                   const std::vector<PackedTags*>& tags,
-                                   int requested_workers) {
+  static bool reify_parallel_group(const std::vector<SuccinctSliceTree*>& trees, const std::vector<PackedTags*>& tags, int requested_workers) {
     if(trees.size() != tags.size())
       throw std::invalid_argument("parallel reification tree/tag count mismatch");
     if(requested_workers <= 1) {
@@ -732,9 +729,9 @@ public:
         const auto past_word = static_cast<std::size_t>((end + 63U) >> 6U);
         for(auto word = first_word; word < past_word; word += close_words_per_task) {
           close_tasks.push_back(GroupCloseTask{
-              state_index,
-              std::max<Node>(begin, static_cast<Node>(word) * 64U),
-              std::min<Node>(end, static_cast<Node>(word + close_words_per_task) * 64U),
+            state_index,
+            std::max<Node>(begin, static_cast<Node>(word) * 64U),
+            std::min<Node>(end, static_cast<Node>(word + close_words_per_task) * 64U),
           });
         }
       }
@@ -798,17 +795,17 @@ public:
     for(std::size_t state_index = 0; state_index < states.size(); ++state_index) {
       auto& state = states[state_index];
       emit_contexts[state_index] = ParallelEmitContext{
-          state.tree,
-          state.tags,
-          state.old_count,
-          &state.live_offsets,
-          &state.child_starts,
-          &state.output,
-          state.compact_bcaf ? &state.tree->bcaf_child_clauses_ : nullptr,
-          state.compact_bcaf ? &state.retained_clauses : nullptr,
-          state.old_bcaf_begin,
-          state.old_leaf_begin,
-          state.retained_bcaf_begin,
+        state.tree,
+        state.tags,
+        state.old_count,
+        &state.live_offsets,
+        &state.child_starts,
+        &state.output,
+        state.compact_bcaf ? &state.tree->bcaf_child_clauses_ : nullptr,
+        state.compact_bcaf ? &state.retained_clauses : nullptr,
+        state.old_bcaf_begin,
+        state.old_leaf_begin,
+        state.retained_bcaf_begin,
       };
       for(std::size_t task = 0; task < state.child_starts.size(); ++task)
         emit_tasks.push_back(GroupLocalTask{state_index, task});
@@ -878,8 +875,8 @@ public:
   [[nodiscard]] const std::vector<Node>& checkpoint_levels() const noexcept { return level_begin_; }
 
   static SuccinctSliceTree from_checkpoint(std::vector<std::uint64_t> words, std::vector<Node> levels, Node node_count, std::size_t depth) {
-    if(node_count == 0 || depth > std::numeric_limits<std::size_t>::max() - 2U || levels.size() != depth + 2U || levels.front() != 0 ||
-       levels[1] != 1 || levels.back() != node_count || words.size() != word_count_for_nodes(node_count)) {
+    if(node_count == 0 || depth > std::numeric_limits<std::size_t>::max() - 2U || levels.size() != depth + 2U || levels.front() != 0 || levels[1] != 1 ||
+       levels.back() != node_count || words.size() != word_count_for_nodes(node_count)) {
       throw std::runtime_error("invalid slice tree in checkpoint");
     }
     for(std::size_t level = 0; level + 1U < levels.size(); ++level) {
@@ -1066,8 +1063,7 @@ private:
       if(context.source_clauses != nullptr && node >= context.source_clause_begin && node < context.source_leaf_begin) {
         const auto clauses = (*context.source_clauses)[static_cast<std::size_t>(node - context.source_clause_begin)];
         const auto retained_labels = static_cast<std::uint8_t>(retained_mask | (retained_mask << 4U));
-        (*context.output_clauses)[static_cast<std::size_t>(output_node - context.output_clause_begin)] =
-            static_cast<std::uint8_t>(clauses & retained_labels);
+        (*context.output_clauses)[static_cast<std::size_t>(output_node - context.output_clause_begin)] = static_cast<std::uint8_t>(clauses & retained_labels);
       }
       ++output_nibble;
       ++output_node;
@@ -1214,8 +1210,7 @@ private:
     const auto word_index = static_cast<std::size_t>(node >> 4U);
     const auto bit_offset = static_cast<unsigned>((node & 15U) * 4U + label);
     const auto lower = bit_offset == 0 ? std::uint64_t{0} : (std::uint64_t{1} << bit_offset) - 1U;
-    const auto rank =
-        absolute_rank_[word_index / words_per_absolute_chunk] + relative_rank_[word_index] + static_cast<Node>(std::popcount(original_word & lower));
+    const auto rank = absolute_rank_[word_index / words_per_absolute_chunk] + relative_rank_[word_index] + static_cast<Node>(std::popcount(original_word & lower));
     return rank + 1U;
   }
 
@@ -1223,11 +1218,10 @@ private:
     const auto word_index = static_cast<std::size_t>(node >> 4U);
     const auto shift = static_cast<unsigned>((node & 15U) * 4U);
     const auto lower = shift == 0 ? std::uint64_t{0} : (std::uint64_t{1} << shift) - 1U;
-    const auto rank =
-        absolute_rank_[word_index / words_per_absolute_chunk] + relative_rank_[word_index] + static_cast<Node>(std::popcount(original_word & lower));
+    const auto rank = absolute_rank_[word_index / words_per_absolute_chunk] + relative_rank_[word_index] + static_cast<Node>(std::popcount(original_word & lower));
     return ChildBlock{
-        rank + 1U,
-        static_cast<std::uint8_t>((original_word >> shift) & 0x0fU),
+      rank + 1U,
+      static_cast<std::uint8_t>((original_word >> shift) & 0x0fU),
     };
   }
 
