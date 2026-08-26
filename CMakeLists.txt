@@ -1,18 +1,18 @@
 cmake_minimum_required(VERSION 3.20)
 project(rlife_llsss LANGUAGES CXX)
 
-find_package(OpenMP REQUIRED)
+find_package(Threads REQUIRED)
 
 add_library(rlife_indexed_executor STATIC src/rlife/indexed_executor.cpp)
 target_compile_features(rlife_indexed_executor PRIVATE cxx_std_20)
 target_compile_options(rlife_indexed_executor PRIVATE -Wall -Wextra -Wpedantic)
-target_link_libraries(rlife_indexed_executor PRIVATE OpenMP::OpenMP_CXX)
+target_link_libraries(rlife_indexed_executor PRIVATE Threads::Threads)
 
 add_executable(rlife_llsss src/main.cpp)
 target_include_directories(rlife_llsss PRIVATE src)
 target_compile_features(rlife_llsss PRIVATE cxx_std_20)
 target_compile_options(rlife_llsss PRIVATE -Wall -Wextra -Wpedantic)
-target_link_libraries(rlife_llsss PRIVATE rlife_indexed_executor)
+target_link_libraries(rlife_llsss PRIVATE rlife_indexed_executor Threads::Threads)
 
 option(RLIFE_NATIVE "Optimize for the build host CPU" ON)
 if(RLIFE_NATIVE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")

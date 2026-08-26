@@ -170,10 +170,11 @@ intersects reachability from the right boundary. With BCAF, dependency order
 combines normal right reachability with suffix witnesses, then combines normal
 left reachability, prefix witnesses, and the first global-cleanup direction.
 The reverse cleanup and final gate emission bring the total to four pair-tree
-traversals instead of six independent traversals. Normal reachability, witness
-reachability, and global cleanup use six simultaneous packed tag bits per
-expanded node. This deliberately avoids a much larger temporary bit tape over
-every compatible neighboring leaf pair.
+traversals instead of six independent traversals. Suffix state is completed
+one slice at a time in the reverse sweep; prefix state is allocated as the
+forward sweep reaches a slice and released immediately after reification. This
+deliberately avoids both a full set of simultaneous tag planes and a much
+larger temporary bit tape over every compatible neighboring leaf pair.
 
 Reification performs one DFS to tag live ancestry, then stably compacts the
 four-bit records in place. Whole-tree walks exploit BFS ordering with one child
@@ -206,6 +207,61 @@ End detection likewise uses one complete lookback (`2P` orthogonal or `4P`
 diagonal) as its zero suffix and the preceding logical tile as its interesting
 witness. It runs only at complete tile boundaries.
 
+## External sweep residency
+
+Large rows can move completed reverse-sweep records to local disk while later
+relations are still computing. A record contains both the expanded native
+`SuccinctSliceTree` image and its normal/BCAF suffix tags. Once submitted, it
+is owned exclusively by the residency manager; the search threads receive it
+back as a loaded lease before touching that slice again. Hot relation code
+therefore sees ordinary vectors and contains no per-access loaded-state or
+atomic checks.
+
+External residency is enabled by default but activates only when the current
+RSS plus the predicted row-record bytes exceeds `--spill-threshold` (4 GiB by
+default). The relevant controls are:
+
+```sh
+--spill-dir scratch
+--spill-threshold 4GiB
+--spill-resident 4GiB
+--[no-]spill
+--[no-]spill-checksum
+```
+
+`--spill-resident` is a soft byte cap on records owned by the manager: queued
+writes, retained turnaround records, prefetched reads, and active leases. A
+single record, or the adjacent pair required by a relation, is allowed to
+exceed it because that working set is unavoidable. The cap is not a process
+RSS limit. Compact output tries, relation gates, the currently constructed
+prefix, allocator high-water behavior, and checkpoint-loading memory are
+outside it.
+
+The reverse sweep submits records from right to left to one dedicated I/O
+thread. Records needed immediately after the turnaround are poor eviction
+candidates, so the largest contiguous left prefix fitting half the byte budget
+is retained. At the turnaround the first adjacent pair is requested. While
+forward relation `i` computes, record `i+2` is prefetched; after slice `i` is
+reified its lease and old gate are released. Reverse producers block only when
+their queued resident bytes fill the budget, and forward consumers block only
+when a required read misses that lookahead.
+
+On Linux the manager preallocates one temporary file and uses 8 MiB aligned
+staging buffers with `O_DIRECT` when the scratch filesystem supports it,
+falling back to buffered positional I/O otherwise. The format is a native
+process-local image, not a portable checkpoint. It intentionally makes no
+endianness or cross-build compatibility promise. Checksums operate on native
+word chunks and are verified by default. The file is removed on normal exit;
+an uncatchable kill can leave an incomplete `rlife-sweep-*.tmp` file that may
+be deleted after confirming no search process is using it.
+
+Each completed row reports logical spill bytes written/read, main-thread
+`write-wait` and `read-wait`, the peak manager-owned record bytes, aggregate
+I/O service time, and whether direct I/O was used. `--verbose` additionally
+reports physical aligned bytes, record counts, and the retained-turnaround
+bytes. These counters separate transfer time that was successfully overlapped
+from time that actually stalled search progress.
+
 The reported `persistent_payload_bytes` covers the allocated slice-tree child
 bits, rank directories and level boundaries, persistent relation gates, and
 rule/projection/transition lookup payloads. At a row boundary those are the
@@ -216,6 +272,7 @@ lifetime resident-set high-water mark, so it also retains peaks from the
 expanded pre-compaction trees, the sweep tag planes, overlapping old/new gates,
 reconstruction data, and allocator high-water behavior after a row compacts.
 
-This version is serial. Pair-tree traversal is isolated from mutation of the
-persistent tries, leaving its top-level branch work suitable for later
-parallelization. Autochoke is intentionally absent.
+Indexed pair-tree walks and reification use the persistent worker team selected
+by `--threads`; keeping that team alive also avoids repeated barriers between
+the many dependent trie levels. The residency manager has its own I/O thread.
+Autochoke is intentionally absent.

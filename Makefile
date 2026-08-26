@@ -14,13 +14,13 @@ HEADERS := $(wildcard src/rlife/*.hpp)
 all: $(TARGET)
 
 $(TARGET): $(OBJECTS)
-	$(CXX) $(OBJECTS) $(LDFLAGS) -fopenmp -o $@
+	$(CXX) $(OBJECTS) $(LDFLAGS) -pthread -o $@
 
 src/main.o: src/main.cpp $(HEADERS)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(NATIVE_FLAGS) -Isrc -c $< -o $@
 
 src/rlife/indexed_executor.o: src/rlife/indexed_executor.cpp src/rlife/indexed_executor.hpp
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(NATIVE_FLAGS) -fopenmp -Isrc -c $< -o $@
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(NATIVE_FLAGS) -pthread -Isrc -c $< -o $@
 
 clean:
 	rm -f $(TARGET) $(OBJECTS)

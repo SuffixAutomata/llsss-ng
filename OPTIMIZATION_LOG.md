@@ -815,3 +815,48 @@ of partial mode and is still emitted with `--partials none`.
 Validation for this continuation includes byte-identical serial/indexed
 partials, exact deep-row columns, the full and smoke regressions, Release
 CMake/CTest, and non-native ASan/UBSan smoke tests.
+
+## Byte-budgeted external sweep residency
+
+Expanded slice trees and their completed reverse-sweep suffix tags can now be
+owned by a dedicated residency manager instead of remaining live for the
+whole row. The manager preallocates a native temporary record file, uses
+aligned `O_DIRECT` positional I/O when available, verifies word-oriented
+checksums, retains a byte-budgeted left prefix at the turnaround, and
+prefetches record `i+2` while forward relation `i` runs. The search loop only
+submits complete records and receives loaded leases, so its inner relation
+walks have no loaded-state branches.
+
+Rolling each slice through reification initially exposed a separate executor
+problem: opening thousands of short OpenMP regions for dependent trie levels
+made `save_217` exceed three minutes even with disk disabled. A
+process-lifetime indexed worker team restored the intended granularity. Exact
+`save_217 -> Row 218` measurements with identical columns were:
+
+```text
+no spill: 25.440191 s row, 4609340 KiB maxRSS
+4 GiB policy: 24.921469 s row, 4162204 KiB maxRSS
+policy I/O: 2371 MiB written/read, 0.000 s read/write wait
+```
+
+The final bounded `save_239 -> Row 240` comparison used the default 4 GiB
+activation and resident budgets on the SATA-backed `scratch/` mount:
+
+```text
+baseline: 106.821271 s row, 24719012 KiB maxRSS
+spill:    136.478927 s row, 16805628 KiB maxRSS
+phases:   right 51.590405 s, left/reification 84.884202 s
+I/O:      17 GiB written, 15 GiB read, direct=yes
+wait:     1.123 s producer, 20.179 s demand read
+service:  15.146 s write, 19.057 s read
+records:  9005 MiB manager-resident peak
+```
+
+This is a 32.0% max-RSS reduction for a 27.8% row-time cost. The result has
+the exact expected 6,760,494,684 nodes and per-slice columns. The 4 GiB budget
+is deliberately soft: the central adjacent pair required by one relation is
+about 8.8 GiB and cannot be evicted while that relation runs. Compact output
+tries, gates, the rolling prefix, checkpoint-load memory, and allocator
+high-water behavior are also outside the manager budget. Late in the forward
+sweep the observed live RSS fell much farther than the lifetime maxRSS once
+those central records were consumed.

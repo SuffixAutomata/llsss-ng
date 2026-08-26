@@ -5,6 +5,8 @@
 #include "indexed_executor.hpp"
 #include "rule.hpp"
 #include "succinct_slice_tree.hpp"
+#include "sweep_spill.hpp"
+#include "sweep_tags.hpp"
 
 #include <algorithm>
 #include <array>
@@ -139,6 +141,7 @@ struct Options {
   int save_every = 1;
   std::string savefile = "save";
   std::string loadfile;
+  SweepSpillConfig spill;
   // Checkpoint loading uses saved configuration as its baseline.  This set
   // distinguishes an invocation default from an option the user explicitly
   // supplied, so mutable settings can be overridden intentionally.
@@ -319,6 +322,11 @@ Orthogonal and diagonal fixed-width LLSSS using succinct two-column slice trees.
   --partials MODE            none, final, default, or every:N (default: final)
   --partial-output FILE      write RLE partials/completions to FILE
   --dump-slice-stats FILE    append per-height succinct-slice statistics
+  --spill-dir DIR            temporary tree/tag records (default: scratch)
+  --spill-threshold SIZE     enable external residency above SIZE (default: 4GiB)
+  --spill-resident SIZE      soft cap for manager-owned records (default: 4GiB)
+  --[no-]spill               enable/disable external sweep residency (default: on)
+  --[no-]spill-checksum      verify native u64 spill records (default: verify)
   --phase-progress           print individual sweep phases
   --phase-timings            print final cumulative timings per phase
   --verbose                  verbose information at every row
@@ -481,6 +489,24 @@ inline Options parse_cli(int argc, char** argv) {
     } else if(current == "--dump-slice-stats") {
       options.stats_output = argument(current);
       options.explicitly_set.insert("stats_output");
+    } else if(current == "--spill-dir") {
+      options.spill.directory = argument(current);
+      if(options.spill.directory.empty())
+        throw std::runtime_error("--spill-dir must not be empty");
+    } else if(current == "--spill-threshold") {
+      options.spill.activation_bytes = parse_byte_count(argument(current));
+    } else if(current == "--spill-resident") {
+      options.spill.resident_budget_bytes = parse_byte_count(argument(current));
+      if(options.spill.resident_budget_bytes == 0)
+        throw std::runtime_error("--spill-resident must be positive");
+    } else if(current == "--spill") {
+      options.spill.enabled = true;
+    } else if(current == "--no-spill") {
+      options.spill.enabled = false;
+    } else if(current == "--spill-checksum") {
+      options.spill.checksum = true;
+    } else if(current == "--no-spill-checksum") {
+      options.spill.checksum = false;
     } else if(current == "--phase-progress") {
       options.phase_progress = true;
       options.explicitly_set.insert("phase_progress");
@@ -628,6 +654,7 @@ public:
       pair_leaves_ = 0;
       boundary_states_ = 0;
       peak_tag_bytes_ = 0;
+      row_spill_telemetry_ = SweepSpillTelemetry{};
       completion_at_current_row_ = false;
       bool row_reported = false;
       auto report_row = [&]() {
@@ -639,13 +666,11 @@ public:
         row_reported = true;
       };
 
-      phase("extend slice-tree tails");
-      expand_slice_tails();
       ++height_;
       expanded_uniform_tail_ = true;
 
-      phase("support and filter sweeps");
-      if(!prune_supported()) {
+      phase("pipelined tree expansion, support/filter sweeps, and residency");
+      if(!prune_supported(true)) {
         if(geometry_.subtile_count != 1) {
           std::cout << "search exhausted at flattened depth " << height_ << " (w_pos " << geometry_.position_string(height_) << ")\n";
         } else {
@@ -710,61 +735,6 @@ public:
 private:
   using Clock = std::chrono::steady_clock;
   using Node = SuccinctSliceTree::Node;
-
-  // Relation sweeps touch only current leaves.  Keeping witness/suffix bits
-  // in leaf-local coordinates avoids paying for every historical internal
-  // trie node, which is substantial on the large diagonal searches.
-  struct LeafTags {
-    LeafTags() = default;
-    LeafTags(Node first, Node count) : first(first), bits(count) {}
-
-    [[nodiscard]] bool get(Node node) const noexcept { return bits.get(node - first); }
-    void set(Node node) noexcept { bits.set(node - first); }
-    void atomic_set(Node node) noexcept { bits.atomic_set(node - first); }
-    void set(Node node, bool value) noexcept { bits.set(node - first, value); }
-    void clear() noexcept { bits.clear(); }
-    [[nodiscard]] std::uint8_t get_4(Node node) const noexcept { return bits.get_4(node - first); }
-    void or_4(Node node, std::uint8_t value) noexcept { bits.or_4(node - first, value); }
-    void atomic_or_4(Node node, std::uint8_t value) noexcept { bits.atomic_or_4(node - first, value); }
-    // OR an absolute leaf interval from a full-tree tag plane into this
-    // leaf-local plane.  Source and destination have a fixed bit offset but
-    // not necessarily the same word alignment, so extract one shifted source
-    // window for each destination word fragment.
-    void or_source_range(const PackedTags& source, Node begin, Node end) noexcept {
-      auto source_bit = begin;
-      auto destination_bit = begin - first;
-      auto remaining = end - begin;
-      while(remaining != 0) {
-        const auto destination_offset = static_cast<unsigned>(destination_bit & 63U);
-        const auto take = static_cast<unsigned>(std::min<Node>(remaining, 64U - destination_offset));
-        const auto source_word = static_cast<std::size_t>(source_bit >> 6U);
-        const auto source_offset = static_cast<unsigned>(source_bit & 63U);
-        auto value = source.word(source_word) >> source_offset;
-        if(source_offset != 0 && source_offset + take > 64U && source_word + 1U < source.word_size())
-          value |= source.word(source_word + 1U) << (64U - source_offset);
-        if(take != 64U)
-          value &= (std::uint64_t{1} << take) - 1U;
-        bits.or_word(static_cast<std::size_t>(destination_bit >> 6U), value << destination_offset);
-        source_bit += take;
-        destination_bit += take;
-        remaining -= take;
-      }
-    }
-    [[nodiscard]] std::size_t allocated_bytes() const noexcept { return bits.allocated_bytes(); }
-
-    Node first = 0;
-    PackedTags bits;
-  };
-
-  struct LeafTagPair {
-    LeafTagPair() = default;
-    LeafTagPair(Node first, Node count) : planes{LeafTags(first, count), LeafTags(first, count)} {}
-
-    LeafTags& operator[](std::size_t index) { return planes[index]; }
-    const LeafTags& operator[](std::size_t index) const { return planes[index]; }
-
-    LeafTags planes[2];
-  };
 
   static void write_config(CheckpointWriter& output, const Options& options);
   static int checkpoint_positive_int(CheckpointReader& input, std::string_view field);
@@ -1473,57 +1443,42 @@ private:
       context.long_start, context.short_start, *context.callback);
   }
 
-  struct BcafReifyContext {
-    Solver* solver = nullptr;
-    std::vector<TagPair>* normal = nullptr;
-    std::vector<LeafTagPair>* witness = nullptr;
-    std::vector<std::uint8_t>* retained = nullptr;
-  };
-
-  static void execute_bcaf_reify(void* opaque, std::size_t position, std::size_t) {
-    auto& context = *static_cast<BcafReifyContext*>(opaque);
-    auto& tree = context.solver->slices_[position];
-    auto& normal = (*context.normal)[position];
-    auto& witness = (*context.witness)[position];
-    auto& keep = normal[0];
-    for(Node leaf = tree.leaf_begin(); leaf < tree.leaf_end(); ++leaf) {
-      keep.set(leaf, keep.get(leaf) && normal[1].get(leaf) && (witness[0].get(leaf) || witness[1].get(leaf)));
-    }
-    (*context.retained)[position] = static_cast<std::uint8_t>(tree.reify(keep));
-  }
-
   struct BcafKeepRange {
     std::size_t position = 0;
     Node begin = 0;
     Node end = 0;
   };
 
-  struct BcafKeepContext {
+  struct RollingKeepContext {
     Solver* solver = nullptr;
-    std::vector<TagPair>* normal = nullptr;
-    std::vector<LeafTagPair>* witness = nullptr;
+    std::size_t position = 0;
+    PackedTags* prefix_normal = nullptr;
+    const PackedTags* suffix_normal = nullptr;
+    LeafTags* prefix_witness = nullptr;
+    const LeafTags* suffix_witness = nullptr;
     const std::vector<BcafKeepRange>* ranges = nullptr;
+    bool bcaf_active = false;
   };
 
-  static void execute_bcaf_keep_range(void* opaque, std::size_t task, std::size_t) {
-    auto& context = *static_cast<BcafKeepContext*>(opaque);
+  static void execute_rolling_keep_range(void* opaque, std::size_t task, std::size_t) {
+    auto& context = *static_cast<RollingKeepContext*>(opaque);
     const auto range = (*context.ranges)[task];
-    auto& tree = context.solver->slices_[range.position];
-    auto& normal = (*context.normal)[range.position];
-    auto& witness = (*context.witness)[range.position];
-    auto& keep = normal[0];
+    auto& tree = context.solver->slices_[context.position];
     const auto leaf_begin = tree.leaf_begin();
     const auto parent_begin = tree.level_begin(tree.depth() - 1U);
     for(Node leaf = range.begin; leaf < range.end; ++leaf) {
-      if(context.solver->expanded_uniform_tail_ && ((leaf - leaf_begin) & 3U) == 0) {
-        const auto parent = parent_begin + (leaf - leaf_begin) / 4U;
-        const auto prefix_four = witness[0].get_4(leaf);
-        const auto suffix_four = witness[1].get_4(leaf);
-        tree.set_bcaf_child_clauses_unchecked(parent, static_cast<std::uint8_t>(prefix_four | (suffix_four << 4U)));
+      bool witnessed = true;
+      if(context.bcaf_active) {
+        if(context.solver->expanded_uniform_tail_ && ((leaf - leaf_begin) & 3U) == 0) {
+          const auto parent = parent_begin + (leaf - leaf_begin) / 4U;
+          const auto prefix_four = context.prefix_witness->get_4(leaf);
+          const auto suffix_four = context.suffix_witness->get_4(leaf);
+          tree.set_bcaf_child_clauses_unchecked(parent, static_cast<std::uint8_t>(prefix_four | (suffix_four << 4U)));
+        }
+        witnessed = context.prefix_witness->get(leaf) || context.suffix_witness->get(leaf);
       }
-      const bool prefix = witness[0].get(leaf);
-      const bool suffix = witness[1].get(leaf);
-      keep.set(leaf, keep.get(leaf) && normal[1].get(leaf) && (prefix || suffix));
+      context.prefix_normal->set(leaf,
+        context.prefix_normal->get(leaf) && context.suffix_normal->get(leaf) && witnessed);
     }
   }
 
@@ -1824,7 +1779,7 @@ private:
   // stored on the corresponding nodes of the two slice tries.  The sparse
   // PairGate that remains is only an ordered restart index over accepted
   // parent paths.
-  bool prune_supported() {
+  bool prune_supported(bool extend_trees = false) {
     if(slices_.empty())
       return false;
     cached_partial_.reset();
@@ -1832,77 +1787,96 @@ private:
     cached_completion_height_ = std::numeric_limits<std::size_t>::max();
 
     const auto adjacency_count = slices_.size() - 1U;
-    std::vector<TagPair> normal;
-    normal.reserve(slices_.size());
-    for(const auto& slice : slices_)
-      normal.emplace_back(slice.node_count());
-    account_tags(normal);
-
     const auto bcaf_window = geometry_.long_window();
     const bool bcaf_active = options_.bcaf && height_ >= bcaf_window;
+    const bool initialize_bcaf_clauses = bcaf_active && bcaf_clause_begin_depth_ == 0;
     const bool cache_partial =
       (options_.partial_mode == PartialMode::Every && height_ % static_cast<std::size_t>(options_.partial_every) == 0) ||
       (options_.partial_mode != PartialMode::None && options_.halt_height >= 0 && geometry_.w_position(height_) >= static_cast<std::size_t>(options_.halt_height));
-    std::vector<LeafTagPair> witness;
-    if(bcaf_active) {
-      witness.reserve(slices_.size());
-      for(const auto& slice : slices_)
-        witness.emplace_back(slice.leaf_begin(), slice.leaf_count());
-    }
-
     const bool cache_completion = bcaf_active && options_.detect_ends && geometry_.complete_tile(height_);
-    std::vector<LeafTagPair> completion_prefix;
-    if(cache_completion) {
-      completion_prefix.reserve(slices_.size());
-      for(const auto& slice : slices_)
-        completion_prefix.emplace_back(slice.leaf_begin(), slice.leaf_count());
+
+    std::vector<SweepSuffixLayout> suffix_layouts;
+    suffix_layouts.reserve(slices_.size());
+    for(const auto& slice : slices_) {
+      if(extend_trees) {
+        auto tree_layout = slice.expanded_native_layout();
+        if(initialize_bcaf_clauses) {
+          tree_layout.bcaf_first_child_depth = height_;
+          tree_layout.bcaf_parent_begin = slice.leaf_begin();
+          tree_layout.bcaf_byte_count = static_cast<std::size_t>(slice.leaf_count());
+        }
+        suffix_layouts.push_back(SweepSuffixLayout{tree_layout.node_count, slice.node_count(), 4U * slice.leaf_count(), bcaf_active, tree_layout});
+      } else {
+        suffix_layouts.push_back(SweepSuffixLayout{slice.node_count(), slice.leaf_begin(), slice.leaf_count(), bcaf_active, std::nullopt});
+      }
     }
-    peak_tag_bytes_ = std::max(peak_tag_bytes_, tag_bytes(normal) + tag_bytes(witness) + tag_bytes(completion_prefix));
+    SweepSpill suffix_store(options_.spill, suffix_layouts, row_spill_telemetry_);
+    const bool externalize_trees = extend_trees && suffix_store.active();
+    const bool trees_preexpanded = extend_trees && !externalize_trees;
+    if(trees_preexpanded)
+      expand_slice_tails();
 
-    mark_boundary(slices_.front(), options_.left_edge, true, normal.front()[0]);
-    mark_boundary(slices_.back(), options_.right_edge, false, normal.back()[1]);
+    // Prefix and completion planes are allocated just before their slice is
+    // reached and released as soon as that slice is reified. Suffix planes are
+    // leased from the residency layer and remain branch-free in hot code.
+    std::vector<TagPair> normal(slices_.size());
+    std::vector<LeafTagPair> witness(slices_.size());
+    std::vector<LeafTagPair> completion_prefix(slices_.size());
 
-    std::vector<LeafRange> local_prefix_uninteresting;
-    if(bcaf_active) {
-      phase("  implicit local-prefix-interest ranges");
-      local_prefix_uninteresting.reserve(slices_.size());
-      for(const auto& slice : slices_)
-        local_prefix_uninteresting.push_back(local_prefix_uninteresting_range(slice, bcaf_window));
-    }
+    std::vector<LeafRange> local_prefix_uninteresting(slices_.size());
+    std::vector<std::uint8_t> tree_prepared(slices_.size(), 0);
+    if(initialize_bcaf_clauses)
+      bcaf_clause_begin_depth_ = height_;
+    auto prepare_tree = [&](std::size_t position) {
+      if(tree_prepared[position])
+        return;
+      if(extend_trees && !trees_preexpanded)
+        slices_[position].expand_leaves();
+      if(initialize_bcaf_clauses)
+        slices_[position].initialize_bcaf_clauses(bcaf_clause_begin_depth_);
+      if(bcaf_active)
+        local_prefix_uninteresting[position] = local_prefix_uninteresting_range(slices_[position], bcaf_window);
+      tree_prepared[position] = 1;
+    };
 
-    auto seed_suffix = [&](std::size_t position) {
+    auto seed_suffix = [&](std::size_t position, SweepSuffixState& suffix) {
       if(!bcaf_active)
         return;
       const auto leaves = LeafRange{slices_[position].leaf_begin(), slices_[position].leaf_end()};
       const auto skip = local_prefix_uninteresting[position];
-      witness[position][1].or_source_range(normal[position][1], leaves.begin, skip.begin);
-      witness[position][1].or_source_range(normal[position][1], skip.end, leaves.end);
+      suffix.witness.or_source_range(suffix.normal, leaves.begin, skip.begin);
+      suffix.witness.or_source_range(suffix.normal, skip.end, leaves.end);
     };
 
     phase(bcaf_active ? "  implicit relation: right reach + bcaf suffix" : "  implicit relation: right reach");
-    seed_suffix(slices_.size() - 1U);
+    prepare_tree(slices_.size() - 1U);
+    SweepSuffixState right_suffix(suffix_layouts.back());
+    mark_boundary(slices_.back(), options_.right_edge, false, right_suffix.normal);
+    seed_suffix(slices_.size() - 1U, right_suffix);
     for(std::size_t i = adjacency_count; i > 0; --i) {
       const auto relation = i - 1U;
+      prepare_tree(relation);
+      SweepSuffixState left_suffix(suffix_layouts[relation]);
       if(expanded_uniform_tail_) {
         auto visit = [&]<bool AtomicWrites>(Node left_first, Node right_first, std::uint8_t active) {
-          const auto reaches_right = static_cast<std::uint8_t>(active & expand_right_edges(get_leaf_four(normal[i][1], right_first)));
+          const auto reaches_right = static_cast<std::uint8_t>(active & expand_right_edges(get_leaf_four(right_suffix.normal, right_first)));
           if(reaches_right == 0)
             return;
           const auto normal_output = project_left_edges(reaches_right);
           std::uint8_t witness_output = 0;
           if(bcaf_active) {
-            const auto witnessed = static_cast<std::uint8_t>(reaches_right & expand_right_edges(get_leaf_four(witness[i][1], right_first)));
+            const auto witnessed = static_cast<std::uint8_t>(reaches_right & expand_right_edges(get_leaf_four(right_suffix.witness, right_first)));
             witness_output = project_left_edges(witnessed);
           }
           if constexpr(AtomicWrites) {
             if(normal_output != 0)
-              atomic_set_leaf_four(normal[relation][1], left_first, normal_output);
+              atomic_set_leaf_four(left_suffix.normal, left_first, normal_output);
             if(witness_output != 0)
-              atomic_set_leaf_four(witness[relation][1], left_first, witness_output);
+              atomic_set_leaf_four(left_suffix.witness, left_first, witness_output);
           } else {
-            set_leaf_four(normal[relation][1], left_first, normal_output);
+            set_leaf_four(left_suffix.normal, left_first, normal_output);
             if(witness_output != 0)
-              set_leaf_four(witness[relation][1], left_first, witness_output);
+              set_leaf_four(left_suffix.witness, left_first, witness_output);
           }
         };
         if(can_walk_candidate_pair_batches_parallel(relation)) {
@@ -1917,15 +1891,45 @@ private:
         }
       } else {
         walk_candidate_pairs<false>(relation, [&](Node left_leaf, Node right_leaf, const auto&, bool) {
-          if(!normal[i][1].get(right_leaf))
+          if(!right_suffix.normal.get(right_leaf))
             return;
-          normal[relation][1].set(left_leaf);
-          if(bcaf_active && witness[i][1].get(right_leaf))
-            witness[relation][1].set(left_leaf);
+          left_suffix.normal.set(left_leaf);
+          if(bcaf_active && right_suffix.witness.get(right_leaf))
+            left_suffix.witness.set(left_leaf);
         });
       }
-      seed_suffix(relation);
+      seed_suffix(relation, left_suffix);
+      if(externalize_trees)
+        right_suffix.tree = std::move(slices_[i]).release_native();
+      suffix_store.submit(i, std::move(right_suffix));
+      right_suffix = std::move(left_suffix);
     }
+    if(externalize_trees)
+      right_suffix.tree = std::move(slices_.front()).release_native();
+    suffix_store.submit(0, std::move(right_suffix));
+    suffix_store.begin_forward();
+    auto current_suffix = suffix_store.acquire(0);
+    SweepSpill::Lease next_suffix;
+    if(adjacency_count != 0)
+      next_suffix = suffix_store.acquire(1);
+
+    auto restore_tree = [&](std::size_t position, SweepSpill::Lease& lease) {
+      if(!externalize_trees)
+        return;
+      if(!lease->tree)
+        throw std::logic_error("resident sweep record lost its slice tree");
+      slices_[position] = SuccinctSliceTree::from_native(std::move(*lease->tree));
+    };
+    restore_tree(0, current_suffix);
+    if(next_suffix)
+      restore_tree(1, next_suffix);
+
+    normal.front()[0].reset_size(slices_.front().node_count());
+    if(bcaf_active)
+      witness.front()[0] = LeafTags(slices_.front().leaf_begin(), slices_.front().leaf_count());
+    if(cache_completion)
+      completion_prefix.front() = LeafTagPair(slices_.front().leaf_begin(), slices_.front().leaf_count());
+    mark_boundary(slices_.front(), options_.left_edge, true, normal.front()[0]);
 
     auto seed_prefix = [&](std::size_t position) {
       if(!bcaf_active)
@@ -1937,16 +1941,16 @@ private:
     };
     seed_prefix(0);
 
-    auto live_leaf = [&](std::size_t position, Node leaf) {
-      const bool supported = normal[position][0].get(leaf) && normal[position][1].get(leaf);
-      return supported && (!bcaf_active || witness[position][0].get(leaf) || witness[position][1].get(leaf));
+    auto live_leaf = [&](std::size_t position, Node leaf, const SweepSuffixState& suffix) {
+      const bool supported = normal[position][0].get(leaf) && suffix.normal.get(leaf);
+      return supported && (!bcaf_active || witness[position][0].get(leaf) || suffix.witness.get(leaf));
     };
     Node partial_current = slices_.front().leaf_end();
     std::vector<std::vector<std::uint8_t>> partial_lineages;
     bool partial_seen = false;
     if(cache_partial) {
       for(Node leaf = slices_.front().leaf_begin(); leaf < slices_.front().leaf_end(); ++leaf) {
-        if(live_leaf(0, leaf)) {
+        if(live_leaf(0, leaf, current_suffix.state())) {
           partial_current = leaf;
           break;
         }
@@ -1959,7 +1963,7 @@ private:
     }
     if(cache_completion) {
       for(Node leaf = slices_.front().leaf_begin(); leaf < slices_.front().leaf_end(); ++leaf) {
-        if(live_leaf(0, leaf))
+        if(live_leaf(0, leaf, current_suffix.state()))
           completion_prefix.front()[0].set(leaf);
       }
     }
@@ -1988,8 +1992,91 @@ private:
       output.append_implicit_ones(count);
     };
 
-    phase(bcaf_active ? "  implicit relation: left reach + bcaf prefix/index" : "  implicit relation: left reach/index");
+    if(bcaf_active && bcaf_clause_begin_depth_ == 0) {
+      bcaf_clause_begin_depth_ = height_;
+      for(auto& slice : slices_)
+        slice.initialize_bcaf_clauses(bcaf_clause_begin_depth_);
+    }
+
+    auto account_rolling_tags = [&](const SweepSpill::Lease& suffix, const SweepSpill::Lease& next) {
+      auto bytes = tag_bytes(normal) + tag_bytes(witness) + tag_bytes(completion_prefix);
+      if(suffix)
+        bytes += suffix->allocated_bytes();
+      if(next)
+        bytes += next->allocated_bytes();
+      peak_tag_bytes_ = std::max(peak_tag_bytes_, bytes);
+    };
+
+    auto finalize_slice = [&](std::size_t position, const SweepSuffixState& suffix) {
+      auto& tree = slices_[position];
+      auto& keep = normal[position][0];
+
+      if(bcaf_active && !expanded_uniform_tail_) {
+        const auto parent_begin = tree.level_begin(tree.depth() - 1U);
+        for(Node parent = parent_begin; parent < tree.leaf_begin(); ++parent) {
+          const auto children = tree.child_block(parent);
+          auto child = children.first;
+          std::uint8_t clauses = 0;
+          for(std::uint8_t label = 0; label < 4; ++label) {
+            if((children.mask & (1U << label)) == 0)
+              continue;
+            if(witness[position][0].get(child))
+              clauses = static_cast<std::uint8_t>(clauses | (1U << label));
+            if(suffix.witness.get(child))
+              clauses = static_cast<std::uint8_t>(clauses | (1U << (label + 4U)));
+            ++child;
+          }
+          tree.set_bcaf_child_clauses(parent, clauses);
+        }
+      }
+
+      constexpr std::size_t keep_words_per_task = 4096;
+      std::vector<BcafKeepRange> ranges;
+      const auto begin = tree.leaf_begin();
+      const auto end = tree.leaf_end();
+      const auto first_word = static_cast<std::size_t>(begin >> 6U);
+      const auto past_word = static_cast<std::size_t>((end + 63U) >> 6U);
+      for(auto word = first_word; word < past_word; word += keep_words_per_task) {
+        ranges.push_back(BcafKeepRange{
+          position,
+          std::max<Node>(begin, static_cast<Node>(word) * 64U),
+          std::min<Node>(end, static_cast<Node>(word + keep_words_per_task) * 64U),
+        });
+      }
+      RollingKeepContext keep_context{
+        this,
+        position,
+        &keep,
+        &suffix.normal,
+        bcaf_active ? &witness[position][0] : nullptr,
+        bcaf_active ? &suffix.witness : nullptr,
+        &ranges,
+        bcaf_active,
+      };
+      if(options_.worker_count > 1 && ranges.size() > 1)
+        execute_indexed_tasks(ranges.size(), options_.worker_count, &keep_context, &execute_rolling_keep_range);
+      else
+        for(std::size_t task = 0; task < ranges.size(); ++task)
+          execute_rolling_keep_range(&keep_context, task, 0);
+
+      const bool retained = tree.reify_parallel(keep, options_.worker_count);
+      normal[position] = TagPair{};
+      witness[position] = LeafTagPair{};
+      completion_prefix[position] = LeafTagPair{};
+      return retained;
+    };
+
+    account_rolling_tags(current_suffix, next_suffix);
+
+    phase(bcaf_active ? "  implicit relation: left reach + bcaf prefix/index + slice reification"
+                      : "  implicit relation: left reach/index + slice reification");
     for(std::size_t i = 0; i < adjacency_count; ++i) {
+      suffix_store.at_forward_step(i);
+      normal[i + 1U][0].reset_size(slices_[i + 1U].node_count());
+      if(bcaf_active)
+        witness[i + 1U][0] = LeafTags(slices_[i + 1U].leaf_begin(), slices_[i + 1U].leaf_count());
+      if(cache_completion)
+        completion_prefix[i + 1U] = LeafTagPair(slices_[i + 1U].leaf_begin(), slices_[i + 1U].leaf_count());
       const auto absent_partial = slices_[i + 1U].leaf_end();
       auto partial_next = absent_partial;
       auto consider_partial_batch = [&](Node left_first, Node right_first, std::uint8_t final_edges, Node& candidate) {
@@ -2000,7 +2087,7 @@ private:
         while(remaining != 0) {
           const auto position = static_cast<std::uint8_t>(std::countr_zero(static_cast<unsigned>(remaining)));
           const auto right_leaf = right_first + (position & 0b11U);
-          if(!bcaf_active || partial_seen || witness[i + 1U][1].get(right_leaf)) {
+          if(!bcaf_active || partial_seen || next_suffix->witness.get(right_leaf)) {
             candidate = right_leaf;
             return;
           }
@@ -2012,12 +2099,12 @@ private:
         if(reaches_left == 0)
           return std::uint8_t{0};
         const auto normal_output = project_right_edges(reaches_left);
-        const auto normal_edges = static_cast<std::uint8_t>(reaches_left & expand_right_edges(get_leaf_four(normal[i + 1U][1], right_first)));
+        const auto normal_edges = static_cast<std::uint8_t>(reaches_left & expand_right_edges(get_leaf_four(next_suffix->normal, right_first)));
         std::uint8_t prefix_output = 0;
         auto final_edges = normal_edges;
         if(bcaf_active && normal_edges != 0) {
           const auto prefix_edges = expand_left_edges(get_leaf_four(witness[i][0], left_first));
-          const auto suffix_edges = expand_right_edges(get_leaf_four(witness[i + 1U][1], right_first));
+          const auto suffix_edges = expand_right_edges(get_leaf_four(next_suffix->witness, right_first));
           prefix_output = project_right_edges(static_cast<std::uint8_t>(normal_edges & prefix_edges));
           final_edges = static_cast<std::uint8_t>(normal_edges & (prefix_edges | suffix_edges));
         }
@@ -2139,14 +2226,14 @@ private:
           if(!normal[i][0].get(left_leaf))
             return;
           normal[i + 1U][0].set(right_leaf);
-          const bool normal_edge = normal[i + 1U][1].get(right_leaf);
+          const bool normal_edge = next_suffix->normal.get(right_leaf);
           if(!normal_edge)
             return;
           bool final_edge = true;
           if(bcaf_active) {
             if(witness[i][0].get(left_leaf))
               witness[i + 1U][0].set(right_leaf);
-            final_edge = witness[i][0].get(left_leaf) || witness[i + 1U][1].get(right_leaf);
+            final_edge = witness[i][0].get(left_leaf) || next_suffix->witness.get(right_leaf);
           }
           if(!final_edge)
             return;
@@ -2164,7 +2251,7 @@ private:
             next_gates[i].add_index_path(next_gates[i].size(), history.data(), height_);
           next_gates[i].push_back(true);
           if constexpr(CapturePartial) {
-            if(partial_next == absent_partial && left_leaf == partial_current && (!bcaf_active || partial_seen || witness[i + 1U][1].get(right_leaf)))
+            if(partial_next == absent_partial && left_leaf == partial_current && (!bcaf_active || partial_seen || next_suffix->witness.get(right_leaf)))
               partial_next = right_leaf;
           }
         };
@@ -2196,6 +2283,16 @@ private:
         partial_lineages.push_back(slices_[i + 1U].lineage(partial_current));
         partial_seen = partial_seen || !bcaf_active || labels_prefix_interesting(partial_lineages.back(), bcaf_window);
       }
+      account_rolling_tags(current_suffix, next_suffix);
+      if(!finalize_slice(i, current_suffix.state()))
+        return false;
+      if(pair_gates_ready_)
+        pair_gates_[i] = PairGate{};
+      current_suffix = std::move(next_suffix);
+      if(i + 2U < slices_.size()) {
+        next_suffix = suffix_store.acquire(i + 2U);
+        restore_tree(i + 2U, next_suffix);
+      }
     }
     if(cache_partial) {
       if(bcaf_active && !partial_seen)
@@ -2205,7 +2302,7 @@ private:
     bool completion_found = false;
     if(cache_completion) {
       walk_leaves(slices_.back(), [&](Node leaf, std::size_t, std::size_t last_nonzero) {
-        if(completion_found || !live_leaf(slices_.size() - 1U, leaf) || !completion_prefix.back()[0].get(leaf))
+        if(completion_found || !live_leaf(slices_.size() - 1U, leaf, current_suffix.state()) || !completion_prefix.back()[0].get(leaf))
           return;
         const bool local_valid = last_nonzero == std::numeric_limits<std::size_t>::max() || last_nonzero < short_start;
         const bool local_interesting = last_nonzero != std::numeric_limits<std::size_t>::max() && last_nonzero >= long_start;
@@ -2215,97 +2312,12 @@ private:
         cached_completion_height_ = height_;
     }
 
-    if(normal.front()[0].count(slices_.front().leaf_begin(), slices_.front().leaf_end()) == 0 ||
-       normal.front()[1].count(slices_.front().leaf_begin(), slices_.front().leaf_end()) == 0) {
+    account_rolling_tags(current_suffix, next_suffix);
+    if(!finalize_slice(slices_.size() - 1U, current_suffix.state()))
       return false;
-    }
-
-    if(bcaf_active) {
-      if(bcaf_clause_begin_depth_ == 0) {
-        bcaf_clause_begin_depth_ = height_;
-        for(auto& slice : slices_)
-          slice.initialize_bcaf_clauses(bcaf_clause_begin_depth_);
-      }
-      if(!expanded_uniform_tail_) {
-        for(std::size_t position = 0; position < slices_.size(); ++position) {
-          auto& tree = slices_[position];
-          const auto parent_begin = tree.level_begin(tree.depth() - 1U);
-          for(Node parent = parent_begin; parent < tree.leaf_begin(); ++parent) {
-            const auto children = tree.child_block(parent);
-            auto child = children.first;
-            std::uint8_t clauses = 0;
-            for(std::uint8_t label = 0; label < 4; ++label) {
-              if((children.mask & (1U << label)) == 0)
-                continue;
-              if(witness[position][0].get(child))
-                clauses = static_cast<std::uint8_t>(clauses | (1U << label));
-              if(witness[position][1].get(child))
-                clauses = static_cast<std::uint8_t>(clauses | (1U << (label + 4U)));
-              ++child;
-            }
-            tree.set_bcaf_child_clauses(parent, clauses);
-          }
-        }
-      }
-    }
-
-    phase("  implicit slice reification");
+    current_suffix = SweepSpill::Lease{};
     if(pair_gates_ready_)
       pair_gates_.clear();
-    std::vector<LeafTagPair>().swap(completion_prefix);
-    const bool parallel_reification = bcaf_active && options_.worker_count > 1 && !options_.verbose;
-    if(parallel_reification) {
-      constexpr std::size_t keep_words_per_task = 4096;
-      std::vector<BcafKeepRange> ranges;
-      for(std::size_t position = 0; position < slices_.size(); ++position) {
-        const auto begin = slices_[position].leaf_begin();
-        const auto end = slices_[position].leaf_end();
-        const auto first_word = static_cast<std::size_t>(begin >> 6U);
-        const auto past_word = static_cast<std::size_t>((end + 63U) >> 6U);
-        for(auto word = first_word; word < past_word; word += keep_words_per_task) {
-          ranges.push_back(BcafKeepRange{
-            position,
-            std::max<Node>(begin, static_cast<Node>(word) * 64U),
-            std::min<Node>(end, static_cast<Node>(word + keep_words_per_task) * 64U),
-          });
-        }
-      }
-      BcafKeepContext keep_context{this, &normal, &witness, &ranges};
-      execute_indexed_tasks(ranges.size(), options_.worker_count, &keep_context, &execute_bcaf_keep_range);
-      for(std::size_t position = 0; position < slices_.size(); ++position) {
-        normal[position][1] = PackedTags{};
-        witness[position] = LeafTagPair{};
-      }
-      std::vector<SuccinctSliceTree*> trees;
-      std::vector<PackedTags*> keeps;
-      trees.reserve(slices_.size());
-      keeps.reserve(slices_.size());
-      for(std::size_t position = 0; position < slices_.size(); ++position) {
-        trees.push_back(&slices_[position]);
-        keeps.push_back(&normal[position][0]);
-      }
-      if(!SuccinctSliceTree::reify_parallel_group(trees, keeps, options_.worker_count))
-        return false;
-      for(auto& tags : normal)
-        tags[0] = PackedTags{};
-    } else {
-      for(std::size_t i = 0; i < slices_.size(); ++i) {
-        auto& keep = normal[i][0];
-        const auto leaf_begin = slices_[i].leaf_begin();
-        const auto parent_begin = slices_[i].level_begin(slices_[i].depth() - 1U);
-        for(Node leaf = slices_[i].leaf_begin(); leaf < slices_[i].leaf_end(); ++leaf) {
-          if(bcaf_active && expanded_uniform_tail_ && ((leaf - leaf_begin) & 3U) == 0) {
-            const auto parent = parent_begin + (leaf - leaf_begin) / 4U;
-            const auto prefix_four = witness[i][0].get_4(leaf);
-            const auto suffix_four = witness[i][1].get_4(leaf);
-            slices_[i].set_bcaf_child_clauses_unchecked(parent, static_cast<std::uint8_t>(prefix_four | (suffix_four << 4U)));
-          }
-          keep.set(leaf, live_leaf(i, leaf));
-        }
-        if(!slices_[i].reify(keep))
-          return false;
-      }
-    }
 
     pair_gates_ = std::move(next_gates);
     pair_gate_depth_ = height_;
@@ -2750,7 +2762,20 @@ private:
            << " level_bytes=" << levels << " allocated_bytes=" << allocated << " pair_gate_bytes=" << pair_gate_bytes << " lookup_bytes=" << lookup_bytes
            << " persistent_payload_bytes=" << persistent_payload_bytes << " pair_candidates=" << pair_candidates << " pair_allowed=" << pair_allowed
            << " tag_peak_bytes=" << peak_tag_bytes_ << " pair_states=" << pair_states_ << " pair_leaves=" << pair_leaves_
-           << " boundary_states=" << boundary_states_ << " seconds=" << std::fixed << std::setprecision(6) << seconds << " slice_nodes=" << per_slice.str()
+           << " boundary_states=" << boundary_states_ << " spill_active=" << (row_spill_telemetry_.activated ? 1 : 0)
+           << " spill_direct_io=" << (row_spill_telemetry_.direct_io ? 1 : 0)
+           << " spill_write_bytes=" << row_spill_telemetry_.logical_bytes_written << " spill_read_bytes=" << row_spill_telemetry_.logical_bytes_read
+           << " spill_physical_write_bytes=" << row_spill_telemetry_.physical_bytes_written
+           << " spill_physical_read_bytes=" << row_spill_telemetry_.physical_bytes_read
+           << " spill_records_written=" << row_spill_telemetry_.records_written
+           << " spill_records_read=" << row_spill_telemetry_.records_read
+           << " spill_turnaround_bytes=" << row_spill_telemetry_.turnaround_retained_bytes
+           << " spill_resident_peak_bytes=" << row_spill_telemetry_.peak_resident_bytes
+           << " spill_write_seconds=" << std::fixed << std::setprecision(6) << row_spill_telemetry_.write_seconds
+           << " spill_read_seconds=" << row_spill_telemetry_.read_seconds
+           << " spill_read_wait_seconds=" << row_spill_telemetry_.main_read_wait_seconds
+           << " spill_write_wait_seconds=" << row_spill_telemetry_.main_write_wait_seconds
+           << " seconds=" << seconds << " slice_nodes=" << per_slice.str()
            << " slice_leaves=" << per_slice_leaves.str() << " slice_state=" << slice_state.str();
     } else {
       std::uint64_t maxrss = getMaxRSS();
@@ -2763,6 +2788,14 @@ private:
       }
       line << ", " << nodes << " nodes, mem " << integer_format(persistent_payload_bytes) << "iB, " << maxrss_display << "sec " << std::fixed
            << std::setprecision(6) << seconds << ", cols: " << slice_state.str();
+      if(row_spill_telemetry_.activated) {
+        line << ", spill W/R " << integer_format(row_spill_telemetry_.logical_bytes_written) << "/"
+             << integer_format(row_spill_telemetry_.logical_bytes_read) << "iB, read-wait " << std::fixed << std::setprecision(3)
+             << row_spill_telemetry_.main_read_wait_seconds << "sec, write-wait " << row_spill_telemetry_.main_write_wait_seconds
+             << "sec, record-resident-peak " << integer_format(row_spill_telemetry_.peak_resident_bytes) << "iB, io-write/read "
+             << row_spill_telemetry_.write_seconds << "/" << row_spill_telemetry_.read_seconds << "sec, direct="
+             << (row_spill_telemetry_.direct_io ? "yes" : "no");
+      }
     }
     std::cerr << line.str() << '\n';
     if(stats_file_) {
@@ -2793,6 +2826,7 @@ private:
   std::uint64_t pair_leaves_ = 0;
   std::uint64_t boundary_states_ = 0;
   std::size_t peak_tag_bytes_ = 0;
+  SweepSpillTelemetry row_spill_telemetry_;
   bool running_ = false;
   bool expanded_uniform_tail_ = false;
   std::optional<Board> cached_partial_;

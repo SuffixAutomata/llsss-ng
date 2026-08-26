@@ -230,6 +230,11 @@ public:
 
   [[nodiscard]] const std::vector<std::uint64_t>& checkpoint_words() const noexcept { return words_; }
 
+  // Native temporary sweep files read directly into an already-sized plane.
+  // The spill layer validates the logical size and padding before returning
+  // ownership to search code; ordinary callers should use the bit methods.
+  [[nodiscard]] std::vector<std::uint64_t>& native_io_words() noexcept { return words_; }
+
   static PackedTags from_checkpoint(std::uint64_t bit_count, std::vector<std::uint64_t> words) {
     if(words.size() != word_count(bit_count)) {
       throw std::runtime_error("invalid packed tags in checkpoint");
@@ -307,6 +312,42 @@ struct TagPair {
 class SuccinctSliceTree {
 public:
   using Node = std::uint64_t;
+
+  struct NativeLayout {
+    std::size_t word_count = 0;
+    std::size_t absolute_rank_count = 0;
+    std::size_t relative_rank_count = 0;
+    std::size_t level_count = 0;
+    std::size_t bcaf_byte_count = 0;
+    std::size_t bcaf_first_child_depth = 0;
+    Node bcaf_parent_begin = 0;
+    Node node_count = 0;
+    std::size_t depth = 0;
+
+    [[nodiscard]] std::uint64_t byte_count() const {
+      std::uint64_t result = 0;
+      auto add = [&](std::size_t count, std::size_t width) {
+        if(count > std::numeric_limits<std::uint64_t>::max() / width || result > std::numeric_limits<std::uint64_t>::max() - count * width)
+          throw std::overflow_error("native slice-tree image is too large");
+        result += count * width;
+      };
+      add(word_count, sizeof(std::uint64_t));
+      add(absolute_rank_count, sizeof(std::uint64_t));
+      add(relative_rank_count, sizeof(std::uint16_t));
+      add(level_count, sizeof(Node));
+      add(bcaf_byte_count, sizeof(std::uint8_t));
+      return result;
+    }
+  };
+
+  struct NativeImage {
+    NativeLayout layout;
+    std::vector<std::uint64_t> words;
+    std::vector<std::uint64_t> absolute_rank;
+    std::vector<std::uint16_t> relative_rank;
+    std::vector<Node> levels;
+    std::vector<std::uint8_t> bcaf_bytes;
+  };
 
   struct ChildBlock {
     Node first = 0;
@@ -866,6 +907,85 @@ public:
   [[nodiscard]] std::size_t allocated_bytes() const noexcept {
     return words_.capacity() * sizeof(std::uint64_t) + absolute_rank_.capacity() * sizeof(std::uint64_t) + relative_rank_.capacity() * sizeof(std::uint16_t) +
            level_begin_.capacity() * sizeof(Node) + bcaf_child_clauses_.capacity();
+  }
+
+  [[nodiscard]] NativeLayout native_layout() const {
+    return NativeLayout{
+      words_.size(),
+      absolute_rank_.size(),
+      relative_rank_.size(),
+      level_begin_.size(),
+      bcaf_child_clauses_.size(),
+      bcaf_first_child_depth_,
+      bcaf_parent_begin_,
+      node_count_,
+      depth_,
+    };
+  }
+
+  [[nodiscard]] NativeLayout expanded_native_layout() const {
+    validate_bcaf_clauses();
+    const auto leaves = leaf_count();
+    if(leaves > (std::numeric_limits<Node>::max() - node_count_) / 4U)
+      throw std::overflow_error("slice tree is too large");
+    const auto expanded_nodes = node_count_ + 4U * leaves;
+    const auto expanded_words = word_count_for_nodes(expanded_nodes);
+    const auto absolute_count = (expanded_words + words_per_absolute_chunk - 1U) / words_per_absolute_chunk;
+    const auto expanded_bcaf = bcaf_clauses_present() ? bcaf_child_clauses_.size() + checked_byte_count(leaves) : 0U;
+    return NativeLayout{
+      expanded_words,
+      absolute_count,
+      expanded_words,
+      level_begin_.size() + 1U,
+      expanded_bcaf,
+      bcaf_first_child_depth_,
+      bcaf_parent_begin_,
+      expanded_nodes,
+      depth_ + 1U,
+    };
+  }
+
+  [[nodiscard]] NativeImage release_native() && {
+    validate_bcaf_clauses();
+    NativeImage image;
+    image.layout = native_layout();
+    image.words = std::move(words_);
+    image.absolute_rank = std::move(absolute_rank_);
+    image.relative_rank = std::move(relative_rank_);
+    image.levels = std::move(level_begin_);
+    image.bcaf_bytes = std::move(bcaf_child_clauses_);
+    return image;
+  }
+
+  static NativeImage allocate_native_image(const NativeLayout& layout) {
+    NativeImage image;
+    image.layout = layout;
+    image.words.resize(layout.word_count);
+    image.absolute_rank.resize(layout.absolute_rank_count);
+    image.relative_rank.resize(layout.relative_rank_count);
+    image.levels.resize(layout.level_count);
+    image.bcaf_bytes.resize(layout.bcaf_byte_count);
+    return image;
+  }
+
+  static SuccinctSliceTree from_native(NativeImage image) {
+    const auto& layout = image.layout;
+    if(image.words.size() != layout.word_count || image.absolute_rank.size() != layout.absolute_rank_count ||
+       image.relative_rank.size() != layout.relative_rank_count || image.levels.size() != layout.level_count || image.bcaf_bytes.size() != layout.bcaf_byte_count ||
+       layout.node_count == 0 || layout.level_count != layout.depth + 2U || image.levels.empty() || image.levels.front() != 0 || image.levels.back() != layout.node_count)
+      throw std::runtime_error("invalid native slice-tree image");
+    SuccinctSliceTree result;
+    result.words_ = std::move(image.words);
+    result.absolute_rank_ = std::move(image.absolute_rank);
+    result.relative_rank_ = std::move(image.relative_rank);
+    result.level_begin_ = std::move(image.levels);
+    result.bcaf_child_clauses_ = std::move(image.bcaf_bytes);
+    result.bcaf_first_child_depth_ = layout.bcaf_first_child_depth;
+    result.bcaf_parent_begin_ = layout.bcaf_parent_begin;
+    result.node_count_ = layout.node_count;
+    result.depth_ = layout.depth;
+    result.validate_bcaf_clauses();
+    return result;
   }
 
   // The child bitstream and level boundaries are the complete non-derived
