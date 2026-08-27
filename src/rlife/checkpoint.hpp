@@ -7,7 +7,7 @@ namespace rlife::llsss {
 inline constexpr std::array<std::uint8_t, 16> checkpoint_magic_ = {
     'R', 'L', 'I', 'F', 'E', '-', 'L', 'L', 'S', 'S', 'S', '-', 'C', 'P', 0, 1,
 };
-inline constexpr std::uint32_t checkpoint_version_ = 6;
+inline constexpr std::uint32_t checkpoint_version_ = 7;
 inline constexpr std::uint32_t oldest_checkpoint_version_ = 4;
 inline constexpr std::size_t checkpoint_buffer_size_ = 8U * 1024U * 1024U;
 
@@ -222,6 +222,7 @@ inline void Solver::write_config(CheckpointWriter& output, const Options& option
   output.u64(static_cast<std::uint64_t>(options.save_every));
   output.string(options.savedir);
   output.string(options.search_name);
+  output.u64(options.max_rss_bytes);
 }
 
 inline int Solver::checkpoint_positive_int(CheckpointReader& input, std::string_view field) {
@@ -284,6 +285,7 @@ inline Options Solver::read_config(CheckpointReader& input, std::uint32_t checkp
       options.savedir = ".";
   }
   options.search_name = checkpoint_version >= 5U ? input.string() : "save";
+  options.max_rss_bytes = checkpoint_version >= 7U ? input.u64() : 0U;
   if(options.rule.empty() || options.geometry.empty() || options.start.empty() || options.savedir.empty()) {
     throw std::runtime_error("checkpoint configuration has an empty required value");
   }
@@ -319,6 +321,7 @@ inline void Solver::merge_checkpoint_config(const Options& saved) {
   merge_mutable(command_line, saved, "phase_progress", &Options::phase_progress);
   merge_mutable(command_line, saved, "threads", &Options::worker_count);
   merge_mutable(command_line, saved, "halt_height", &Options::halt_height);
+  merge_mutable(command_line, saved, "max_rss", &Options::max_rss_bytes);
   if(!command_line.explicitly_set.contains("partials")) {
     options_.partial_mode = saved.partial_mode;
     options_.partial_every = saved.partial_every;
@@ -550,22 +553,104 @@ inline void Solver::save_checkpoint() {
   std::cout << "checkpoint saved: " << path.string() << '\n';
 }
 
-inline int Solver::finish(int status) {
+inline void Solver::write_status(std::string_view reason, int exit_status) const {
+  if(options_.status_output.empty())
+    return;
+  const std::filesystem::path path(options_.status_output);
+  if(last_checkpoint_height_ == height_ && paths_alias(path, checkpoint_path()))
+    throw std::runtime_error("status output would overwrite the completed checkpoint");
+  auto temporary = path;
+  temporary += ".tmp";
+  if((last_checkpoint_height_ == height_ && paths_alias(temporary, checkpoint_path())) || paths_alias(temporary, options_.loadfile) ||
+     paths_alias(temporary, partition_specfile_) || paths_alias(temporary, options_.partial_output) || paths_alias(temporary, options_.stats_output)) {
+    throw std::runtime_error("status temporary output would overwrite another search artifact");
+  }
+  std::ofstream output(temporary, std::ios::out | std::ios::trunc);
+  if(!output)
+    throw std::runtime_error("cannot open status output: " + temporary.string());
+  auto json_string = [&](std::string_view value) {
+    output << '"';
+    constexpr char hex[] = "0123456789abcdef";
+    for(const unsigned char ch : value) {
+      switch(ch) {
+      case '"': output << "\\\""; break;
+      case '\\': output << "\\\\"; break;
+      case '\b': output << "\\b"; break;
+      case '\f': output << "\\f"; break;
+      case '\n': output << "\\n"; break;
+      case '\r': output << "\\r"; break;
+      case '\t': output << "\\t"; break;
+      default:
+        if(ch < 0x20U)
+          output << "\\u00" << hex[ch >> 4U] << hex[ch & 0x0fU];
+        else
+          output << static_cast<char>(ch);
+      }
+    }
+    output << '"';
+  };
+
+  output << "{\n  \"version\": 1,\n  \"reason\": ";
+  json_string(reason);
+  output << ",\n  \"exit_status\": " << exit_status << ",\n  \"height\": " << height_ << ",\n  \"w_position\": " << geometry_.w_position(height_)
+         << ",\n  \"position\": ";
+  json_string(geometry_.position_string(height_));
+  output << ",\n  \"search_name\": ";
+  json_string(options_.search_name);
+  output << ",\n  \"exhausted\": " << (exhausted_ ? "true" : "false") << ",\n  \"completion\": "
+         << (completion_at_current_row_ ? "true" : "false") << ",\n  \"partition_pending\": "
+         << (options_.partition_constraint.has_value() ? "true" : "false") << ",\n  \"max_rss_bytes\": " << getMaxRSS()
+         << ",\n  \"memory_cap_bytes\": " << options_.max_rss_bytes << ",\n  \"halt_w_position\": ";
+  if(options_.halt_height < 0)
+    output << "null";
+  else
+    output << options_.halt_height;
+  output << ",\n  \"checkpoint\": ";
+  if(last_checkpoint_height_ == height_) {
+    json_string(std::filesystem::absolute(checkpoint_path()).lexically_normal().string());
+  } else {
+    output << "null";
+  }
+  output << "\n}\n";
+  output.close();
+  if(!output)
+    throw std::runtime_error("cannot finish status output: " + temporary.string());
+  std::error_code error;
+  std::filesystem::rename(temporary, path, error);
+  if(error) {
+    // rename() does not replace an existing destination on every supported
+    // platform.  Status files are explicit disposable outputs, so use the
+    // non-atomic fallback only there.
+    error.clear();
+    if(std::filesystem::is_directory(path, error) && !error)
+      throw std::runtime_error("status output path is a directory: " + path.string());
+    error.clear();
+    std::filesystem::remove(path, error);
+    error.clear();
+    std::filesystem::rename(temporary, path, error);
+  }
+  if(error)
+    throw std::runtime_error("cannot replace status output " + path.string() + ": " + error.message());
+}
+
+inline int Solver::finish(int status, std::string_view reason) {
   if(options_.save_mode != SaveMode::None)
     save_checkpoint();
+  write_status(reason, status);
   return status;
 }
 
 inline int Solver::finish_interrupted() {
   if(options_.partition_constraint.has_value()) {
     std::cout << "interrupt requested before the pending partition restriction was applied; exiting without checkpoint\n";
+    write_status("interrupted", 130);
     return 130;
   }
   if(options_.save_mode == SaveMode::None)
     std::cout << "interrupt requested after completed row " << height_ << "; exiting without checkpoint\n";
   else
     std::cout << "interrupt requested; saving completed row " << height_ << " and exiting\n";
-  return finish(130);
+  return finish(130, "interrupted");
 }
 
 } // namespace rlife::llsss

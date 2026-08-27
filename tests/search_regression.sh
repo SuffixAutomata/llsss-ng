@@ -182,6 +182,31 @@ grep -Fq 'geometry has too many lattice subtiles' "$test_tmp/huge.err"
 test -s "$test_tmp/checkpoint_12"
 grep -Fq "checkpoint saved: $test_tmp/checkpoint_12" "$test_tmp/checkpoint.out"
 
+# The peak-RSS cap is a soft row-boundary stop, is persisted in checkpoints,
+# and has a structured result so orchestration never needs to scrape logs.
+mkdir "$test_tmp/soft-cap"
+"$binary" llsss --load "$test_tmp/checkpoint_12" --halts w_pos:13 \
+  --max-memory 1 --partials none --ends none --save final \
+  --savedir "$test_tmp/soft-cap" --search-name capped \
+  --status-output "$test_tmp/soft-cap/status.json" \
+  >"$test_tmp/soft-cap.out" 2>"$test_tmp/soft-cap.err"
+grep -Fq 'soft memory cap reached at checkpointable row 12' "$test_tmp/soft-cap.out"
+grep -Fq '"reason": "memory_cap"' "$test_tmp/soft-cap/status.json"
+grep -Fq '"memory_cap_bytes": 1' "$test_tmp/soft-cap/status.json"
+test -s "$test_tmp/soft-cap/capped_12"
+"$binary" llsss --load "$test_tmp/soft-cap/capped_12" \
+  --partials none --ends none --save none \
+  --status-output "$test_tmp/soft-cap/inherited.json" \
+  >"$test_tmp/soft-cap-inherited.out" 2>"$test_tmp/soft-cap-inherited.err"
+grep -Fq '"reason": "memory_cap"' "$test_tmp/soft-cap/inherited.json"
+grep -Fq '"height": 12' "$test_tmp/soft-cap/inherited.json"
+"$binary" llsss --load "$test_tmp/soft-cap/capped_12" --max-memory none \
+  --halts w_pos:13 --partials none --ends none --save none \
+  --status-output "$test_tmp/soft-cap/resumed.json" \
+  >"$test_tmp/soft-cap-resumed.out" 2>"$test_tmp/soft-cap-resumed.err"
+grep -Fq '"reason": "halt"' "$test_tmp/soft-cap/resumed.json"
+grep -Fq '"height": 13' "$test_tmp/soft-cap/resumed.json"
+
 "$binary" llsss --load "$test_tmp/checkpoint_12" --partials none --save none \
   >"$test_tmp/reload.out" 2>"$test_tmp/reload.err"
 grep -Fq 'checkpoint loaded:' "$test_tmp/reload.out"
@@ -198,6 +223,53 @@ fi
 sed -n 's/^.*cols: //p' "$test_tmp/resume.err" >"$test_tmp/resume.cols"
 sed -n 's/^.*cols: //p' "$test_tmp/uninterrupted.err" | tail -n 5 >"$test_tmp/uninterrupted.cols"
 cmp "$test_tmp/resume.cols" "$test_tmp/uninterrupted.cols"
+
+# The process manager must force a split at the cap, materialize all children,
+# visit them depth-first, carry the original hard halt forward, and combine
+# branch partials in a durable top-level artifact.
+manager="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts/rlife_manager.py"
+"$manager" start "$test_tmp/managed" --binary "$binary" --max-memory 1 \
+  --parts 3 --boundary-slack 0 -- \
+  --load "$test_tmp/checkpoint_12" --halts w_pos:13 \
+  --partials final --ends none \
+  >"$test_tmp/managed.out" 2>"$test_tmp/managed.err"
+grep -Fq '"state": "complete"' "$test_tmp/managed/state.json"
+grep -Fq '"outcome": "halt"' "$test_tmp/managed/state.json"
+[[ $(grep -RFl '"reason": "row_limit"' "$test_tmp/managed/partitions" | wc -l) == 3 ]]
+[[ $(grep -c '^#C llsss memory ' "$test_tmp/managed/results.rle") == 1 ]]
+[[ $(grep -c '^#C llsss partition ' "$test_tmp/managed/results.rle") == 3 ]]
+"$manager" status "$test_tmp/managed" >"$test_tmp/managed-status.out"
+grep -Fq 'manager state=complete outcome=halt' "$test_tmp/managed-status.out"
+
+# A completion can first appear in the mandatory materialization row.  It must
+# be transmitted to the combined result and stop the managed search under the
+# inherited default halt-on-end policy; an exhausted sibling remains distinct.
+mkdir "$test_tmp/managed-completion-source"
+"$binary" llsss --rule B3/S23 --left-edge bg --filters bcaf \
+  --partials none --halts w_pos:23 --save final \
+  --savedir "$test_tmp/managed-completion-source" --search-name source \
+  c4d-f2b '@bg(6)' \
+  >"$test_tmp/managed-completion-source.out" 2>"$test_tmp/managed-completion-source.err"
+"$binary" partition --load "$test_tmp/managed-completion-source/source_46" \
+  --parts 2 --search-name seed --output "$test_tmp/managed-completion-seed" \
+  --materialize -- --partials none \
+  >"$test_tmp/managed-completion-seed.out" 2>"$test_tmp/managed-completion-seed.err"
+"$manager" start "$test_tmp/managed-main-completion" --binary "$binary" \
+  --max-memory 1TiB --parts 2 -- \
+  --load "$test_tmp/managed-completion-seed/seed-1_47" --partials none \
+  >"$test_tmp/managed-main-completion.out" 2>"$test_tmp/managed-main-completion.err"
+grep -Fq '"outcome": "completion"' "$test_tmp/managed-main-completion/state.json"
+grep -Fq '"reason": "completion"' "$test_tmp/managed-main-completion/attempts/00000001.status.json"
+[[ $(grep -c '^#C llsss completion ' "$test_tmp/managed-main-completion/results.rle") == 1 ]]
+"$manager" start "$test_tmp/managed-completion" --binary "$binary" \
+  --max-memory 1 --parts 2 -- \
+  --load "$test_tmp/managed-completion-seed/seed-1_47" --partials none \
+  >"$test_tmp/managed-completion.out" 2>"$test_tmp/managed-completion.err"
+grep -Fq '"outcome": "completion"' "$test_tmp/managed-completion/state.json"
+grep -Fq '"completion": 1' "$test_tmp/managed-completion/state.json"
+grep -Fq '"exhausted": 1' "$test_tmp/managed-completion/state.json"
+grep -RFq '"reason": "completion"' "$test_tmp/managed-completion/partitions"
+[[ $(grep -c '^#C llsss completion ' "$test_tmp/managed-completion/results.rle") == 1 ]]
 
 if "$binary" llsss --load "$test_tmp/checkpoint_12" --rule B3/S23 --save none \
   >"$test_tmp/checkpoint-mismatch.out" 2>"$test_tmp/checkpoint-mismatch.err"; then

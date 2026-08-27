@@ -193,7 +193,7 @@ runs one ordinary extend/prune/report row, and writes child checkpoints.
 
 Runtime --save, --savedir, --search-name, --halts, and --load are controlled
 by the partition command. For per-child --partial-output or
---dump-slice-stats paths, include {name} in the path.
+--dump-slice-stats or --status-output paths, include {name} in the path.
 )";
 }
 
@@ -274,6 +274,7 @@ public:
     auto materialize_template = parse_materialize_options(source_path, config.runtime_arguments);
     const bool explicit_partial_output = materialize_template.explicitly_set.contains("partial_output");
     const bool explicit_stats_output = materialize_template.explicitly_set.contains("stats_output");
+    const bool explicit_status_output = materialize_template.explicitly_set.contains("status_output");
     for(const auto& spec : specs) {
       auto child = materialize_template;
       child.loadfile = source_path.string();
@@ -299,8 +300,11 @@ public:
         child.stats_output = (output_directory / (child.search_name + ".stats")).string();
         child.explicitly_set.insert("stats_output");
       }
+      if(explicit_status_output)
+        child.status_output = replace_name_placeholder(child.status_output, child.search_name, "--status-output", specs.size());
       ensure_not_source_output(child.partial_output, "partial output", source_path);
       ensure_not_source_output(child.stats_output, "slice-stats output", source_path);
+      ensure_not_source_output(child.status_output, "status output", source_path);
       std::cout << "materializing partition " << child.search_name << '\n';
       const auto status = Solver(std::move(child)).run();
       if(status != 0)

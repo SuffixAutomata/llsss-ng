@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
@@ -90,6 +91,9 @@ struct Options {
   bool phase_progress = false;
   int worker_count = 1;
   int halt_height = -1;
+  // Zero disables the soft cap.  This is a row-boundary stop request, not an
+  // allocator limit: a row is always returned to checkpointable form first.
+  std::uint64_t max_rss_bytes = 0;
   PartialMode partial_mode = PartialMode::Final;
   int partial_every = 1;
   std::string partial_output;
@@ -101,6 +105,9 @@ struct Options {
   std::string savedir = "saves";
   std::string search_name = "save";
   std::string loadfile;
+  // A runtime-only, atomically replaced JSON result.  Unlike the cap, this
+  // path must not follow a checkpoint to another machine or manager process.
+  std::string status_output;
   std::optional<PartitionConstraint> partition_constraint;
   std::optional<std::size_t> row_limit;
   bool inspection_only = false;
@@ -266,6 +273,49 @@ inline bool valid_search_name(std::string_view name) {
          std::ranges::none_of(name, [](char ch) { return std::iscntrl(static_cast<unsigned char>(ch)) != 0; });
 }
 
+inline bool paths_alias(const std::filesystem::path& first, const std::filesystem::path& second) {
+  if(first.empty() || second.empty())
+    return false;
+  const auto absolute_first = std::filesystem::absolute(first).lexically_normal();
+  const auto absolute_second = std::filesystem::absolute(second).lexically_normal();
+  if(absolute_first == absolute_second)
+    return true;
+  std::error_code error;
+  return std::filesystem::equivalent(absolute_first, absolute_second, error) && !error;
+}
+
+inline std::uint64_t parse_memory_size(std::string text) {
+  std::ranges::transform(text, text.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+  if(text == "none" || text == "off" || text == "0")
+    return 0;
+  std::size_t digits = 0;
+  while(digits < text.size() && std::isdigit(static_cast<unsigned char>(text[digits])) != 0)
+    ++digits;
+  if(digits == 0)
+    throw std::runtime_error("--max-memory must be none or an integer byte size such as 500MiB or 8GiB");
+  std::uint64_t value = 0;
+  const auto parsed = std::from_chars(text.data(), text.data() + digits, value);
+  if(parsed.ec != std::errc{} || parsed.ptr != text.data() + digits)
+    throw std::runtime_error("--max-memory is outside the supported range");
+  const auto suffix = std::string_view(text).substr(digits);
+  std::uint64_t multiplier = 0;
+  if(suffix.empty() || suffix == "b")
+    multiplier = 1;
+  else if(suffix == "k" || suffix == "kb" || suffix == "kib")
+    multiplier = std::uint64_t{1} << 10U;
+  else if(suffix == "m" || suffix == "mb" || suffix == "mib")
+    multiplier = std::uint64_t{1} << 20U;
+  else if(suffix == "g" || suffix == "gb" || suffix == "gib")
+    multiplier = std::uint64_t{1} << 30U;
+  else if(suffix == "t" || suffix == "tb" || suffix == "tib")
+    multiplier = std::uint64_t{1} << 40U;
+  else
+    throw std::runtime_error("--max-memory must be none or an integer byte size such as 500MiB or 8GiB");
+  if(value == 0 || value > std::numeric_limits<std::uint64_t>::max() / multiplier)
+    throw std::runtime_error("--max-memory is outside the supported range");
+  return value * multiplier;
+}
+
 inline void print_help(std::ostream& out) {
   out <<
     R"(rlife llsss [options] <geometry> <start>
@@ -284,6 +334,7 @@ Orthogonal and diagonal fixed-width LLSSS using succinct two-column slice trees.
   --ends default|none        zero-background completion detection (default)
   --[no-]halt-on-ends        halt after the first completion (default: halt)
   --halts w_pos:N            stop at logical W-tile position N
+  --max-memory SIZE          soft peak-RSS cap; stop after the current row
   --save MODE                none, final, or every:N (default: final)
   --savedir DIRECTORY        save under DIRECTORY (default: saves/)
   --search-name NAME         persistent search identity (default: save)
@@ -291,6 +342,7 @@ Orthogonal and diagonal fixed-width LLSSS using succinct two-column slice trees.
   --partials MODE            none, final, default, or every:N (default: final)
   --partial-output FILE      write RLE partials/completions to FILE
   --dump-slice-stats FILE    append per-height succinct-slice statistics
+  --status-output FILE       atomically write a machine-readable run result
   --phase-progress           print individual sweep phases
   --phase-timings            print final cumulative timings per phase
   --verbose                  verbose information at every row
@@ -400,6 +452,9 @@ inline Options parse_cli(int argc, char** argv) {
         throw std::runtime_error("--halts supports w_pos:N");
       }
       options.halt_height = std::stoi(match[1].str());
+    } else if(current == "--max-memory" || current == "--max-rss") {
+      options.max_rss_bytes = parse_memory_size(argument(current));
+      options.explicitly_set.insert("max_rss");
     } else if(current == "--save") {
       options.explicitly_set.insert("save");
       const auto value = argument(current);
@@ -458,6 +513,11 @@ inline Options parse_cli(int argc, char** argv) {
     } else if(current == "--dump-slice-stats") {
       options.stats_output = argument(current);
       options.explicitly_set.insert("stats_output");
+    } else if(current == "--status-output") {
+      options.status_output = argument(current);
+      options.explicitly_set.insert("status_output");
+      if(options.status_output.empty())
+        throw std::runtime_error("--status-output must not be empty");
     } else if(current == "--phase-progress") {
       options.phase_progress = true;
       options.explicitly_set.insert("phase_progress");
@@ -533,6 +593,12 @@ public:
         }
       }
     }
+    if(!options_.status_output.empty()) {
+      if(paths_alias(options_.status_output, options_.loadfile) || paths_alias(options_.status_output, partition_specfile_))
+        throw std::runtime_error("status output would overwrite the loaded checkpoint or partition spec");
+      if(paths_alias(options_.status_output, options_.partial_output) || paths_alias(options_.status_output, options_.stats_output))
+        throw std::runtime_error("status output must differ from partial and slice-stats outputs");
+    }
     if(options_.save_mode != SaveMode::None)
       install_checkpoint_interrupt_handler();
     const bool loading = !options_.loadfile.empty();
@@ -573,6 +639,10 @@ public:
         if(!options_.explicitly_set.contains("stats_output") && !options_.stats_output.empty())
           options_.stats_output = (directory / (options_.search_name + ".stats")).string();
       }
+    }
+    if(!options_.status_output.empty() &&
+       (paths_alias(options_.status_output, options_.partial_output) || paths_alias(options_.status_output, options_.stats_output))) {
+      throw std::runtime_error("status output must differ from partial and slice-stats outputs");
     }
     if(!options_.inspection_only && !options_.partial_output.empty()) {
       const auto mode = loading && !options_.explicitly_set.contains("partial_output") ? std::ios::app : std::ios::trunc;
@@ -616,15 +686,18 @@ public:
               << " left_edge=" << edge_name(options_.left_edge) << " right_edge=" << edge_name(options_.right_edge)
               << " bcaf=" << (options_.bcaf ? "yes" : "no") << " halt_on_ends=" << (options_.halt_on_ends ? "yes" : "no")
               << " search_name=" << options_.search_name << '\n';
+    if(options_.max_rss_bytes != 0)
+      std::cout << "soft memory cap: " << integer_format(options_.max_rss_bytes) << "iB peak RSS\n";
     if(options_.worker_count != 1) {
       std::cout << "indexed relation walks: " << options_.worker_count << " workers\n";
     }
     running_ = true;
     print_stats("init", 0.0);
+    monitor_memory_cap();
 
     if(slices_.empty()) {
       std::cout << "search space is empty after initialization\n";
-      return finish(0);
+      return finish(0, "exhausted");
     }
     if(options_.partition_constraint.has_value() &&
        ((completion_at_current_row_ && options_.detect_ends && options_.halt_on_ends) ||
@@ -633,16 +706,22 @@ public:
     }
     if(completion_at_current_row_ && options_.detect_ends && options_.halt_on_ends) {
       std::cout << "checkpoint row already contains a halting completion\n";
-      return finish(0);
+      return finish(0, "completion");
     }
     if(options_.halt_height >= 0 && geometry_.w_position(height_) >= static_cast<std::size_t>(options_.halt_height)) {
       if(!loaded_from_checkpoint_ || options_.explicitly_set.contains("partials")) {
         emit_final_partial("halt");
       }
-      return finish(0);
+      return finish(0, "halt");
     }
     if(checkpoint_interrupt_requested_) {
       return finish_interrupted();
+    }
+    if(memory_cap_reached_ && !options_.partition_constraint.has_value()) {
+      std::cout << "soft memory cap reached at checkpointable row " << height_ << ": peak RSS " << integer_format(memory_cap_observed_)
+                << "iB >= " << integer_format(options_.max_rss_bytes) << "iB\n";
+      emit_final_partial("memory");
+      return finish(0, "memory_cap");
     }
 
     std::size_t completed_rows = 0;
@@ -685,7 +764,7 @@ public:
         pair_gates_ready_ = false;
         bcaf_clause_begin_depth_ = 0;
         exhausted_ = true;
-        return finish(0);
+        return finish(0, "exhausted");
       }
       expanded_uniform_tail_ = false;
       ++completed_rows;
@@ -710,7 +789,7 @@ public:
           emit_board(*completion, "completion");
           if(options_.halt_on_ends) {
             report_row();
-            return finish(0);
+            return finish(0, "completion");
           }
         }
       }
@@ -724,7 +803,7 @@ public:
         if(!partial_emitted)
           emit_final_partial("halt");
         report_row();
-        return finish(0);
+        return finish(0, "halt");
       }
 
       if(options_.row_limit.has_value() && completed_rows >= *options_.row_limit) {
@@ -732,7 +811,19 @@ public:
         if(!partial_emitted)
           emit_final_partial("partition");
         report_row();
-        return finish(0);
+        return finish(0, "row_limit");
+      }
+
+      if(checkpoint_interrupt_requested_)
+        return finish_interrupted();
+      monitor_memory_cap();
+      if(memory_cap_reached_) {
+        std::cout << "soft memory cap reached after completed row " << height_ << ": peak RSS " << integer_format(memory_cap_observed_)
+                  << "iB >= " << integer_format(options_.max_rss_bytes) << "iB\n";
+        if(!partial_emitted)
+          emit_final_partial("memory");
+        report_row();
+        return finish(0, "memory_cap");
       }
 
       report_row();
@@ -820,7 +911,8 @@ private:
   void apply_partition_restriction(std::size_t position, PackedTags& tags) const;
   [[nodiscard]] std::filesystem::path checkpoint_path() const;
   void save_checkpoint();
-  int finish(int status);
+  void write_status(std::string_view reason, int exit_status) const;
+  int finish(int status, std::string_view reason);
   int finish_interrupted();
 
   static StartGrid magic_background(const std::string& source, std::size_t height) {
@@ -984,6 +1076,7 @@ private:
       for(std::size_t y = 0; y < height_; ++y) {
         slices_[x].append_uniform(allowed_pair_labels(start.at(x, y), start.at(x + 1, y)));
       }
+      monitor_memory_cap();
     }
     if(!prune_supported()) {
       slices_.clear();
@@ -1856,6 +1949,7 @@ private:
       if(seen != gate.size() || (seen != 0 && !gate.index_ready(pair_gate_depth_))) {
         throw std::logic_error("pair-gate index does not match its DFS enumeration");
       }
+      monitor_memory_cap();
     }
   }
 
@@ -1876,28 +1970,35 @@ private:
     const auto adjacency_count = slices_.size() - 1U;
     std::vector<TagPair> normal;
     normal.reserve(slices_.size());
-    for(const auto& slice : slices_)
+    for(const auto& slice : slices_) {
       normal.emplace_back(slice.node_count());
+      monitor_memory_cap();
+    }
     account_tags(normal);
 
     const auto bcaf_window = geometry_.long_window();
     const bool bcaf_active = options_.bcaf && height_ >= bcaf_window;
     const bool cache_partial =
       (options_.partial_mode == PartialMode::Every && height_ % static_cast<std::size_t>(options_.partial_every) == 0) ||
-      (options_.partial_mode != PartialMode::None && options_.halt_height >= 0 && geometry_.w_position(height_) >= static_cast<std::size_t>(options_.halt_height));
+      (options_.partial_mode != PartialMode::None &&
+        (memory_cap_reached_ || (options_.halt_height >= 0 && geometry_.w_position(height_) >= static_cast<std::size_t>(options_.halt_height))));
     std::vector<LeafTagPair> witness;
     if(bcaf_active) {
       witness.reserve(slices_.size());
-      for(const auto& slice : slices_)
+      for(const auto& slice : slices_) {
         witness.emplace_back(slice.leaf_begin(), slice.leaf_count());
+        monitor_memory_cap();
+      }
     }
 
     const bool cache_completion = bcaf_active && options_.detect_ends && geometry_.complete_tile(height_);
     std::vector<LeafTagPair> completion_prefix;
     if(cache_completion) {
       completion_prefix.reserve(slices_.size());
-      for(const auto& slice : slices_)
+      for(const auto& slice : slices_) {
         completion_prefix.emplace_back(slice.leaf_begin(), slice.leaf_count());
+        monitor_memory_cap();
+      }
     }
     peak_tag_bytes_ = std::max(peak_tag_bytes_, tag_bytes(normal) + tag_bytes(witness) + tag_bytes(completion_prefix));
 
@@ -1908,8 +2009,10 @@ private:
     if(bcaf_active) {
       phase("  implicit local-prefix-interest ranges");
       local_prefix_uninteresting.reserve(slices_.size());
-      for(const auto& slice : slices_)
+      for(const auto& slice : slices_) {
         local_prefix_uninteresting.push_back(local_prefix_uninteresting_range(slice, bcaf_window));
+        monitor_memory_cap();
+      }
     }
 
     auto seed_suffix = [&](std::size_t position) {
@@ -1969,6 +2072,7 @@ private:
       }
       apply_partition_restriction(relation, normal[relation][1]);
       seed_suffix(relation);
+      monitor_memory_cap();
     }
 
     auto seed_prefix = [&](std::size_t position) {
@@ -2242,6 +2346,7 @@ private:
         partial_lineages.push_back(slices_[i + 1U].lineage(partial_current));
         partial_seen = partial_seen || !bcaf_active || labels_prefix_interesting(partial_lineages.back(), bcaf_window);
       }
+      monitor_memory_cap();
     }
     if(cache_partial) {
       if(bcaf_active && !partial_seen)
@@ -2291,6 +2396,7 @@ private:
             }
             tree.set_bcaf_child_clauses(parent, clauses);
           }
+          monitor_memory_cap();
         }
       }
     }
@@ -2315,9 +2421,11 @@ private:
             std::min<Node>(end, static_cast<Node>(word + keep_words_per_task) * 64U),
           });
         }
+        monitor_memory_cap();
       }
       BcafKeepContext keep_context{this, &normal, &witness, &ranges};
       execute_indexed_tasks(ranges.size(), options_.worker_count, &keep_context, &execute_bcaf_keep_range);
+      monitor_memory_cap();
       for(std::size_t position = 0; position < slices_.size(); ++position) {
         normal[position][1] = PackedTags{};
         witness[position] = LeafTagPair{};
@@ -2350,6 +2458,7 @@ private:
         }
         if(!slices_[i].reify(keep))
           return false;
+        monitor_memory_cap();
       }
     }
 
@@ -2443,9 +2552,12 @@ private:
     ExpandSliceContext context{this};
     if(options_.worker_count > 1 && !options_.verbose) {
       execute_indexed_tasks(slices_.size(), options_.worker_count, &context, &execute_expand_slice);
+      monitor_memory_cap();
     } else {
-      for(std::size_t position = 0; position < slices_.size(); ++position)
+      for(std::size_t position = 0; position < slices_.size(); ++position) {
         execute_expand_slice(&context, position, 0);
+        monitor_memory_cap();
+      }
     }
   }
 
@@ -2704,6 +2816,16 @@ private:
     }
   }
 
+  void monitor_memory_cap() noexcept {
+    if(memory_cap_reached_ || options_.max_rss_bytes == 0)
+      return;
+    const auto rss = getMaxRSS();
+    if(rss != 0 && rss >= options_.max_rss_bytes) {
+      memory_cap_reached_ = true;
+      memory_cap_observed_ = rss;
+    }
+  }
+
   void phase(std::string_view message) {
     if(running_) {
       if(options_.phase_progress) {
@@ -2843,6 +2965,8 @@ private:
   std::size_t peak_tag_bytes_ = 0;
   bool running_ = false;
   bool expanded_uniform_tail_ = false;
+  bool memory_cap_reached_ = false;
+  std::uint64_t memory_cap_observed_ = 0;
   std::optional<Board> cached_partial_;
   std::optional<Board> cached_completion_;
   std::size_t cached_completion_height_ = std::numeric_limits<std::size_t>::max();

@@ -137,6 +137,35 @@ checkpoint made at its configured halt exits immediately unless a later halt
 is supplied. Ctrl-C is noticed at the next completed row; when saving is
 enabled that row is checkpointed before the program exits.
 
+### Soft memory cap and structured status
+
+`--max-memory SIZE` requests a stop when the process's peak resident set size
+reaches `SIZE`. Integer byte counts and binary suffixes such as `500MiB`,
+`8GiB`, and `1TiB` are accepted; `none` disables an inherited cap.
+
+```sh
+./rlife llsss --load saves/save_217 \
+  --max-memory 32GiB --halts w_pos:300 \
+  --save final --status-output run-status.json
+```
+
+This is deliberately a soft cap, not an allocation limit. The expansion and
+support/reification outer loops latch the peak-RSS crossing, but finish the
+current flattened row before emitting a final partial and checkpoint. Memory
+can therefore overshoot the cap by the transient cost of one row (and by
+checkpoint output buffers). Exhaustion, a completion configured to halt, and
+`--halts` take precedence when they occur on the same row, since none of those
+states needs another partition.
+
+The cap is mutable checkpoint configuration, like `--halts`, so a reload uses
+the saved value unless it is explicitly changed. `--status-output FILE` is a
+runtime-only path and atomically receives a JSON result after the checkpoint
+has been committed. Its `reason` is one of `memory_cap`, `exhausted`,
+`completion`, `halt`, `row_limit`, or `interrupted`; it also names the exact
+checkpoint, row, logical W position, configured halt, completion flag, and
+observed peak RSS. A missing status file or a nonzero process exit without an
+`interrupted` result is an operational failure rather than a search outcome.
+
 ## Partitioning checkpoints
 
 The dedicated `partition` command divides one selected slice into contiguous
@@ -180,7 +209,9 @@ self-contained child checkpoints instead of specs:
 Arguments after `--` are ordinary mutable `llsss` runtime options. The
 partition command controls load/save paths, search names, and the one-row
 stop. A per-child `--partial-output` or `--dump-slice-stats` path must contain
-`{name}`, which is replaced by the child search name.
+`{name}`, which is replaced by the child search name. The same rule applies to
+`--status-output`, allowing an orchestrator to classify every materialized
+child independently.
 
 Automatic slice selection uses the center for asymmetric searches and shifts
 one slice toward a lone symmetry edge. `--slice INDEX` selects a one-based
@@ -189,6 +220,53 @@ within one percent of a part's leaf count in order to minimize the depth of
 `LCA(R-1,R)`. Set `--boundary-slack 0` for exact equal intervals, use
 `--dry-run` to inspect the ranges and spanning-node overhead, and use `--force`
 to replace existing partition outputs.
+
+## Depth-first search manager
+
+`scripts/rlife_manager.py` automates the memory-cap cycle in fresh subprocesses
+(peak RSS is process-lifetime state, so this separation matters). On a
+`memory_cap` result it partitions and materializes the checkpoint, then visits
+the first child to completion before the next sibling. A child that reaches
+the cap is recursively partitioned; an exhausted child is retired. The
+original `--halts` target is reapplied to every materialized descendant.
+
+Start a new managed search with a new work directory:
+
+```sh
+scripts/rlife_manager.py start runs/c5-search \
+  --binary ./rlife --max-memory 32GiB --parts 4 -- \
+  --rule 'B34ar5in/S2i3-i4-nwz5ceny6cei7e8' \
+  --left-edge odd --filters bcaf --halts w_pos:300 \
+  2c5-f2b '@bg(15)'
+```
+
+The arguments after `--` are ordinary `llsss` arguments and may instead begin
+with `--load CHECKPOINT`. The manager controls `--save`, `--savedir`,
+`--search-name`, `--max-memory`, `--status-output`, and `--partial-output` so
+those options must not be supplied there. Other runtime choices, including
+threads, partial frequency, end detection, and halt-on-end behavior, are saved
+normally.
+
+Press Ctrl-C once to pause. The manager forwards it to the active solver,
+waits for the current row and checkpoint, commits that branch to `state.json`,
+and exits with status 130. Continue or inspect it with:
+
+```sh
+scripts/rlife_manager.py resume runs/c5-search
+scripts/rlife_manager.py status runs/c5-search
+```
+
+All per-run and per-materialization RLE files remain under the work directory.
+The manager rebuilds `results.rle` from its artifact list, so partials and
+completions are transmitted back without duplicate appends across a resume.
+`events.jsonl` is the chronological machine-readable event stream. Completion
+detection is active in both ordinary extension and partition materialization:
+with the default halt-on-end behavior, the first such result completes the
+managed run while retaining any unvisited branches in the manifest; with
+`--no-halt-on-ends`, completion RLEs are collected and DFS continues. A failed
+subprocess leaves the active operation recorded, and `resume` retries it;
+materialization retries use `--force` only inside that operation's own output
+directory.
 
 ## Representation and sweeps
 
