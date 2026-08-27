@@ -308,7 +308,7 @@ inline bool valid_search_name(std::string_view name) {
 
 inline void print_help(std::ostream& out) {
   out <<
-    R"(rlife_llsss llsss [options] <geometry> <start>
+    R"(rlife llsss [options] <geometry> <start>
 
 Orthogonal and diagonal fixed-width LLSSS using succinct two-column slice trees.
 
@@ -346,7 +346,7 @@ The implementation has no autochoke and stores no join endpoints or join DAG.
 
 inline Options parse_cli(int argc, char** argv) {
   if(argc < 2) {
-    throw std::runtime_error("usage: rlife_llsss llsss [options] <geometry> <start>");
+    throw std::runtime_error("usage: rlife llsss [options] <geometry> <start>");
   }
   int index = 1;
   if(std::string(argv[index++]) != "llsss") {
@@ -636,7 +636,7 @@ public:
   }
 
   int run() {
-    std::cout << "rlife_llsss: geom=" << geometry_.source << " lattice=" << (geometry_.diagonal() ? "diagonal" : "orthogonal") << " p=" << geometry_.period
+    std::cout << "rlife: geom=" << geometry_.source << " lattice=" << (geometry_.diagonal() ? "diagonal" : "orthogonal") << " p=" << geometry_.period
               << " k=" << geometry_.displacement << " subtiles=" << geometry_.subtile_count << " rule=" << options_.rule << " width=" << width_
               << " left_edge=" << edge_name(options_.left_edge) << " right_edge=" << edge_name(options_.right_edge)
               << " bcaf=" << (options_.bcaf ? "yes" : "no") << " halt_on_ends=" << (options_.halt_on_ends ? "yes" : "no")

@@ -11,7 +11,7 @@ int main(int argc, char** argv) {
     auto options = rlife::llsss::parse_cli(argc, argv);
     return rlife::llsss::Solver(std::move(options)).run();
   } catch(const std::exception& error) {
-    std::cerr << "rlife_llsss: " << error.what() << '\n';
+    std::cerr << "rlife: " << error.what() << '\n';
     return 2;
   }
 }

@@ -1,7 +1,7 @@
 /build/
-/rlife_llsss
 /target/
 
 *.o
-/rlife/
+/rlife_vanilla/
+rlife
 /saves/

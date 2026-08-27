@@ -4,7 +4,7 @@ NATIVE_FLAGS ?= -march=native
 CPPFLAGS ?=
 LDFLAGS ?=
 
-TARGET := rlife_llsss
+TARGET := rlife
 SOURCES := src/main.cpp src/rlife/partition.cpp
 OBJECTS := src/main.o src/rlife/partition.o src/rlife/indexed_executor.o
 HEADERS := $(wildcard src/rlife/*.hpp)

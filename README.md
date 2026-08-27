@@ -37,13 +37,13 @@ Debug build remains quick.
 ## Run
 
 ```sh
-./rlife_llsss llsss [options] <geometry> <start>
+./rlife llsss [options] <geometry> <start>
 ```
 
 For example:
 
 ```sh
-./rlife_llsss llsss \
+./rlife llsss \
   --rule 'B34ar5in/S2i3-i4-nwz5ceny6cei7e8' \
   --left-edge odd --filters bcaf --halts w_pos:20 \
   2c5-f2b '@bg(15)'
@@ -65,7 +65,7 @@ child label remain exactly the same size in every geometry. For example,
 `c5d-f2b` alternates two subtiles and starts with a 20-level CA lookback:
 
 ```sh
-./rlife_llsss llsss --rule 'B35678/S4678' \
+./rlife llsss --rule 'B35678/S4678' \
   --left-edge bg --filters bcaf c5d-f2b '@bg(11)'
 ```
 
@@ -74,7 +74,7 @@ edges. For example, this bounded invocation exercises both `c6d` subtiles
 without running the much larger width-seven search:
 
 ```sh
-./rlife_llsss llsss --rule 'B3578/S24678' \
+./rlife llsss --rule 'B3578/S24678' \
   --left-edge gse --filters bcaf --ends none --halts w_pos:14 \
   --save none c6d-f2b '@bg(4)'
 ```
@@ -85,7 +85,7 @@ standard Life RLE file, or an ASCII grid containing `.`, `*`, and independent
 contain at least `2P` rows orthogonally or `4P` rows diagonally, and must end at
 a complete lattice tile. `@bg(W)` constructs this lookback automatically.
 
-Run `./rlife_llsss llsss --help` for all supported options. Zero is currently
+Run `./rlife llsss --help` for all supported options. Zero is currently
 the only background agar. Background, odd, even, glide-odd (`gso`), and
 glide-even (`gse`) edges can be selected independently. Their compatibility is:
 
@@ -126,7 +126,7 @@ reload, while the save path remains a runtime policy. Existing checkpoint
 files are atomically replaced. Resume without geometry or a start grid using:
 
 ```sh
-./rlife_llsss llsss --load FILE [runtime options]
+./rlife llsss --load FILE [runtime options]
 ```
 
 The checkpoint's rule, geometry, start description, edges, and BCAF setting
@@ -148,7 +148,7 @@ arbitrarily grouped cut nodes.
 By default the command writes small partition specifiers:
 
 ```sh
-./rlife_llsss partition --load save_217 --parts 4 \
+./rlife partition --load save_217 --parts 4 \
   --search-name c5-search --output parts
 ```
 
@@ -160,7 +160,7 @@ if it were a checkpoint, supplying a later halt when the source checkpoint was
 itself saved at its halt:
 
 ```sh
-./rlife_llsss llsss --load parts/c5-search-1.rlp --halts w_pos:120
+./rlife llsss --load parts/c5-search-1.rlp --halts w_pos:120
 ```
 
 The first completed row applies the restriction in both support directions;
@@ -172,7 +172,7 @@ Use `--materialize` to perform that ordinary first row immediately and write
 self-contained child checkpoints instead of specs:
 
 ```sh
-./rlife_llsss partition --load save_217 --parts 4 \
+./rlife partition --load save_217 --parts 4 \
   --search-name c5-search --output parts --materialize -- \
   --threads 20 --partials none
 ```

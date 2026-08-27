@@ -68,7 +68,7 @@ Case-1 checkpoint:
 Canonical case-1 timing command:
 
 ```sh
-/usr/bin/time -v ./rlife_llsss llsss \
+/usr/bin/time -v ./rlife llsss \
   --load /tmp/rlife-bench/case1_implicit_66 \
   --partials none --halts w_pos:67 --save none \
   --threads 20 --phase-timings
@@ -169,7 +169,7 @@ Case-1 paired-walk counts per pass are 92,239,356 interior states, 94,583,633 te
 Run after material changes:
 
 ```sh
-bash tests/search_regression.sh ./rlife_llsss smoke
+bash tests/search_regression.sh ./rlife smoke
 ```
 
 The smoke suite and multiple exact case-1 checkpoint comparisons have passed throughout.  Run the full regression suite before final handoff.
@@ -794,7 +794,7 @@ An explicit partial override on an already-halted loaded checkpoint is now a
 read-only inspection operation.  For example:
 
 ```sh
-./rlife_llsss llsss --load save_217 --save none --halts w_pos:108 \
+./rlife llsss --load save_217 --save none --halts w_pos:108 \
   --partials every:1 --partial-output partial.rle --threads 20
 ```
 

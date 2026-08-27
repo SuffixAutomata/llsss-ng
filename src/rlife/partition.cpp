@@ -173,7 +173,7 @@ void write_partition_spec(const std::filesystem::path& path, const PartitionSpec
 }
 
 void print_partition_help(std::ostream& output) {
-  output << R"(rlife_llsss partition --load CHECKPOINT --parts N [options]
+  output << R"(rlife partition --load CHECKPOINT --parts N [options]
 
 Partition one checkpoint by contiguous leaf intervals in a selected slice.
 By default this writes small .rlp specifiers; --materialize loads each part,
@@ -628,7 +628,7 @@ private:
         throw std::runtime_error("partition --materialize controls runtime option " + argument);
       }
     }
-    std::vector<std::string> arguments{"rlife_llsss", "llsss", "--load", checkpoint.string()};
+    std::vector<std::string> arguments{"rlife", "llsss", "--load", checkpoint.string()};
     arguments.insert(arguments.end(), runtime_arguments.begin(), runtime_arguments.end());
     std::vector<char*> pointers;
     pointers.reserve(arguments.size());

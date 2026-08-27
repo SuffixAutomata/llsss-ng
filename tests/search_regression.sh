@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-binary=${1:?usage: search_regression.sh /path/to/rlife_llsss [smoke|full]}
+binary=${1:?usage: search_regression.sh /path/to/rlife [smoke|full]}
 mode=${2:-full}
 if [[ $mode != smoke && $mode != full ]]; then
   echo 'test mode must be smoke or full' >&2
