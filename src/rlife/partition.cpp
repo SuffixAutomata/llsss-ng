@@ -184,14 +184,14 @@ runs one ordinary extend/prune/report row, and writes child checkpoints.
   --slice auto|INDEX         one-based slice to partition (default: auto)
   --search-name NAME         parent identity for NAME-1, NAME-2, ...
   --output DIRECTORY         output directory (default: FILE.parts)
-  --boundary-slack PERCENT  endpoint search radius per ideal part (default: 1)
+  --boundary-slack PERCENT   endpoint search radius per ideal part (default: 1)
   --materialize              write checkpoints after one ordinary row
   --dry-run                  print the plan without writing files
   --force                    replace existing partition outputs
-  --                          pass following llsss runtime options while materializing
+  --                         pass following llsss runtime options while materializing
   -h, --help                 show this help
 
-Runtime --save, --savefile, --search-name, --halts, and --load are controlled
+Runtime --save, --savedir, --search-name, --halts, and --load are controlled
 by the partition command. For per-child --partial-output or
 --dump-slice-stats paths, include {name} in the path.
 )";
@@ -282,10 +282,10 @@ public:
       child.halt_height = -1;
       child.save_mode = SaveMode::Final;
       child.search_name = spec.constraint.search_name;
-      child.savefile = output_directory.string() + std::filesystem::path::preferred_separator;
+      child.savedir = output_directory.string();
       child.explicitly_set.insert("halt_height");
       child.explicitly_set.insert("save");
-      child.explicitly_set.insert("savefile");
+      child.explicitly_set.insert("savedir");
       child.explicitly_set.insert("search_name");
       if(explicit_partial_output) {
         child.partial_output = replace_name_placeholder(child.partial_output, child.search_name, "--partial-output", specs.size());
@@ -623,7 +623,7 @@ private:
 
   static Options parse_materialize_options(const std::filesystem::path& checkpoint, const std::vector<std::string>& runtime_arguments) {
     for(const auto& argument : runtime_arguments) {
-      if(argument == "--load" || argument == "--save" || argument == "--savefile" || argument == "--search-name" || argument == "--halts" ||
+      if(argument == "--load" || argument == "--save" || argument == "--savedir" || argument == "--search-name" || argument == "--halts" ||
          argument == "-h" || argument == "--help") {
         throw std::runtime_error("partition --materialize controls runtime option " + argument);
       }

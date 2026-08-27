@@ -6,6 +6,7 @@
 #include "partition.hpp"
 #include "rule.hpp"
 #include "succinct_slice_tree.hpp"
+#include "util.hpp"
 
 #include <algorithm>
 #include <array>
@@ -39,11 +40,6 @@
 #include <immintrin.h>
 #endif
 
-#ifdef __linux__
-#include <sys/resource.h>
-#include <sys/time.h>
-#endif
-
 namespace rlife::llsss {
 
 namespace detail {
@@ -72,48 +68,12 @@ static_assert([] {
   const auto spread = static_cast<std::uint8_t>(_pdep_u32(leaves & 0x0fU, 0x55U));
   return static_cast<std::uint8_t>(spread | (spread << 1U));
 #else
-  constexpr std::array<std::uint8_t, 16> expanded = {
-    0x00,
-    0x03,
-    0x0c,
-    0x0f,
-    0x30,
-    0x33,
-    0x3c,
-    0x3f,
-    0xc0,
-    0xc3,
-    0xcc,
-    0xcf,
-    0xf0,
-    0xf3,
-    0xfc,
-    0xff,
-  };
+  constexpr std::array<std::uint8_t, 16> expanded = {0x00, 0x03, 0x0c, 0x0f, 0x30, 0x33, 0x3c, 0x3f, 0xc0, 0xc3, 0xcc, 0xcf, 0xf0, 0xf3, 0xfc, 0xff};
   return expanded[leaves & 0x0fU];
 #endif
 }
 
 } // namespace detail
-
-inline std::uint64_t getMaxRSS() {
-#ifdef __linux__
-  struct rusage usage;
-  if(getrusage(RUSAGE_SELF, &usage) == 0)
-    return usage.ru_maxrss * 1024ll;
-#endif
-  return 0;
-}
-
-inline std::string integer_format(std::uint64_t n) {
-  if(n < 10 * 1024)
-    return std::to_string(n);
-  if(n < 10 * 1024 * 1024)
-    return std::to_string(n >> 10) + "K";
-  if(n < (10ll << 30))
-    return std::to_string(n >> 20) + "M";
-  return std::to_string(n >> 30) + "G";
-}
 
 enum class PartialMode { None, Final, Every };
 enum class SaveMode { None, Final, Every };
@@ -138,7 +98,7 @@ struct Options {
   bool phase_timings = false;
   SaveMode save_mode = SaveMode::Final;
   int save_every = 1;
-  std::string savefile = "save";
+  std::string savedir = "saves";
   std::string search_name = "save";
   std::string loadfile;
   std::optional<PartitionConstraint> partition_constraint;
@@ -325,7 +285,7 @@ Orthogonal and diagonal fixed-width LLSSS using succinct two-column slice trees.
   --[no-]halt-on-ends        halt after the first completion (default: halt)
   --halts w_pos:N            stop at logical W-tile position N
   --save MODE                none, final, or every:N (default: final)
-  --savefile FILE_PREFIX     save as FILE_PREFIX_{row} (default: save)
+  --savedir DIRECTORY        save under DIRECTORY (default: saves/)
   --search-name NAME         persistent search identity (default: save)
   --load FILE                resume a checkpoint; geometry/start may be omitted
   --partials MODE            none, final, default, or every:N (default: final)
@@ -457,11 +417,11 @@ inline Options parse_cli(int argc, char** argv) {
       } else {
         throw std::runtime_error("--save supports none, final, or every:N");
       }
-    } else if(current == "--savefile") {
-      options.savefile = argument(current);
-      options.explicitly_set.insert("savefile");
-      if(options.savefile.empty()) {
-        throw std::runtime_error("--savefile must not be empty");
+    } else if(current == "--savedir") {
+      options.savedir = argument(current);
+      options.explicitly_set.insert("savedir");
+      if(options.savedir.empty()) {
+        throw std::runtime_error("--savedir must not be empty");
       }
     } else if(current == "--search-name") {
       options.search_name = argument(current);
@@ -567,11 +527,9 @@ public:
           options_.search_name = options_.partition_constraint->search_name;
           options_.explicitly_set.insert("search_name");
         }
-        if(!options_.explicitly_set.contains("savefile")) {
-          auto directory = std::filesystem::absolute(requested).parent_path().string();
-          directory.push_back(std::filesystem::path::preferred_separator);
-          options_.savefile = std::move(directory);
-          options_.explicitly_set.insert("savefile");
+        if(!options_.explicitly_set.contains("savedir")) {
+          options_.savedir = std::filesystem::absolute(requested).parent_path().string();
+          options_.explicitly_set.insert("savedir");
         }
       }
     }
@@ -581,6 +539,23 @@ public:
     loaded_from_checkpoint_ = loading;
     if(loading) {
       load_checkpoint(options_.loadfile);
+    }
+    if(!options_.inspection_only && (options_.save_mode != SaveMode::None || options_.explicitly_set.contains("savedir"))) {
+      const std::filesystem::path directory(options_.savedir);
+      std::error_code error;
+      const bool exists = std::filesystem::exists(directory, error);
+      if(error)
+        throw std::runtime_error("cannot inspect save directory " + directory.string() + ": " + error.message());
+      if(exists && !std::filesystem::is_directory(directory, error)) {
+        if(error)
+          throw std::runtime_error("cannot inspect save directory " + directory.string() + ": " + error.message());
+        throw std::runtime_error("save directory exists but is not a directory: " + directory.string());
+      }
+      if(!exists) {
+        std::filesystem::create_directories(directory, error);
+        if(error)
+          throw std::runtime_error("cannot create save directory " + directory.string() + ": " + error.message());
+      }
     }
     geometry_ = Geometry::parse(options_.geometry);
     rule_ = RuleTable::parse(options_.rule);

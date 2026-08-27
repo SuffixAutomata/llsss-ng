@@ -7,7 +7,7 @@ namespace rlife::llsss {
 inline constexpr std::array<std::uint8_t, 16> checkpoint_magic_ = {
     'R', 'L', 'I', 'F', 'E', '-', 'L', 'L', 'S', 'S', 'S', '-', 'C', 'P', 0, 1,
 };
-inline constexpr std::uint32_t checkpoint_version_ = 5;
+inline constexpr std::uint32_t checkpoint_version_ = 6;
 inline constexpr std::uint32_t oldest_checkpoint_version_ = 4;
 inline constexpr std::size_t checkpoint_buffer_size_ = 8U * 1024U * 1024U;
 
@@ -220,7 +220,7 @@ inline void Solver::write_config(CheckpointWriter& output, const Options& option
   output.boolean(options.phase_timings);
   output.u8(static_cast<std::uint8_t>(options.save_mode));
   output.u64(static_cast<std::uint64_t>(options.save_every));
-  output.string(options.savefile);
+  output.string(options.savedir);
   output.string(options.search_name);
 }
 
@@ -270,9 +270,21 @@ inline Options Solver::read_config(CheckpointReader& input, std::uint32_t checkp
   }
   options.save_mode = static_cast<SaveMode>(save_mode);
   options.save_every = checkpoint_positive_int(input, "save interval");
-  options.savefile = input.string();
+  const auto stored_save_path = input.string();
+  if(checkpoint_version >= 6U) {
+    options.savedir = stored_save_path;
+  } else if(stored_save_path == "save") {
+    options.savedir = "saves";
+  } else {
+    const std::filesystem::path legacy_savefile(stored_save_path);
+    std::error_code error;
+    const bool was_directory = std::filesystem::is_directory(legacy_savefile, error) || stored_save_path.ends_with('/') || stored_save_path.ends_with('\\');
+    options.savedir = was_directory ? stored_save_path : legacy_savefile.parent_path().string();
+    if(options.savedir.empty())
+      options.savedir = ".";
+  }
   options.search_name = checkpoint_version >= 5U ? input.string() : "save";
-  if(options.rule.empty() || options.geometry.empty() || options.start.empty() || options.savefile.empty()) {
+  if(options.rule.empty() || options.geometry.empty() || options.start.empty() || options.savedir.empty()) {
     throw std::runtime_error("checkpoint configuration has an empty required value");
   }
   if(!valid_search_name(options.search_name))
@@ -319,7 +331,7 @@ inline void Solver::merge_checkpoint_config(const Options& saved) {
     options_.save_mode = saved.save_mode;
     options_.save_every = saved.save_every;
   }
-  merge_mutable(command_line, saved, "savefile", &Options::savefile);
+  merge_mutable(command_line, saved, "savedir", &Options::savedir);
   merge_mutable(command_line, saved, "search_name", &Options::search_name);
 }
 
@@ -474,13 +486,7 @@ inline void Solver::apply_partition_restriction(std::size_t position, PackedTags
 }
 
 [[nodiscard]] inline std::filesystem::path Solver::checkpoint_path() const {
-  const std::filesystem::path prefix(options_.savefile);
-  std::error_code error;
-  const bool directory = std::filesystem::is_directory(prefix, error) || options_.savefile.ends_with('/') || options_.savefile.ends_with('\\');
-  if(directory) {
-    return prefix / (options_.search_name + "_" + std::to_string(height_));
-  }
-  return std::filesystem::path(options_.savefile + "_" + std::to_string(height_));
+  return std::filesystem::path(options_.savedir) / (options_.search_name + "_" + std::to_string(height_));
 }
 
 inline void Solver::save_checkpoint() {

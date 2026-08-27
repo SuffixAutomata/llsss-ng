@@ -110,20 +110,20 @@ right.
 
 Checkpointing happens only after a row has finished and the tries and relation
 gates are back in their compact persistent form. By default a final checkpoint
-is written as `save_{row}` whenever the search exits normally. The policy and
-prefix can be changed with:
+is written as `saves/save_{row}` whenever the search exits normally. The policy,
+directory, and search name can be changed with:
 
 ```sh
 --save none|final|every:N
---savefile FILE_PREFIX
+--savedir DIRECTORY
 --search-name NAME
 ```
 
-If `FILE_PREFIX` names a directory, files in it are named
-`SEARCH_NAME_{row}` (`save_{row}` by default); otherwise the name remains
-`FILE_PREFIX_{row}`.  The search name is checkpoint metadata and survives a
-reload, while the save path remains a runtime policy. Existing checkpoint
-files are atomically replaced. Resume without geometry or a start grid using:
+Checkpoint files are named `DIRECTORY/SEARCH_NAME_{row}`. The directory is
+created recursively when needed, and must not be an existing file. The search
+name is checkpoint metadata and survives a reload, while the save directory
+remains a runtime policy. Existing checkpoint files are atomically replaced.
+Resume without geometry or a start grid using:
 
 ```sh
 ./rlife llsss --load FILE [runtime options]
@@ -148,7 +148,7 @@ arbitrarily grouped cut nodes.
 By default the command writes small partition specifiers:
 
 ```sh
-./rlife partition --load save_217 --parts 4 \
+./rlife partition --load saves/save_217 --parts 4 \
   --search-name c5-search --output parts
 ```
 
@@ -172,7 +172,7 @@ Use `--materialize` to perform that ordinary first row immediately and write
 self-contained child checkpoints instead of specs:
 
 ```sh
-./rlife partition --load save_217 --parts 4 \
+./rlife partition --load saves/save_217 --parts 4 \
   --search-name c5-search --output parts --materialize -- \
   --threads 20 --partials none
 ```

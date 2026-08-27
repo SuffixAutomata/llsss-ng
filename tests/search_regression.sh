@@ -60,7 +60,7 @@ if [[ $mode == smoke ]]; then
     --rule B3578/S24678 --left-edge gse --filters bcaf \
     --partials final --partial-output "$test_tmp/gse.rle" \
     --ends none --halts w_pos:14 \
-    --save final --savefile "$test_tmp/gse-checkpoint" \
+    --save final --savedir "$test_tmp" --search-name gse-checkpoint \
     c6d-f2b '@bg:4' >"$test_tmp/gse.out" 2>"$test_tmp/gse.err"
   grep -Fq 'w_pos halt at 14[0]' "$test_tmp/gse.out"
   [[ $(grep -c 'cols:' "$test_tmp/gse.err") == 5 ]]
@@ -87,17 +87,18 @@ if [[ $mode == smoke ]]; then
     exit 1
   fi
 
+  mkdir "$test_tmp/completion-checkpoints"
   timeout "${RLIFE_TEST_TIMEOUT:-180}" "$binary" llsss \
     --rule B3/S23 --left-edge bg --filters bcaf --partials none \
-    --save final --savefile "$test_tmp/completion-checkpoint" \
+    --save final --savedir "$test_tmp/completion-checkpoints/search2" --search-name completion-checkpoint \
     --partial-output "$test_tmp/completion.rle" c4d-f2b '@bg(6)' \
     >"$test_tmp/completion.out" 2>"$test_tmp/completion.err"
   grep -Fq 'completion at flattened depth 48 (w_pos 24[0])' "$test_tmp/completion.out"
   grep -Fq '#C physical time phases 0..3 left-to-right; gap=16' "$test_tmp/completion.rle"
   grep -Fq 'x = 94, y = 12, rule = B3/S23' "$test_tmp/completion.rle"
   [[ $(sha256sum "$test_tmp/completion.rle" | awk '{print $1}') == 8571b78b68c4f8db6d845fe68dd9ead52c589fa0c2c19d269d07a10543fcee40 ]]
-  test -s "$test_tmp/completion-checkpoint_48"
-  "$binary" llsss --load "$test_tmp/completion-checkpoint_48" --partials none --save none \
+  test -s "$test_tmp/completion-checkpoints/search2/completion-checkpoint_48"
+  "$binary" llsss --load "$test_tmp/completion-checkpoints/search2/completion-checkpoint_48" --partials none --save none \
     >"$test_tmp/completion-reload.out" 2>"$test_tmp/completion-reload.err"
   grep -Fq 'checkpoint row already contains a halting completion' "$test_tmp/completion-reload.out"
 
@@ -176,7 +177,7 @@ grep -Fq 'geometry has too many lattice subtiles' "$test_tmp/huge.err"
 # saved halt remains active unless explicitly replaced with a later one.
 "$binary" llsss --rule B35678/S4678 --left-edge bg --filters bcaf \
   --partials none --ends none --halts w_pos:12 \
-  --savefile "$test_tmp/checkpoint" c5-f2b '@bg(8)' \
+  --savedir "$test_tmp" --search-name checkpoint c5-f2b '@bg(8)' \
   >"$test_tmp/checkpoint.out" 2>"$test_tmp/checkpoint.err"
 test -s "$test_tmp/checkpoint_12"
 grep -Fq "checkpoint saved: $test_tmp/checkpoint_12" "$test_tmp/checkpoint.out"
@@ -254,7 +255,7 @@ grep -Fq 'search_name=branch-1' "$test_tmp/partition-spec-load.out"
 mkdir "$test_tmp/named-checkpoint"
 "$binary" llsss --load "$test_tmp/checkpoint_12" --halts w_pos:13 \
   --partials none --ends none --search-name renamed --save final \
-  --savefile "$test_tmp/named-checkpoint" \
+  --savedir "$test_tmp/named-checkpoint" \
   >"$test_tmp/named-checkpoint.out" 2>"$test_tmp/named-checkpoint.err"
 test -s "$test_tmp/named-checkpoint/renamed_13"
 sed 's#checkpoint "../checkpoint_12"#checkpoint "../named-checkpoint/renamed_13"#' \
@@ -294,7 +295,7 @@ mkdir "$test_tmp/checkpoint-folder"
 printf 'old checkpoint\n' >"$test_tmp/checkpoint-folder/save_12"
 "$binary" llsss --rule B35678/S4678 --left-edge bg --filters bcaf \
   --partials none --ends none --halts w_pos:13 --save every:2 \
-  --savefile "$test_tmp/checkpoint-folder" c5-f2b '@bg(8)' \
+  --savedir "$test_tmp/checkpoint-folder" c5-f2b '@bg(8)' \
   >"$test_tmp/periodic.out" 2>"$test_tmp/periodic.err"
 test -s "$test_tmp/checkpoint-folder/save_12"
 test -s "$test_tmp/checkpoint-folder/save_13"
@@ -304,5 +305,13 @@ if grep -Fq 'old checkpoint' "$test_tmp/checkpoint-folder/save_12"; then
 fi
 grep -Fq "checkpoint saved: $test_tmp/checkpoint-folder/save_12" "$test_tmp/periodic.out"
 grep -Fq "checkpoint saved: $test_tmp/checkpoint-folder/save_13" "$test_tmp/periodic.out"
+
+printf 'not a directory\n' >"$test_tmp/save-directory-file"
+if "$binary" llsss --save none --savedir "$test_tmp/save-directory-file" c5-f2b '@bg(8)' \
+  >"$test_tmp/save-directory-file.out" 2>"$test_tmp/save-directory-file.err"; then
+  echo 'file-valued save directory unexpectedly succeeded' >&2
+  exit 1
+fi
+grep -Fq 'save directory exists but is not a directory' "$test_tmp/save-directory-file.err"
 
 echo "$mode diagonal search regression passed"
