@@ -825,35 +825,25 @@ public:
     std::vector<std::uint8_t> path(depth_);
     auto node = leaf;
     for(std::size_t depth = depth_; depth > 0; --depth) {
-      const auto target_rank = node - 1U;
-      auto first_word = static_cast<std::size_t>(level_begin_[depth - 1U] >> 4U);
-      auto last_word = static_cast<std::size_t>((level_begin_[depth] + 15U) >> 4U);
-      while(first_word < last_word) {
-        const auto middle = first_word + (last_word - first_word) / 2U;
-        const auto rank_before = absolute_rank_[middle / words_per_absolute_chunk] + relative_rank_[middle];
-        const auto rank_after = rank_before + static_cast<Node>(std::popcount(words_[middle]));
-        if(rank_after <= target_rank) {
-          first_word = middle + 1U;
-        } else {
-          last_word = middle;
-        }
-      }
-      if(first_word >= words_.size())
-        throw std::logic_error("slice-tree lineage select exceeded its bitstream");
-      const auto rank_before = absolute_rank_[first_word / words_per_absolute_chunk] + relative_rank_[first_word];
-      auto bits = words_[first_word];
-      auto remaining = target_rank - rank_before;
-      while(remaining != 0) {
-        bits &= bits - 1U;
-        --remaining;
-      }
-      if(bits == 0)
-        throw std::logic_error("slice-tree lineage select missed its child bit");
-      const auto selected = static_cast<Node>(std::countr_zero(bits));
-      node = static_cast<Node>(first_word) * nodes_per_word + selected / 4U;
-      path[depth - 1U] = static_cast<std::uint8_t>(selected & 0b11U);
-      if(node < level_begin_[depth - 1U] || node >= level_begin_[depth])
-        throw std::logic_error("slice-tree lineage select found the wrong level");
+      const auto [parent, label] = parent_link(node, depth);
+      node = parent;
+      path[depth - 1U] = label;
+    }
+    return path;
+  }
+
+  // Node IDs are breadth-first rather than carrying parent pointers. Reverse
+  // rank-select finds each parent with a binary search over its level's child
+  // bits, returning the root-through-leaf node path without a DFS.
+  [[nodiscard]] std::vector<Node> ancestry(Node leaf) const {
+    if(leaf < leaf_begin() || leaf >= leaf_end())
+      throw std::out_of_range("node is not a current slice-tree leaf");
+    std::vector<Node> path(depth_ + 1U);
+    auto node = leaf;
+    path[depth_] = node;
+    for(std::size_t depth = depth_; depth > 0; --depth) {
+      node = parent_link(node, depth).first;
+      path[depth - 1U] = node;
     }
     return path;
   }
@@ -1223,6 +1213,37 @@ private:
       rank + 1U,
       static_cast<std::uint8_t>((original_word >> shift) & 0x0fU),
     };
+  }
+
+  [[nodiscard]] std::pair<Node, std::uint8_t> parent_link(Node node, std::size_t depth) const {
+    const auto target_rank = node - 1U;
+    auto first_word = static_cast<std::size_t>(level_begin_[depth - 1U] >> 4U);
+    auto last_word = static_cast<std::size_t>((level_begin_[depth] + 15U) >> 4U);
+    while(first_word < last_word) {
+      const auto middle = first_word + (last_word - first_word) / 2U;
+      const auto rank_before = absolute_rank_[middle / words_per_absolute_chunk] + relative_rank_[middle];
+      const auto rank_after = rank_before + static_cast<Node>(std::popcount(words_[middle]));
+      if(rank_after <= target_rank)
+        first_word = middle + 1U;
+      else
+        last_word = middle;
+    }
+    if(first_word >= words_.size())
+      throw std::logic_error("slice-tree ancestry select exceeded its bitstream");
+    const auto rank_before = absolute_rank_[first_word / words_per_absolute_chunk] + relative_rank_[first_word];
+    auto bits = words_[first_word];
+    auto remaining = target_rank - rank_before;
+    while(remaining != 0) {
+      bits &= bits - 1U;
+      --remaining;
+    }
+    if(bits == 0)
+      throw std::logic_error("slice-tree ancestry select missed its child bit");
+    const auto selected = static_cast<Node>(std::countr_zero(bits));
+    const auto parent = static_cast<Node>(first_word) * nodes_per_word + selected / 4U;
+    if(parent < level_begin_[depth - 1U] || parent >= level_begin_[depth])
+      throw std::logic_error("slice-tree ancestry select found the wrong level");
+    return {parent, static_cast<std::uint8_t>(selected & 0b11U)};
   }
 
   void rebuild_rank_directory() {

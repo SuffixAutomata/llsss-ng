@@ -7,7 +7,8 @@ namespace rlife::llsss {
 inline constexpr std::array<std::uint8_t, 16> checkpoint_magic_ = {
     'R', 'L', 'I', 'F', 'E', '-', 'L', 'L', 'S', 'S', 'S', '-', 'C', 'P', 0, 1,
 };
-inline constexpr std::uint32_t checkpoint_version_ = 4;
+inline constexpr std::uint32_t checkpoint_version_ = 5;
+inline constexpr std::uint32_t oldest_checkpoint_version_ = 4;
 inline constexpr std::size_t checkpoint_buffer_size_ = 8U * 1024U * 1024U;
 
 class CheckpointWriter {
@@ -147,7 +148,7 @@ public:
     return values;
   }
 
-  void finish() {
+  [[nodiscard]] std::uint64_t finish() {
     if(remaining_ != sizeof(std::uint64_t))
       throw std::runtime_error("checkpoint has trailing or missing data");
     std::array<std::uint8_t, sizeof(std::uint64_t)> encoded{};
@@ -157,6 +158,7 @@ public:
     remaining_ = 0;
     if(decode<std::uint64_t>(encoded.data()) != checksum_)
       throw std::runtime_error("checkpoint checksum mismatch");
+    return checksum_;
   }
 
 private:
@@ -187,7 +189,10 @@ private:
 
 inline volatile std::sig_atomic_t checkpoint_interrupt_requested_ = 0;
 
-inline void checkpoint_interrupt_handler_(int) { checkpoint_interrupt_requested_ = 1; }
+inline void checkpoint_interrupt_handler_(int) {
+  std::cerr << "Interrupt requested. Will exit after completing the current row." << std::endl;
+  checkpoint_interrupt_requested_ = 1;
+}
 
 inline void install_checkpoint_interrupt_handler() {
   checkpoint_interrupt_requested_ = 0;
@@ -216,6 +221,7 @@ inline void Solver::write_config(CheckpointWriter& output, const Options& option
   output.u8(static_cast<std::uint8_t>(options.save_mode));
   output.u64(static_cast<std::uint64_t>(options.save_every));
   output.string(options.savefile);
+  output.string(options.search_name);
 }
 
 inline int Solver::checkpoint_positive_int(CheckpointReader& input, std::string_view field) {
@@ -226,7 +232,7 @@ inline int Solver::checkpoint_positive_int(CheckpointReader& input, std::string_
   return static_cast<int>(value);
 }
 
-inline Options Solver::read_config(CheckpointReader& input) {
+inline Options Solver::read_config(CheckpointReader& input, std::uint32_t checkpoint_version) {
   Options options;
   options.rule = input.string();
   options.geometry = input.string();
@@ -265,9 +271,12 @@ inline Options Solver::read_config(CheckpointReader& input) {
   options.save_mode = static_cast<SaveMode>(save_mode);
   options.save_every = checkpoint_positive_int(input, "save interval");
   options.savefile = input.string();
+  options.search_name = checkpoint_version >= 5U ? input.string() : "save";
   if(options.rule.empty() || options.geometry.empty() || options.start.empty() || options.savefile.empty()) {
     throw std::runtime_error("checkpoint configuration has an empty required value");
   }
+  if(!valid_search_name(options.search_name))
+    throw std::runtime_error("checkpoint configuration has an invalid search name");
   return options;
 }
 
@@ -311,6 +320,7 @@ inline void Solver::merge_checkpoint_config(const Options& saved) {
     options_.save_every = saved.save_every;
   }
   merge_mutable(command_line, saved, "savefile", &Options::savefile);
+  merge_mutable(command_line, saved, "search_name", &Options::search_name);
 }
 
 inline std::size_t Solver::checkpoint_size(std::uint64_t value, std::string_view field) {
@@ -337,11 +347,11 @@ inline void Solver::load_checkpoint(const std::string& path) {
   std::array<std::uint8_t, checkpoint_magic_.size()> magic{};
   reader.bytes(magic.data(), magic.size());
   const auto checkpoint_version = reader.u32();
-  if(magic != checkpoint_magic_ || checkpoint_version != checkpoint_version_) {
+  if(magic != checkpoint_magic_ || checkpoint_version < oldest_checkpoint_version_ || checkpoint_version > checkpoint_version_) {
     throw std::runtime_error("unsupported checkpoint format: " + path);
   }
 
-  merge_checkpoint_config(read_config(reader));
+  merge_checkpoint_config(read_config(reader, checkpoint_version));
   exhausted_ = reader.boolean();
   completion_at_current_row_ = reader.boolean();
   width_ = checkpoint_size(reader.u64(), "width");
@@ -394,7 +404,7 @@ inline void Solver::load_checkpoint(const std::string& path) {
       throw std::runtime_error("checkpoint pair gate has an invalid sparse index");
     pair_gates_.push_back(std::move(gate));
   }
-  reader.finish();
+  loaded_checkpoint_fingerprint_ = CheckpointFingerprint{static_cast<std::uint64_t>(end), reader.finish()};
 }
 
 inline void Solver::validate_loaded_state() const {
@@ -427,12 +437,48 @@ inline void Solver::validate_loaded_state() const {
   }
 }
 
+inline void Solver::validate_partition_constraint() const {
+  if(!options_.partition_constraint.has_value())
+    return;
+  const auto& partition = *options_.partition_constraint;
+  if(exhausted_ || slices_.empty())
+    throw std::runtime_error("cannot apply a partition to an exhausted checkpoint");
+  if(partition.source != loaded_checkpoint_fingerprint_)
+    throw std::runtime_error("partition spec checkpoint fingerprint mismatch");
+  if(partition.height != height_ || partition.slice >= slices_.size())
+    throw std::runtime_error("partition spec checkpoint dimensions mismatch");
+  const auto& tree = slices_[static_cast<std::size_t>(partition.slice)];
+  if(partition.source_leaves != tree.leaf_count() || partition.part_count < 2U || partition.part_index >= partition.part_count ||
+     partition.first_leaf >= partition.past_leaf || partition.past_leaf > partition.source_leaves || !valid_search_name(partition.search_name)) {
+    throw std::runtime_error("partition spec has an invalid leaf range or identity");
+  }
+}
+
+inline void Solver::apply_partition_restriction(std::size_t position, PackedTags& tags) const {
+  if(!options_.partition_constraint.has_value() || options_.partition_constraint->slice != position)
+    return;
+  const auto& partition = *options_.partition_constraint;
+  const auto& tree = slices_[position];
+  Node expansion = 0;
+  if(tree.leaf_count() == partition.source_leaves) {
+    expansion = 1;
+  } else if(expanded_uniform_tail_ && partition.source_leaves <= std::numeric_limits<Node>::max() / 4U && tree.leaf_count() == 4U * partition.source_leaves) {
+    expansion = 4;
+  } else {
+    throw std::logic_error("partitioned slice shape changed before its restriction was applied");
+  }
+  const auto first = tree.leaf_begin() + expansion * partition.first_leaf;
+  const auto past = tree.leaf_begin() + expansion * partition.past_leaf;
+  tags.clear_range(tree.leaf_begin(), first);
+  tags.clear_range(past, tree.leaf_end());
+}
+
 [[nodiscard]] inline std::filesystem::path Solver::checkpoint_path() const {
   const std::filesystem::path prefix(options_.savefile);
   std::error_code error;
   const bool directory = std::filesystem::is_directory(prefix, error) || options_.savefile.ends_with('/') || options_.savefile.ends_with('\\');
   if(directory) {
-    return prefix / ("save_" + std::to_string(height_));
+    return prefix / (options_.search_name + "_" + std::to_string(height_));
   }
   return std::filesystem::path(options_.savefile + "_" + std::to_string(height_));
 }
@@ -441,6 +487,8 @@ inline void Solver::save_checkpoint() {
   if(options_.save_mode == SaveMode::None || last_checkpoint_height_ == height_) {
     return;
   }
+  if(options_.partition_constraint.has_value())
+    throw std::runtime_error("cannot save before the pending partition restriction has been applied");
   const auto path = checkpoint_path();
   auto temporary = path;
   temporary += ".tmp";
@@ -503,6 +551,10 @@ inline int Solver::finish(int status) {
 }
 
 inline int Solver::finish_interrupted() {
+  if(options_.partition_constraint.has_value()) {
+    std::cout << "interrupt requested before the pending partition restriction was applied; exiting without checkpoint\n";
+    return 130;
+  }
   if(options_.save_mode == SaveMode::None)
     std::cout << "interrupt requested after completed row " << height_ << "; exiting without checkpoint\n";
   else

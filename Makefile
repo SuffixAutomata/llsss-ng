@@ -5,8 +5,8 @@ CPPFLAGS ?=
 LDFLAGS ?=
 
 TARGET := rlife_llsss
-SOURCES := src/main.cpp
-OBJECTS := src/main.o src/rlife/indexed_executor.o
+SOURCES := src/main.cpp src/rlife/partition.cpp
+OBJECTS := src/main.o src/rlife/partition.o src/rlife/indexed_executor.o
 HEADERS := $(wildcard src/rlife/*.hpp)
 
 .PHONY: all clean test
@@ -17,6 +17,9 @@ $(TARGET): $(OBJECTS)
 	$(CXX) $(OBJECTS) $(LDFLAGS) -fopenmp -o $@
 
 src/main.o: src/main.cpp $(HEADERS)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(NATIVE_FLAGS) -Isrc -c $< -o $@
+
+src/rlife/partition.o: src/rlife/partition.cpp $(HEADERS)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(NATIVE_FLAGS) -Isrc -c $< -o $@
 
 src/rlife/indexed_executor.o: src/rlife/indexed_executor.cpp src/rlife/indexed_executor.hpp

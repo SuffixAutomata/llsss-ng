@@ -116,11 +116,14 @@ prefix can be changed with:
 ```sh
 --save none|final|every:N
 --savefile FILE_PREFIX
+--search-name NAME
 ```
 
-If `FILE_PREFIX` names a directory, files in it are named `save_{row}`;
-otherwise the name is `FILE_PREFIX_{row}`. Existing checkpoint files are
-atomically replaced. Resume without geometry or a start grid using:
+If `FILE_PREFIX` names a directory, files in it are named
+`SEARCH_NAME_{row}` (`save_{row}` by default); otherwise the name remains
+`FILE_PREFIX_{row}`.  The search name is checkpoint metadata and survives a
+reload, while the save path remains a runtime policy. Existing checkpoint
+files are atomically replaced. Resume without geometry or a start grid using:
 
 ```sh
 ./rlife_llsss llsss --load FILE [runtime options]
@@ -133,6 +136,59 @@ is used as a baseline and can be explicitly overridden, including `--halts`,
 checkpoint made at its configured halt exits immediately unless a later halt
 is supplied. Ctrl-C is noticed at the next completed row; when saving is
 enabled that row is checkpointed before the program exits.
+
+## Partitioning checkpoints
+
+The dedicated `partition` command divides one selected slice into contiguous
+leaf intervals.  Since final-level node order is lexicographic, every subtree
+occupies a contiguous leaf interval.  A boundary can therefore duplicate at
+most one ancestor at each depth, avoiding the much larger ancestry overlap of
+arbitrarily grouped cut nodes.
+
+By default the command writes small partition specifiers:
+
+```sh
+./rlife_llsss partition --load save_217 --parts 4 \
+  --search-name c5-search --output parts
+```
+
+This creates `parts/c5-search-1.rlp` through
+`parts/c5-search-4.rlp`. A spec records the exact source checkpoint size and
+checksum, saved height, selected slice, source leaf count, and half-open leaf
+range. It cannot silently be applied to another checkpoint. Resume a spec as
+if it were a checkpoint, supplying a later halt when the source checkpoint was
+itself saved at its halt:
+
+```sh
+./rlife_llsss llsss --load parts/c5-search-1.rlp --halts w_pos:120
+```
+
+The first completed row applies the restriction in both support directions;
+normal BCAF, completion, partial, reporting, reification, and checkpoint logic
+then continues unchanged. Child checkpoints inherit their distinct search
+names and save into the spec directory unless explicitly overridden.
+
+Use `--materialize` to perform that ordinary first row immediately and write
+self-contained child checkpoints instead of specs:
+
+```sh
+./rlife_llsss partition --load save_217 --parts 4 \
+  --search-name c5-search --output parts --materialize -- \
+  --threads 20 --partials none
+```
+
+Arguments after `--` are ordinary mutable `llsss` runtime options. The
+partition command controls load/save paths, search names, and the one-row
+stop. A per-child `--partial-output` or `--dump-slice-stats` path must contain
+`{name}`, which is replaced by the child search name.
+
+Automatic slice selection uses the center for asymmetric searches and shifts
+one slice toward a lone symmetry edge. `--slice INDEX` selects a one-based
+slice explicitly. Ideal equal-leaf boundaries are, by default, allowed to move
+within one percent of a part's leaf count in order to minimize the depth of
+`LCA(R-1,R)`. Set `--boundary-slack 0` for exact equal intervals, use
+`--dry-run` to inspect the ranges and spanning-node overhead, and use `--force`
+to replace existing partition outputs.
 
 ## Representation and sweeps
 

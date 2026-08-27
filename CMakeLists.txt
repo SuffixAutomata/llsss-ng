@@ -8,7 +8,7 @@ target_compile_features(rlife_indexed_executor PRIVATE cxx_std_20)
 target_compile_options(rlife_indexed_executor PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(rlife_indexed_executor PRIVATE OpenMP::OpenMP_CXX)
 
-add_executable(rlife_llsss src/main.cpp)
+add_executable(rlife_llsss src/main.cpp src/rlife/partition.cpp)
 target_include_directories(rlife_llsss PRIVATE src)
 target_compile_features(rlife_llsss PRIVATE cxx_std_20)
 target_compile_options(rlife_llsss PRIVATE -Wall -Wextra -Wpedantic)

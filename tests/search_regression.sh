@@ -205,6 +205,91 @@ if "$binary" llsss --load "$test_tmp/checkpoint_12" --rule B3/S23 --save none \
 fi
 grep -Fq 'cannot alter checkpoint search-tree option rule' "$test_tmp/checkpoint-mismatch.err"
 
+# Partition planning uses contiguous leaf intervals, persists a fingerprinted
+# spec, and can materialize every part through the ordinary one-row path.
+"$binary" partition --load "$test_tmp/checkpoint_12" --parts 3 \
+  --search-name branch --boundary-slack 49 --dry-run \
+  >"$test_tmp/partition-plan.out" 2>"$test_tmp/partition-plan.err"
+grep -Fq 'boundary 1: ideal=6 selected=4 shift=-2 lca_depth=11->10' "$test_tmp/partition-plan.out"
+grep -Fq 'part 2: name=branch-2 leaves=[4,12) count=8' "$test_tmp/partition-plan.out"
+
+"$binary" partition --load "$test_tmp/checkpoint_12" --parts 3 \
+  --search-name branch --boundary-slack 0 --output "$test_tmp/partition-specs" \
+  >"$test_tmp/partition-specs.out" 2>"$test_tmp/partition-specs.err"
+for part in 1 2 3; do
+  test -s "$test_tmp/partition-specs/branch-$part.rlp"
+  grep -Fq 'RLIFE-PARTITION-SPEC 1' "$test_tmp/partition-specs/branch-$part.rlp"
+  grep -Fq "search_name \"branch-$part\"" "$test_tmp/partition-specs/branch-$part.rlp"
+done
+
+# --force may replace old child outputs, but never the checkpoint those
+# children still need as their common source.
+mkdir "$test_tmp/partition-source-collision"
+cp "$test_tmp/checkpoint_12" "$test_tmp/partition-source-collision/danger-1.rlp"
+source_hash=$(sha256sum "$test_tmp/partition-source-collision/danger-1.rlp" | awk '{print $1}')
+if "$binary" partition --load "$test_tmp/partition-source-collision/danger-1.rlp" --parts 2 \
+  --search-name danger --output "$test_tmp/partition-source-collision" --force \
+  >"$test_tmp/partition-source-collision.out" 2>"$test_tmp/partition-source-collision.err"; then
+  echo 'partition unexpectedly overwrote its source checkpoint' >&2
+  exit 1
+fi
+grep -Fq 'partition output would overwrite its source checkpoint' "$test_tmp/partition-source-collision.err"
+[[ $(sha256sum "$test_tmp/partition-source-collision/danger-1.rlp" | awk '{print $1}') == "$source_hash" ]]
+
+if "$binary" llsss --load "$test_tmp/partition-specs/branch-1.rlp" --partials none --ends none \
+  >"$test_tmp/partition-unapplied.out" 2>"$test_tmp/partition-unapplied.err"; then
+  echo 'partition spec unexpectedly saved/exited before applying its restriction' >&2
+  exit 1
+fi
+grep -Fq 'partition spec would halt before its restriction is applied' "$test_tmp/partition-unapplied.err"
+
+"$binary" llsss --load "$test_tmp/partition-specs/branch-1.rlp" --halts w_pos:13 \
+  --partials none --ends none --save final \
+  >"$test_tmp/partition-spec-load.out" 2>"$test_tmp/partition-spec-load.err"
+test -s "$test_tmp/partition-specs/branch-1_13"
+grep -Fq 'search_name=branch-1' "$test_tmp/partition-spec-load.out"
+
+# Redirecting an otherwise valid spec to a different checkpoint must fail its
+# exact source fingerprint before any leaf ordinals are interpreted.
+mkdir "$test_tmp/named-checkpoint"
+"$binary" llsss --load "$test_tmp/checkpoint_12" --halts w_pos:13 \
+  --partials none --ends none --search-name renamed --save final \
+  --savefile "$test_tmp/named-checkpoint" \
+  >"$test_tmp/named-checkpoint.out" 2>"$test_tmp/named-checkpoint.err"
+test -s "$test_tmp/named-checkpoint/renamed_13"
+sed 's#checkpoint "../checkpoint_12"#checkpoint "../named-checkpoint/renamed_13"#' \
+  "$test_tmp/partition-specs/branch-2.rlp" >"$test_tmp/partition-specs/wrong-source.rlp"
+if "$binary" llsss --load "$test_tmp/partition-specs/wrong-source.rlp" --halts w_pos:14 --save none \
+  >"$test_tmp/partition-wrong-source.out" 2>"$test_tmp/partition-wrong-source.err"; then
+  echo 'partition spec unexpectedly accepted a different checkpoint' >&2
+  exit 1
+fi
+grep -Fq 'partition spec checkpoint fingerprint mismatch' "$test_tmp/partition-wrong-source.err"
+
+"$binary" partition --load "$test_tmp/checkpoint_12" --parts 3 \
+  --search-name material --boundary-slack 0 --output "$test_tmp/materialized" --materialize -- \
+  --threads 2 --partials every:1 --partial-output "$test_tmp/materialized/{name}.rle" --ends none \
+  >"$test_tmp/materialized.out" 2>"$test_tmp/materialized.err"
+for part in 1 2 3; do
+  test -s "$test_tmp/materialized/material-${part}_13"
+  grep -Fq '#C llsss partial height=13 geometry=c5-f2b' "$test_tmp/materialized/material-$part.rle"
+  "$binary" llsss --load "$test_tmp/materialized/material-${part}_13" --halts w_pos:0 \
+    --partials none --ends none --save none --verbose \
+    >"$test_tmp/materialized-$part.out" 2>"$test_tmp/materialized-$part.err"
+  grep -Fq "search_name=material-$part" "$test_tmp/materialized-$part.out"
+done
+
+"$binary" llsss --load "$test_tmp/checkpoint_12" --halts w_pos:13 \
+  --partials none --ends none --save none --verbose \
+  >"$test_tmp/partition-control.out" 2>"$test_tmp/partition-control.err"
+control_center_leaves=$(sed -n 's/.*label=step.*slice_leaves=\[\([^]]*\)\].*/\1/p' "$test_tmp/partition-control.err" | tail -n 1 | cut -d, -f4)
+partition_center_leaves=0
+for part in 1 2 3; do
+  leaves=$(sed -n 's/.*label=init.*slice_leaves=\[\([^]]*\)\].*/\1/p' "$test_tmp/materialized-$part.err" | tail -n 1 | cut -d, -f4)
+  partition_center_leaves=$((partition_center_leaves + leaves))
+done
+[[ $partition_center_leaves == "$control_center_leaves" ]]
+
 mkdir "$test_tmp/checkpoint-folder"
 printf 'old checkpoint\n' >"$test_tmp/checkpoint-folder/save_12"
 "$binary" llsss --rule B35678/S4678 --left-edge bg --filters bcaf \

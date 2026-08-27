@@ -3,6 +3,7 @@
 #include "geometry_acceptance.hpp"
 #include "geometry_render.hpp"
 #include "indexed_executor.hpp"
+#include "partition.hpp"
 #include "rule.hpp"
 #include "succinct_slice_tree.hpp"
 
@@ -95,7 +96,7 @@ static_assert([] {
 
 } // namespace detail
 
-std::uint64_t getMaxRSS() {
+inline std::uint64_t getMaxRSS() {
 #ifdef __linux__
   struct rusage usage;
   if(getrusage(RUSAGE_SELF, &usage) == 0)
@@ -138,7 +139,11 @@ struct Options {
   SaveMode save_mode = SaveMode::Final;
   int save_every = 1;
   std::string savefile = "save";
+  std::string search_name = "save";
   std::string loadfile;
+  std::optional<PartitionConstraint> partition_constraint;
+  std::optional<std::size_t> row_limit;
+  bool inspection_only = false;
   // Checkpoint loading uses saved configuration as its baseline.  This set
   // distinguishes an invocation default from an option the user explicitly
   // supplied, so mutable settings can be overridden intentionally.
@@ -295,6 +300,12 @@ inline std::vector<std::string> split_words(std::string text) {
   return result;
 }
 
+inline bool valid_search_name(std::string_view name) {
+  return !name.empty() && name.size() <= 200U && name != "." && name != ".." && name.find('/') == std::string_view::npos &&
+         name.find('\\') == std::string_view::npos &&
+         std::ranges::none_of(name, [](char ch) { return std::iscntrl(static_cast<unsigned char>(ch)) != 0; });
+}
+
 inline void print_help(std::ostream& out) {
   out <<
     R"(rlife_llsss llsss [options] <geometry> <start>
@@ -315,6 +326,7 @@ Orthogonal and diagonal fixed-width LLSSS using succinct two-column slice trees.
   --halts w_pos:N            stop at logical W-tile position N
   --save MODE                none, final, or every:N (default: final)
   --savefile FILE_PREFIX     save as FILE_PREFIX_{row} (default: save)
+  --search-name NAME         persistent search identity (default: save)
   --load FILE                resume a checkpoint; geometry/start may be omitted
   --partials MODE            none, final, default, or every:N (default: final)
   --partial-output FILE      write RLE partials/completions to FILE
@@ -338,7 +350,7 @@ inline Options parse_cli(int argc, char** argv) {
   }
   int index = 1;
   if(std::string(argv[index++]) != "llsss") {
-    throw std::runtime_error("the only subcommand is llsss");
+    throw std::runtime_error("expected llsss or partition subcommand");
   }
 
   Options options;
@@ -451,6 +463,11 @@ inline Options parse_cli(int argc, char** argv) {
       if(options.savefile.empty()) {
         throw std::runtime_error("--savefile must not be empty");
       }
+    } else if(current == "--search-name") {
+      options.search_name = argument(current);
+      options.explicitly_set.insert("search_name");
+      if(!valid_search_name(options.search_name))
+        throw std::runtime_error("--search-name must be a nonempty filename component");
     } else if(current == "--load") {
       options.loadfile = argument(current);
       if(options.loadfile.empty()) {
@@ -540,6 +557,24 @@ struct StartGrid {
 class Solver {
 public:
   explicit Solver(Options options) : options_(std::move(options)) {
+    if(!options_.loadfile.empty() && !options_.partition_constraint.has_value()) {
+      const auto requested = std::filesystem::path(options_.loadfile);
+      if(auto spec = try_read_partition_spec(requested)) {
+        partition_specfile_ = requested;
+        options_.loadfile = spec->checkpoint.string();
+        options_.partition_constraint = std::move(spec->constraint);
+        if(!options_.explicitly_set.contains("search_name")) {
+          options_.search_name = options_.partition_constraint->search_name;
+          options_.explicitly_set.insert("search_name");
+        }
+        if(!options_.explicitly_set.contains("savefile")) {
+          auto directory = std::filesystem::absolute(requested).parent_path().string();
+          directory.push_back(std::filesystem::path::preferred_separator);
+          options_.savefile = std::move(directory);
+          options_.explicitly_set.insert("savefile");
+        }
+      }
+    }
     if(options_.save_mode != SaveMode::None)
       install_checkpoint_interrupt_handler();
     const bool loading = !options_.loadfile.empty();
@@ -555,15 +590,23 @@ public:
     rule_.release_partial_lookup();
     if(loading) {
       validate_loaded_state();
+      validate_partition_constraint();
+      if(!partition_specfile_.empty()) {
+        const auto directory = std::filesystem::absolute(partition_specfile_).parent_path();
+        if(!options_.explicitly_set.contains("partial_output") && !options_.partial_output.empty())
+          options_.partial_output = (directory / (options_.search_name + ".rle")).string();
+        if(!options_.explicitly_set.contains("stats_output") && !options_.stats_output.empty())
+          options_.stats_output = (directory / (options_.search_name + ".stats")).string();
+      }
     }
-    if(!options_.partial_output.empty()) {
+    if(!options_.inspection_only && !options_.partial_output.empty()) {
       const auto mode = loading && !options_.explicitly_set.contains("partial_output") ? std::ios::app : std::ios::trunc;
       partial_file_.open(options_.partial_output, std::ios::out | mode);
       if(!partial_file_) {
         throw std::runtime_error("cannot open partial output: " + options_.partial_output);
       }
     }
-    if(!options_.stats_output.empty()) {
+    if(!options_.inspection_only && !options_.stats_output.empty()) {
       const auto mode = loading && !options_.explicitly_set.contains("stats_output") ? std::ios::app : std::ios::trunc;
       stats_file_.open(options_.stats_output, std::ios::out | mode);
       if(!stats_file_) {
@@ -571,11 +614,13 @@ public:
       }
     }
     if(loading) {
+      if(!partition_specfile_.empty())
+        std::cout << "partition spec loaded: " << partition_specfile_.string() << '\n';
       std::cout << "checkpoint loaded: " << options_.loadfile << " at row " << height_ << '\n';
     } else {
       initialize();
     }
-    if(options_.worker_count > 1 && !options_.verbose && pair_gates_ready_) {
+    if(!options_.inspection_only && options_.worker_count > 1 && !options_.verbose && pair_gates_ready_) {
       const bool indexes_ready = std::ranges::all_of(pair_gates_, [&](const PairGate& gate) { return gate.size() == 0 || gate.index_ready(pair_gate_depth_); });
       if(!indexes_ready)
         build_pair_gate_indexes();
@@ -594,7 +639,8 @@ public:
     std::cout << "rlife_llsss: geom=" << geometry_.source << " lattice=" << (geometry_.diagonal() ? "diagonal" : "orthogonal") << " p=" << geometry_.period
               << " k=" << geometry_.displacement << " subtiles=" << geometry_.subtile_count << " rule=" << options_.rule << " width=" << width_
               << " left_edge=" << edge_name(options_.left_edge) << " right_edge=" << edge_name(options_.right_edge)
-              << " bcaf=" << (options_.bcaf ? "yes" : "no") << " halt_on_ends=" << (options_.halt_on_ends ? "yes" : "no") << '\n';
+              << " bcaf=" << (options_.bcaf ? "yes" : "no") << " halt_on_ends=" << (options_.halt_on_ends ? "yes" : "no")
+              << " search_name=" << options_.search_name << '\n';
     if(options_.worker_count != 1) {
       std::cout << "indexed relation walks: " << options_.worker_count << " workers\n";
     }
@@ -604,6 +650,11 @@ public:
     if(slices_.empty()) {
       std::cout << "search space is empty after initialization\n";
       return finish(0);
+    }
+    if(options_.partition_constraint.has_value() &&
+       ((completion_at_current_row_ && options_.detect_ends && options_.halt_on_ends) ||
+        (options_.halt_height >= 0 && geometry_.w_position(height_) >= static_cast<std::size_t>(options_.halt_height)))) {
+      throw std::runtime_error("partition spec would halt before its restriction is applied; supply a later --halts value or use partition --materialize");
     }
     if(completion_at_current_row_ && options_.detect_ends && options_.halt_on_ends) {
       std::cout << "checkpoint row already contains a halting completion\n";
@@ -619,6 +670,7 @@ public:
       return finish_interrupted();
     }
 
+    std::size_t completed_rows = 0;
     for(;;) {
       if(checkpoint_interrupt_requested_) {
         return finish_interrupted();
@@ -645,7 +697,9 @@ public:
       expanded_uniform_tail_ = true;
 
       phase("support and filter sweeps");
-      if(!prune_supported()) {
+      const bool supported = prune_supported();
+      options_.partition_constraint.reset();
+      if(!supported) {
         if(geometry_.subtile_count != 1) {
           std::cout << "search exhausted at flattened depth " << height_ << " (w_pos " << geometry_.position_string(height_) << ")\n";
         } else {
@@ -659,6 +713,7 @@ public:
         return finish(0);
       }
       expanded_uniform_tail_ = false;
+      ++completed_rows;
       phase("row accounting");
 
       bool partial_emitted = false;
@@ -697,6 +752,14 @@ public:
         return finish(0);
       }
 
+      if(options_.row_limit.has_value() && completed_rows >= *options_.row_limit) {
+        std::cout << "partition materialization stopped after completed row " << height_ << '\n';
+        if(!partial_emitted)
+          emit_final_partial("partition");
+        report_row();
+        return finish(0);
+      }
+
       report_row();
       if(options_.save_mode == SaveMode::Every && height_ % static_cast<std::size_t>(options_.save_every) == 0) {
         save_checkpoint();
@@ -708,6 +771,8 @@ public:
   }
 
 private:
+  friend class PartitionCommand;
+
   using Clock = std::chrono::steady_clock;
   using Node = SuccinctSliceTree::Node;
 
@@ -768,7 +833,7 @@ private:
 
   static void write_config(CheckpointWriter& output, const Options& options);
   static int checkpoint_positive_int(CheckpointReader& input, std::string_view field);
-  static Options read_config(CheckpointReader& input);
+  static Options read_config(CheckpointReader& input, std::uint32_t checkpoint_version);
 
   template <class T> void merge_immutable(const Options& command_line, const Options& saved, std::string_view name, T Options::* member);
   template <class T> void merge_mutable(const Options& command_line, const Options& saved, std::string_view name, T Options::* member);
@@ -776,6 +841,8 @@ private:
   static std::size_t checkpoint_size(std::uint64_t value, std::string_view field);
   void load_checkpoint(const std::string& path);
   void validate_loaded_state() const;
+  void validate_partition_constraint() const;
+  void apply_partition_restriction(std::size_t position, PackedTags& tags) const;
   [[nodiscard]] std::filesystem::path checkpoint_path() const;
   void save_checkpoint();
   int finish(int status);
@@ -1880,6 +1947,7 @@ private:
     };
 
     phase(bcaf_active ? "  implicit relation: right reach + bcaf suffix" : "  implicit relation: right reach");
+    apply_partition_restriction(slices_.size() - 1U, normal.back()[1]);
     seed_suffix(slices_.size() - 1U);
     for(std::size_t i = adjacency_count; i > 0; --i) {
       const auto relation = i - 1U;
@@ -1924,6 +1992,7 @@ private:
             witness[relation][1].set(left_leaf);
         });
       }
+      apply_partition_restriction(relation, normal[relation][1]);
       seed_suffix(relation);
     }
 
@@ -1935,6 +2004,7 @@ private:
       witness[position][0].or_source_range(normal[position][0], leaves.begin, skip.begin);
       witness[position][0].or_source_range(normal[position][0], skip.end, leaves.end);
     };
+    apply_partition_restriction(0, normal.front()[0]);
     seed_prefix(0);
 
     auto live_leaf = [&](std::size_t position, Node leaf) {
@@ -2184,6 +2254,7 @@ private:
         else
           run_edges.template operator()<false>();
       }
+      apply_partition_restriction(i + 1U, normal[i + 1U][0]);
       seed_prefix(i + 1U);
       if(next_gates[i].size() == 0)
         return false;
@@ -2786,6 +2857,8 @@ private:
   bool exhausted_ = false;
   bool completion_at_current_row_ = false;
   bool loaded_from_checkpoint_ = false;
+  CheckpointFingerprint loaded_checkpoint_fingerprint_;
+  std::filesystem::path partition_specfile_;
   std::optional<std::size_t> last_checkpoint_height_;
   std::ofstream partial_file_;
   std::ofstream stats_file_;
