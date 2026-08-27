@@ -1,0 +1,35 @@
+name: macOS arm64
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Verify Apple Silicon runner
+        run: test "$(uname -m)" = arm64
+
+      - name: Install OpenMP runtime
+        run: brew install libomp
+
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix libomp)"
+
+      - name: Build
+        run: cmake --build build --parallel 3
+
+      - name: Run smoke test
+        run: ctest --test-dir build --output-on-failure -L smoke

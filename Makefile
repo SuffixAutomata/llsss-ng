@@ -1,6 +1,11 @@
 CXX ?= c++
 CXXFLAGS ?= -O3 -DNDEBUG -std=c++20 -Wall -Wextra -Wpedantic
+HOST_ARCH := $(shell uname -m)
+ifneq ($(filter arm64 aarch64,$(HOST_ARCH)),)
+NATIVE_FLAGS ?= -mcpu=native
+else
 NATIVE_FLAGS ?= -march=native
+endif
 CPPFLAGS ?=
 LDFLAGS ?=
 
