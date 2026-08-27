@@ -10,10 +10,37 @@ fi
 test_tmp=$(mktemp -d "${TMPDIR:-/tmp}/rlife-regression.XXXXXX")
 trap 'rm -rf "$test_tmp"' EXIT
 
+if command -v timeout >/dev/null 2>&1; then
+  timeout_command=timeout
+elif command -v gtimeout >/dev/null 2>&1; then
+  timeout_command=gtimeout
+else
+  timeout_command=
+fi
+
+run_with_timeout() {
+  if [[ -n $timeout_command ]]; then
+    "$timeout_command" "${RLIFE_TEST_TIMEOUT:-180}" "$@"
+  else
+    "$@"
+  fi
+}
+
+sha256_digest() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$@"
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$@"
+  else
+    echo 'search regression requires sha256sum or shasum' >&2
+    return 127
+  fi
+}
+
 normalize_hash() {
   sed -n 's/^.*cols: //p' "$1" \
     | sed 's/[^0-9][^0-9]*/ /g;s/^ //;s/ $//' \
-    | sha256sum \
+    | sha256_digest \
     | awk '{print $1}'
 }
 
@@ -22,7 +49,7 @@ run_search() {
   local width=$2
   local stdout_file=$3
   local stderr_file=$4
-  timeout "${RLIFE_TEST_TIMEOUT:-180}" "$binary" llsss \
+  run_with_timeout "$binary" llsss \
     --rule 'B35678/S4678' \
     --left-edge bg \
     --filters bcaf \
@@ -37,7 +64,7 @@ run_tiny_edge() {
   local halt=$3
   local stdout_file=$4
   local stderr_file=$5
-  timeout "${RLIFE_TEST_TIMEOUT:-180}" "$binary" llsss \
+  run_with_timeout "$binary" llsss \
     --rule B3578/S24678 --left-edge "$edge" --filters bcaf \
     --partials none --ends none --halts "w_pos:$halt" --save none \
     "$geometry" '@bg(3)' >"$stdout_file" 2>"$stderr_file"
@@ -56,7 +83,7 @@ if [[ $mode == smoke ]]; then
   four_subtile_hash=$(normalize_hash "$test_tmp/four-subtile.err")
   [[ $four_subtile_hash == 92692a524225d9f5d02253fc1e12459e06f958e4b7a876dfc6335d08be7bbc99 ]]
 
-  timeout "${RLIFE_TEST_TIMEOUT:-180}" "$binary" llsss \
+  run_with_timeout "$binary" llsss \
     --rule B3578/S24678 --left-edge gse --filters bcaf \
     --partials final --partial-output "$test_tmp/gse.rle" \
     --ends none --halts w_pos:14 \
@@ -88,7 +115,7 @@ if [[ $mode == smoke ]]; then
   fi
 
   mkdir "$test_tmp/completion-checkpoints"
-  timeout "${RLIFE_TEST_TIMEOUT:-180}" "$binary" llsss \
+  run_with_timeout "$binary" llsss \
     --rule B3/S23 --left-edge bg --filters bcaf --partials none \
     --save final --savedir "$test_tmp/completion-checkpoints/search2" --search-name completion-checkpoint \
     --partial-output "$test_tmp/completion.rle" c4d-f2b '@bg(6)' \
@@ -96,7 +123,7 @@ if [[ $mode == smoke ]]; then
   grep -Fq 'completion at flattened depth 48 (w_pos 24[0])' "$test_tmp/completion.out"
   grep -Fq '#C physical time phases 0..3 left-to-right; gap=16' "$test_tmp/completion.rle"
   grep -Fq 'x = 94, y = 12, rule = B3/S23' "$test_tmp/completion.rle"
-  [[ $(sha256sum "$test_tmp/completion.rle" | awk '{print $1}') == 8571b78b68c4f8db6d845fe68dd9ead52c589fa0c2c19d269d07a10543fcee40 ]]
+  [[ $(sha256_digest "$test_tmp/completion.rle" | awk '{print $1}') == 8571b78b68c4f8db6d845fe68dd9ead52c589fa0c2c19d269d07a10543fcee40 ]]
   test -s "$test_tmp/completion-checkpoints/search2/completion-checkpoint_48"
   "$binary" llsss --load "$test_tmp/completion-checkpoints/search2/completion-checkpoint_48" --partials none --save none \
     >"$test_tmp/completion-reload.out" 2>"$test_tmp/completion-reload.err"
@@ -104,7 +131,7 @@ if [[ $mode == smoke ]]; then
 
   # The indexed implicit walk carries only the three-state completion class;
   # it must reproduce the serial exact-summary completion byte-for-byte.
-  timeout "${RLIFE_TEST_TIMEOUT:-180}" "$binary" llsss \
+  run_with_timeout "$binary" llsss \
     --rule B3/S23 --left-edge bg --filters bcaf --threads 4 \
     --partials final --partial-output "$test_tmp/completion-indexed.rle" \
     --save none c4d-f2b '@bg(6)' \
@@ -114,12 +141,12 @@ if [[ $mode == smoke ]]; then
 
   # Capturing a scheduled partial inside the indexed left sweep must preserve
   # the serial DFS choice byte-for-byte.
-  timeout "${RLIFE_TEST_TIMEOUT:-180}" "$binary" llsss \
+  run_with_timeout "$binary" llsss \
     --rule B35678/S4678 --left-edge bg --filters bcaf --threads 1 \
     --partials every:1 --partial-output "$test_tmp/partials-serial.rle" \
     --save none c3d-f2b '@bg(7)' \
     >"$test_tmp/partials-serial.out" 2>"$test_tmp/partials-serial.err"
-  timeout "${RLIFE_TEST_TIMEOUT:-180}" "$binary" llsss \
+  run_with_timeout "$binary" llsss \
     --rule B35678/S4678 --left-edge bg --filters bcaf --threads 4 \
     --partials every:1 --partial-output "$test_tmp/partials-indexed.rle" \
     --save none c3d-f2b '@bg(7)' \
@@ -299,7 +326,7 @@ done
 # children still need as their common source.
 mkdir "$test_tmp/partition-source-collision"
 cp "$test_tmp/checkpoint_12" "$test_tmp/partition-source-collision/danger-1.rlp"
-source_hash=$(sha256sum "$test_tmp/partition-source-collision/danger-1.rlp" | awk '{print $1}')
+source_hash=$(sha256_digest "$test_tmp/partition-source-collision/danger-1.rlp" | awk '{print $1}')
 if "$binary" partition --load "$test_tmp/partition-source-collision/danger-1.rlp" --parts 2 \
   --search-name danger --output "$test_tmp/partition-source-collision" --force \
   >"$test_tmp/partition-source-collision.out" 2>"$test_tmp/partition-source-collision.err"; then
@@ -307,7 +334,7 @@ if "$binary" partition --load "$test_tmp/partition-source-collision/danger-1.rlp
   exit 1
 fi
 grep -Fq 'partition output would overwrite its source checkpoint' "$test_tmp/partition-source-collision.err"
-[[ $(sha256sum "$test_tmp/partition-source-collision/danger-1.rlp" | awk '{print $1}') == "$source_hash" ]]
+[[ $(sha256_digest "$test_tmp/partition-source-collision/danger-1.rlp" | awk '{print $1}') == "$source_hash" ]]
 
 if "$binary" llsss --load "$test_tmp/partition-specs/branch-1.rlp" --partials none --ends none \
   >"$test_tmp/partition-unapplied.out" 2>"$test_tmp/partition-unapplied.err"; then

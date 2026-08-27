@@ -3,6 +3,7 @@ name: macOS arm64
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -13,7 +14,7 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Verify Apple Silicon runner
         run: test "$(uname -m)" = arm64
@@ -30,6 +31,26 @@ jobs:
 
       - name: Build
         run: cmake --build build --parallel 3
+
+      - name: Package standalone binary
+        run: |
+          mkdir -p package/rlife-macos-arm64
+          cp build/rlife package/rlife-macos-arm64/rlife
+          cp -L "$(brew --prefix libomp)/lib/libomp.dylib" package/rlife-macos-arm64/libomp.dylib
+          libomp_reference="$(otool -L package/rlife-macos-arm64/rlife | awk '/libomp.*dylib/ { print $1; exit }')"
+          test -n "$libomp_reference"
+          install_name_tool -change "$libomp_reference" '@executable_path/libomp.dylib' package/rlife-macos-arm64/rlife
+          codesign --force --sign - package/rlife-macos-arm64/rlife
+          package/rlife-macos-arm64/rlife llsss --help >/dev/null
+          tar -czf rlife-macos-arm64.tar.gz -C package rlife-macos-arm64
+
+      - name: Upload macOS arm64 binary
+        uses: actions/upload-artifact@v6
+        with:
+          name: rlife-macos-arm64-${{ github.sha }}
+          path: rlife-macos-arm64.tar.gz
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Run smoke test
         run: ctest --test-dir build --output-on-failure -L smoke
