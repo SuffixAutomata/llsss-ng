@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -17,6 +19,7 @@ from typing import Any
 
 
 MANIFEST_VERSION = 1
+DISK_PAUSE_EXIT = 75
 STATUS_REASONS = {
     "memory_cap",
     "exhausted",
@@ -39,6 +42,43 @@ RLE_KIND = re.compile(r"^#C llsss ([A-Za-z0-9_-]+)\b", re.MULTILINE)
 
 class ManagerError(RuntimeError):
     pass
+
+
+def parse_byte_size(text: str, option: str) -> int:
+    value = text.lower()
+    if value in ("none", "off", "0"):
+        return 0
+    match = re.fullmatch(r"([0-9]+)([a-z]*)", value)
+    suffixes = {
+        "": 1,
+        "b": 1,
+        "k": 1 << 10,
+        "kb": 1 << 10,
+        "kib": 1 << 10,
+        "m": 1 << 20,
+        "mb": 1 << 20,
+        "mib": 1 << 20,
+        "g": 1 << 30,
+        "gb": 1 << 30,
+        "gib": 1 << 30,
+        "t": 1 << 40,
+        "tb": 1 << 40,
+        "tib": 1 << 40,
+    }
+    if match is None or match.group(2) not in suffixes:
+        raise ManagerError(f"{option} must be none or an integer byte size such as 500MiB or 8GiB")
+    number = int(match.group(1))
+    result = number * suffixes[match.group(2)]
+    if number == 0 or result >= 1 << 64:
+        raise ManagerError(f"{option} is outside the supported range")
+    return result
+
+
+def format_bytes(value: int) -> str:
+    for suffix, unit in (("TiB", 1 << 40), ("GiB", 1 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10)):
+        if value >= unit:
+            return f"{value / unit:.2f}{suffix}"
+    return f"{value}B"
 
 
 def now() -> str:
@@ -101,6 +141,16 @@ class Manager:
         self.results_path = workdir / "results.rle"
         self.events_path = workdir / "events.jsonl"
         self.manifest = manifest
+        config = self.manifest.setdefault("config", {})
+        if "disk_reserve_bytes" not in config:
+            memory_cap = str(config.get("memory_cap", "none"))
+            config["disk_reserve"] = memory_cap
+            config["disk_reserve_bytes"] = parse_byte_size(memory_cap, "saved memory cap")
+        else:
+            config.setdefault("disk_reserve", str(config["disk_reserve_bytes"]))
+        config.setdefault("archive_dir", None)
+        self.manifest.setdefault("pause_reason", None)
+        self.manifest.setdefault("archived_checkpoints", [])
 
     @classmethod
     def create(
@@ -108,26 +158,47 @@ class Manager:
         workdir: Path,
         binary: Path,
         memory_cap: str,
+        disk_reserve: str | None,
+        archive_dir: Path | None,
         parts: int,
         boundary_slack: float,
         solver_args: list[str],
     ) -> "Manager":
+        if archive_dir is not None:
+            try:
+                archive_dir.relative_to(workdir)
+            except ValueError:
+                pass
+            else:
+                raise ManagerError("--archive-dir must be outside the managed work directory")
+            try:
+                workdir.relative_to(archive_dir)
+            except ValueError:
+                pass
+            else:
+                raise ManagerError("--archive-dir must not contain the managed work directory")
         if workdir.exists() and any(workdir.iterdir()):
             raise ManagerError(f"start work directory is not empty: {workdir}")
         workdir.mkdir(parents=True, exist_ok=True)
         for directory in ("attempts", "checkpoints", "partitions"):
             (workdir / directory).mkdir()
+        reserve_text = memory_cap if disk_reserve is None else disk_reserve
+        reserve_bytes = parse_byte_size(reserve_text, "--disk-reserve")
         manifest: dict[str, Any] = {
             "version": MANIFEST_VERSION,
             "state": "running",
             "outcome": None,
             "error": None,
+            "pause_reason": None,
             "created_at": now(),
             "updated_at": now(),
             "config": {
                 "binary": str(binary),
                 "launch_cwd": str(Path.cwd()),
                 "memory_cap": memory_cap,
+                "disk_reserve": reserve_text,
+                "disk_reserve_bytes": reserve_bytes,
+                "archive_dir": str(archive_dir) if archive_dir is not None else None,
                 "parts": parts,
                 "boundary_slack": boundary_slack,
                 "solver_args": solver_args,
@@ -152,10 +223,11 @@ class Manager:
             "events": [],
             "terminal": {"exhausted": 0, "halt": 0, "completion": 0},
             "discoveries": {},
+            "archived_checkpoints": [],
         }
         manager = cls(workdir, manifest)
         manager.save()
-        manager.rebuild_outputs()
+        manager.rebuild_outputs_best_effort()
         return manager
 
     @classmethod
@@ -170,13 +242,243 @@ class Manager:
 
     def save(self) -> None:
         self.manifest["updated_at"] = now()
-        atomic_json(self.manifest_path, self.manifest)
+        try:
+            atomic_json(self.manifest_path, self.manifest)
+        except OSError as error:
+            raise ManagerError(f"cannot save manager state {self.manifest_path}: {error}") from error
 
     def relative(self, path: Path) -> str:
         return os.path.relpath(path, self.workdir)
 
     def absolute(self, stored: str) -> Path:
         return (self.workdir / stored).resolve()
+
+    def configure(self, disk_reserve: str | None, archive_dir: Path | None) -> bool:
+        changed = False
+        config = self.manifest["config"]
+        if disk_reserve is not None:
+            reserve_bytes = parse_byte_size(disk_reserve, "--disk-reserve")
+            config["disk_reserve"] = disk_reserve
+            config["disk_reserve_bytes"] = reserve_bytes
+            changed = True
+        if archive_dir is not None:
+            resolved = archive_dir.expanduser().resolve()
+            try:
+                resolved.relative_to(self.workdir)
+            except ValueError:
+                pass
+            else:
+                raise ManagerError("--archive-dir must be outside the managed work directory")
+            try:
+                self.workdir.relative_to(resolved)
+            except ValueError:
+                pass
+            else:
+                raise ManagerError("--archive-dir must not contain the managed work directory")
+            config["archive_dir"] = str(resolved)
+            changed = True
+        return changed
+
+    def disk_free_bytes(self) -> int:
+        try:
+            return shutil.disk_usage(self.workdir).free
+        except OSError as error:
+            raise ManagerError(f"cannot inspect free space for {self.workdir}: {error}") from error
+
+    def live_checkpoint_paths(self) -> set[Path]:
+        result: set[Path] = set()
+        active = self.manifest.get("active")
+        branches = list(self.manifest.get("stack", []))
+        if active is not None:
+            branches.append(active["branch"])
+        for branch in branches:
+            checkpoint = branch.get("checkpoint")
+            if checkpoint:
+                result.add(Path(checkpoint).resolve())
+        return result
+
+    def retired_checkpoint_paths(self) -> list[Path]:
+        live = self.live_checkpoint_paths()
+        active_partition: Path | None = None
+        active = self.manifest.get("active")
+        if active is not None and active.get("action") == "split" and active.get("partition"):
+            active_partition = self.absolute(active["partition"]["directory"])
+
+        candidates: set[Path] = set()
+        status_paths = list((self.workdir / "attempts").glob("*.status.json"))
+        status_paths.extend((self.workdir / "partitions").glob("*/*.status.json"))
+        for status_path in status_paths:
+            try:
+                checkpoint = load_json(status_path).get("checkpoint")
+            except ManagerError:
+                continue
+            if not checkpoint:
+                continue
+            path = Path(checkpoint).resolve()
+            try:
+                path.relative_to(self.workdir)
+            except ValueError:
+                continue
+            if path in live or not path.is_file() or path.name.endswith(".tmp"):
+                continue
+            if active_partition is not None:
+                try:
+                    path.relative_to(active_partition)
+                except ValueError:
+                    pass
+                else:
+                    continue
+            candidates.add(path)
+        return sorted(candidates, key=lambda path: (path.stat().st_mtime_ns, str(path)))
+
+    @staticmethod
+    def same_file_contents(first: Path, second: Path) -> bool:
+        if first.stat().st_size != second.stat().st_size:
+            return False
+        first_digest = hashlib.sha256()
+        second_digest = hashlib.sha256()
+        with first.open("rb") as left, second.open("rb") as right:
+            while True:
+                left_block = left.read(16 << 20)
+                right_block = right.read(16 << 20)
+                if not left_block and not right_block:
+                    break
+                first_digest.update(left_block)
+                second_digest.update(right_block)
+        return first_digest.digest() == second_digest.digest()
+
+    def archive_checkpoint(self, source: Path, archive_root: Path) -> int:
+        relative = source.relative_to(self.workdir)
+        destination = archive_root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        size = source.stat().st_size
+        record = {
+            "source": str(relative),
+            "destination": str(destination),
+            "bytes": size,
+            "time": now(),
+            "state": "planned",
+        }
+        records = self.manifest["archived_checkpoints"]
+        existing = next(
+            (
+                item
+                for item in records
+                if item.get("source") == record["source"] and item.get("destination") == record["destination"]
+            ),
+            None,
+        )
+        if existing is None:
+            records.append(record)
+        else:
+            record = existing
+            record.update({"bytes": size, "time": now(), "state": "planned"})
+
+        if destination.exists():
+            if not destination.is_file() or not self.same_file_contents(source, destination):
+                raise ManagerError(f"archive destination conflicts with checkpoint: {destination}")
+        elif source.stat().st_dev == destination.parent.stat().st_dev:
+            os.replace(source, destination)
+        else:
+            temporary = destination.with_name(destination.name + f".moving-{os.getpid()}")
+            try:
+                with source.open("rb") as input_file, temporary.open("wb") as output_file:
+                    shutil.copyfileobj(input_file, output_file, length=16 << 20)
+                    output_file.flush()
+                    os.fsync(output_file.fileno())
+                shutil.copystat(source, temporary)
+                if temporary.stat().st_size != size:
+                    raise ManagerError(f"archived checkpoint has the wrong size: {temporary}")
+                os.replace(temporary, destination)
+            except Exception:
+                temporary.unlink(missing_ok=True)
+                raise
+            source.unlink()
+
+        if source.exists():
+            source.unlink()
+        record["state"] = "archived"
+        record["time"] = now()
+        self.event(
+            "checkpoint_archived",
+            source=str(relative),
+            destination=str(destination),
+            bytes=size,
+        )
+        self.save()
+        print(f"manager: archived retired checkpoint {relative} ({format_bytes(size)}) -> {destination}", flush=True)
+        return size
+
+    def archive_retired_checkpoints(self, target_free: int | None = None) -> tuple[int, int]:
+        configured = self.manifest["config"].get("archive_dir")
+        if not configured:
+            return self.disk_free_bytes(), 0
+        archive_root = Path(configured)
+        archive_root.mkdir(parents=True, exist_ok=True)
+        if target_free is not None and archive_root.stat().st_dev == self.workdir.stat().st_dev:
+            print(
+                f"manager: archive directory {archive_root} is on the managed filesystem and cannot reclaim space",
+                file=sys.stderr,
+                flush=True,
+            )
+            return self.disk_free_bytes(), 0
+
+        moved = 0
+        for source in self.retired_checkpoint_paths():
+            moved += self.archive_checkpoint(source, archive_root)
+            free = self.disk_free_bytes()
+            if target_free is not None and free >= target_free:
+                return free, moved
+        return self.disk_free_bytes(), moved
+
+    def pause_for_disk(self, stage: str, free: int, reserve: int, detail: str | None = None) -> None:
+        message = (
+            f"disk reserve reached before {stage}: {format_bytes(free)} free is below "
+            f"the configured {format_bytes(reserve)} reserve"
+        )
+        if detail:
+            message += f" ({detail})"
+        self.manifest["state"] = "paused"
+        self.manifest["error"] = message
+        self.manifest["pause_reason"] = {
+            "kind": "disk_space",
+            "stage": stage,
+            "free_bytes": free,
+            "required_bytes": reserve,
+        }
+        self.event(
+            "manager_paused_disk",
+            stage=stage,
+            free_bytes=free,
+            required_bytes=reserve,
+            detail=detail,
+        )
+        self.save()
+        print(f"manager: {message}; free space and resume", file=sys.stderr, flush=True)
+
+    def ensure_disk_space(self, stage: str) -> bool:
+        reserve = int(self.manifest["config"].get("disk_reserve_bytes", 0))
+        if reserve == 0:
+            return True
+        free = self.disk_free_bytes()
+        if free >= reserve:
+            return True
+        detail: str | None = None
+        if self.manifest["config"].get("archive_dir"):
+            try:
+                free, moved = self.archive_retired_checkpoints(reserve)
+                if moved:
+                    print(
+                        f"manager: archive reclaimed {format_bytes(moved)}; {format_bytes(free)} now free",
+                        flush=True,
+                    )
+            except (ManagerError, OSError) as error:
+                detail = f"automatic archival failed: {error}"
+                free = self.disk_free_bytes()
+        if free >= reserve:
+            return True
+        self.pause_for_disk(stage, free, reserve, detail)
+        return False
 
     def event(self, kind: str, **fields: Any) -> None:
         self.manifest["events"].append({"time": now(), "kind": kind, **fields})
@@ -224,6 +526,14 @@ class Manager:
             for event in self.manifest.get("events", []):
                 output.write(json.dumps(event, sort_keys=True) + "\n")
         os.replace(events_tmp, self.events_path)
+
+    def rebuild_outputs_best_effort(self) -> bool:
+        try:
+            self.rebuild_outputs()
+            return True
+        except OSError as error:
+            print(f"manager: could not rebuild summary outputs: {error}", file=sys.stderr, flush=True)
+            return False
 
     def allocate_attempt(self, active: dict[str, Any]) -> dict[str, Any]:
         number = self.manifest["next_attempt"]
@@ -322,9 +632,10 @@ class Manager:
     def fail(self, message: str) -> None:
         self.manifest["state"] = "failed"
         self.manifest["error"] = message
+        self.manifest["pause_reason"] = None
         self.event("manager_failed", message=message)
         self.save()
-        self.rebuild_outputs()
+        self.rebuild_outputs_best_effort()
 
     def drive_extension(self) -> bool:
         active = self.manifest["active"]
@@ -335,6 +646,8 @@ class Manager:
         return_code: int | None = None
         interrupted = False
         if not status_path.is_file():
+            if not self.ensure_disk_space(f"extending {branch['id']}"):
+                return False
             command = self.command_for_extension(branch, attempt)
             return_code, interrupted = self.run_command(command, Path(self.manifest["config"]["launch_cwd"]))
 
@@ -344,10 +657,19 @@ class Manager:
             if interrupted or return_code == 130:
                 self.manifest["state"] = "paused"
                 self.manifest["error"] = None
+                self.manifest["pause_reason"] = {"kind": "interrupt", "stage": "extend"}
                 self.event("manager_paused", branch=branch["id"], stage="extend")
                 self.save()
                 if added:
-                    self.rebuild_outputs()
+                    self.rebuild_outputs_best_effort()
+                return False
+            reserve = int(self.manifest["config"].get("disk_reserve_bytes", 0))
+            if reserve and self.disk_free_bytes() < reserve:
+                self.save()
+                if self.ensure_disk_space(f"retrying {branch['id']} after an incomplete checkpoint"):
+                    if added:
+                        self.rebuild_outputs_best_effort()
+                    return True
                 return False
             self.fail(f"rlife exited with status {return_code} without writing {status_path}")
             return False
@@ -388,6 +710,7 @@ class Manager:
                     return False
             self.manifest["state"] = "paused"
             self.manifest["error"] = None
+            self.manifest["pause_reason"] = {"kind": "interrupt", "stage": "extend"}
             self.event("manager_paused", branch=branch["id"], stage="extend")
         elif reason == "completion":
             self.manifest["terminal"]["completion"] += 1
@@ -402,12 +725,15 @@ class Manager:
             return False
 
         self.save()
-        if added:
-            self.rebuild_outputs()
         if interrupted and self.manifest["state"] == "running":
             self.manifest["state"] = "paused"
+            self.manifest["pause_reason"] = {"kind": "interrupt", "stage": "extend"}
             self.event("manager_paused", branch=branch["id"], stage="extend")
             self.save()
+        if self.manifest["state"] == "running" and not self.ensure_disk_space(f"continuing after {branch['id']}"):
+            return False
+        if added:
+            self.rebuild_outputs_best_effort()
         return self.manifest["state"] == "running"
 
     def allocate_partition(self, active: dict[str, Any]) -> dict[str, Any]:
@@ -422,26 +748,40 @@ class Manager:
         self.save()
         return partition
 
-    def partition_statuses(self, partition: dict[str, Any]) -> list[tuple[str, Path, Path, dict[str, Any]]] | None:
-        count = int(self.manifest["config"]["parts"])
+    def partition_status(
+        self, partition: dict[str, Any], part: int
+    ) -> tuple[str, Path, Path, dict[str, Any]] | None:
         directory = self.absolute(partition["directory"])
-        statuses: list[tuple[str, Path, Path, dict[str, Any]]] = []
-        for part in range(1, count + 1):
-            name = f"{partition['name']}-{part}"
-            status_path = directory / f"{name}.status.json"
-            rle_path = directory / f"{name}.rle"
-            if not status_path.is_file():
-                return None
+        name = f"{partition['name']}-{part}"
+        status_path = directory / f"{name}.status.json"
+        rle_path = directory / f"{name}.rle"
+        if not status_path.is_file():
+            return None
+        try:
             status = self.read_status(status_path)
-            if status["reason"] == "interrupted":
-                return None
-            checkpoint = status.get("checkpoint")
-            if checkpoint is None or not Path(checkpoint).is_file():
-                return None
-            statuses.append((name, status_path, rle_path, status))
-        return statuses
+        except ManagerError as error:
+            print(f"manager: ignoring incomplete partition status {status_path}: {error}", file=sys.stderr)
+            return None
+        active = self.manifest.get("active")
+        expected_height = int(active["branch"]["height"]) + 1 if active is not None else None
+        if (
+            status.get("search_name") != name
+            or status["reason"] == "interrupted"
+            or status.get("exit_status") != 0
+            or status.get("height") != expected_height
+        ):
+            return None
+        checkpoint = status.get("checkpoint")
+        expected_checkpoint = (directory / f"{name}_{expected_height}").resolve()
+        if (
+            checkpoint is None
+            or Path(checkpoint).resolve() != expected_checkpoint
+            or not expected_checkpoint.is_file()
+        ):
+            return None
+        return name, status_path, rle_path, status
 
-    def command_for_partition(self, branch: dict[str, Any], partition: dict[str, Any]) -> list[str]:
+    def command_for_partition(self, branch: dict[str, Any], partition: dict[str, Any], part: int) -> list[str]:
         config = self.manifest["config"]
         directory = self.absolute(partition["directory"])
         directory.mkdir(parents=True, exist_ok=True)
@@ -459,6 +799,8 @@ class Manager:
             "--boundary-slack",
             str(config["boundary_slack"]),
             "--materialize",
+            "--part",
+            str(part),
             "--force",
             "--",
             "--max-memory",
@@ -473,26 +815,42 @@ class Manager:
         active = self.manifest["active"]
         branch = active["branch"]
         partition = active.get("partition") or self.allocate_partition(active)
-        statuses = self.partition_statuses(partition)
-        return_code: int | None = None
-        interrupted = False
-        if statuses is None:
-            command = self.command_for_partition(branch, partition)
-            return_code, interrupted = self.run_command(command, Path(self.manifest["config"]["launch_cwd"]))
-            statuses = self.partition_statuses(partition)
-
-        if statuses is None:
-            if interrupted or return_code == 130:
-                self.manifest["state"] = "paused"
-                self.manifest["error"] = None
-                self.event("manager_paused", branch=branch["id"], stage="partition")
-                self.save()
-                return False
-            self.fail(f"partition materialization failed with status {return_code}; resume retries it with --force")
-            return False
-        if return_code not in (None, 0):
-            self.fail(f"partition materialization returned status {return_code} despite complete child outputs")
-            return False
+        statuses: list[tuple[str, Path, Path, dict[str, Any]]] = []
+        for part in range(1, int(self.manifest["config"]["parts"]) + 1):
+            materialized = self.partition_status(partition, part)
+            while materialized is None:
+                if not self.ensure_disk_space(f"materializing {partition['id']}/{part}"):
+                    return False
+                command = self.command_for_partition(branch, partition, part)
+                return_code, interrupted = self.run_command(
+                    command, Path(self.manifest["config"]["launch_cwd"])
+                )
+                if interrupted or return_code == 130:
+                    self.manifest["state"] = "paused"
+                    self.manifest["error"] = None
+                    self.manifest["pause_reason"] = {"kind": "interrupt", "stage": "partition", "part": part}
+                    self.event("manager_paused", branch=branch["id"], stage="partition", part=part)
+                    self.save()
+                    return False
+                materialized = self.partition_status(partition, part)
+                if materialized is None:
+                    reserve = int(self.manifest["config"].get("disk_reserve_bytes", 0))
+                    if reserve and self.disk_free_bytes() < reserve:
+                        if self.ensure_disk_space(f"retrying {partition['id']}/{part} after an incomplete checkpoint"):
+                            continue
+                        return False
+                    self.fail(
+                        f"partition child {part} failed with status {return_code}; "
+                        "resume retries only that child with --force"
+                    )
+                    return False
+                status = materialized[3]
+                if return_code != status.get("exit_status"):
+                    self.fail(f"rlife exit status {return_code} disagrees with {materialized[1]}")
+                    return False
+                if not self.ensure_disk_space(f"continuing after {partition['id']}/{part}"):
+                    return False
+            statuses.append(materialized)
 
         children: list[dict[str, Any]] = []
         completion_halt = False
@@ -538,12 +896,9 @@ class Manager:
         if completion_halt:
             self.manifest["state"] = "complete"
             self.manifest["outcome"] = "completion"
-        elif interrupted:
-            self.manifest["state"] = "paused"
-            self.event("manager_paused", branch=branch["id"], stage="partition")
         self.save()
         if artifacts_added:
-            self.rebuild_outputs()
+            self.rebuild_outputs_best_effort()
         return self.manifest["state"] == "running"
 
     def finish_if_done(self) -> bool:
@@ -554,22 +909,27 @@ class Manager:
         self.manifest["outcome"] = "halt" if terminal["halt"] else "exhausted"
         self.event("manager_complete", outcome=self.manifest["outcome"])
         self.save()
-        self.rebuild_outputs()
+        self.rebuild_outputs_best_effort()
         return True
 
     def run(self) -> int:
-        self.rebuild_outputs()
         if self.manifest["state"] == "complete":
+            self.rebuild_outputs_best_effort()
             self.print_status()
             return 0
         self.manifest["state"] = "running"
         self.manifest["error"] = None
+        self.manifest["pause_reason"] = None
         active = self.manifest.get("active")
         if active and active["action"] == "extend" and active.get("attempt"):
             attempt_status = self.absolute(active["attempt"]["status"])
             if not attempt_status.is_file():
                 active["attempt"] = None
         self.save()
+        if not self.ensure_disk_space("starting the next search operation"):
+            self.print_status()
+            return DISK_PAUSE_EXIT
+        self.rebuild_outputs_best_effort()
 
         while self.manifest["state"] == "running":
             if self.manifest["active"] is None:
@@ -595,6 +955,8 @@ class Manager:
         if self.manifest["state"] == "complete":
             return 0
         if self.manifest["state"] == "paused":
+            if (self.manifest.get("pause_reason") or {}).get("kind") == "disk_space":
+                return DISK_PAUSE_EXIT
             return 130
         return 1
 
@@ -609,6 +971,11 @@ class Manager:
         )
         print(
             f"terminal={self.manifest.get('terminal', {})} discoveries={self.manifest.get('discoveries', {})}"
+        )
+        reserve = int(self.manifest["config"].get("disk_reserve_bytes", 0))
+        print(
+            f"disk_free={format_bytes(self.disk_free_bytes())} disk_reserve={format_bytes(reserve)} "
+            f"archive={self.manifest['config'].get('archive_dir') or 'none'}"
         )
         if self.manifest.get("error"):
             print(f"error: {self.manifest['error']}", file=sys.stderr)
@@ -644,12 +1011,30 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("workdir", type=Path)
     start.add_argument("--binary", type=Path, default=Path("./rlife"))
     start.add_argument("--max-memory", required=True, help="rlife soft cap, for example 32GiB")
+    start.add_argument(
+        "--disk-reserve",
+        help="minimum free space before launching more work (default: --max-memory)",
+    )
+    start.add_argument(
+        "--archive-dir",
+        type=Path,
+        help="move retired checkpoint payloads here when the disk reserve is reached",
+    )
     start.add_argument("--parts", type=int, default=4)
     start.add_argument("--boundary-slack", type=float, default=1.0)
     resume = commands.add_parser("resume", help="resume a paused or failed managed search")
     resume.add_argument("workdir", type=Path)
+    resume.add_argument("--disk-reserve", help="replace the saved minimum-free-space setting")
+    resume.add_argument("--archive-dir", type=Path, help="set or replace the saved archive directory")
     status = commands.add_parser("status", help="show persistent managed-search state")
     status.add_argument("workdir", type=Path)
+    configure = commands.add_parser("configure", help="change durable disk-space settings without resuming")
+    configure.add_argument("workdir", type=Path)
+    configure.add_argument("--disk-reserve", help="replace the saved minimum-free-space setting")
+    configure.add_argument("--archive-dir", type=Path, help="set or replace the saved archive directory")
+    archive = commands.add_parser("archive", help="move all currently retired checkpoints to the archive")
+    archive.add_argument("workdir", type=Path)
+    archive.add_argument("--archive-dir", type=Path, help="set or replace the saved archive directory")
     return parser
 
 
@@ -672,14 +1057,18 @@ def main() -> int:
                 raise ManagerError("--parts must be at least 2")
             if not (0.0 <= args.boundary_slack < 50.0):
                 raise ManagerError("--boundary-slack must be in [0,50)")
+            parse_byte_size(args.max_memory, "--max-memory")
             binary = args.binary.expanduser().resolve()
             if not binary.is_file() or not os.access(binary, os.X_OK):
                 raise ManagerError(f"rlife binary is not executable: {binary}")
             solver_args = validate_start_arguments(solver_arguments)
+            archive_dir = args.archive_dir.expanduser().resolve() if args.archive_dir is not None else None
             manager = Manager.create(
                 workdir,
                 binary,
                 args.max_memory,
+                args.disk_reserve,
+                archive_dir,
                 args.parts,
                 args.boundary_slack,
                 solver_args,
@@ -689,13 +1078,31 @@ def main() -> int:
                 raise ManagerError("only start accepts llsss arguments after --")
             manager = Manager.open(workdir)
         with RunLock(workdir):
+            if args.command == "configure":
+                if args.disk_reserve is None and args.archive_dir is None:
+                    raise ManagerError("configure requires --disk-reserve and/or --archive-dir")
+                manager.configure(args.disk_reserve, args.archive_dir)
+                manager.save()
+                manager.print_status()
+                return 0
+            if args.command == "archive":
+                manager.configure(None, args.archive_dir)
+                if not manager.manifest["config"].get("archive_dir"):
+                    raise ManagerError("archive requires --archive-dir or a previously configured archive directory")
+                manager.save()
+                _, moved = manager.archive_retired_checkpoints()
+                print(f"manager: archived {format_bytes(moved)} of retired checkpoints")
+                manager.print_status()
+                return 0
+            if args.command == "resume" and manager.configure(args.disk_reserve, args.archive_dir):
+                manager.save()
             try:
                 return manager.run()
-            except ManagerError as error:
-                if manager.manifest.get("state") != "failed":
+            except (ManagerError, OSError) as error:
+                if manager.manifest.get("state") not in ("failed", "paused", "complete"):
                     manager.fail(str(error))
                 raise
-    except ManagerError as error:
+    except (ManagerError, OSError) as error:
         print(f"rlife-manager: {error}", file=sys.stderr)
         return 2
 

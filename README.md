@@ -206,6 +206,10 @@ self-contained child checkpoints instead of specs:
   --threads 20 --partials none
 ```
 
+`--part INDEX` (one-based) materializes only that child of the full plan. This
+lets a resumable orchestrator preserve completed children and replace only an
+interrupted or failed child with `--force`.
+
 Arguments after `--` are ordinary mutable `llsss` runtime options. The
 partition command controls load/save paths, search names, and the one-row
 stop. A per-child `--partial-output` or `--dump-slice-stats` path must contain
@@ -234,7 +238,7 @@ Start a new managed search with a new work directory:
 
 ```sh
 scripts/rlife_manager.py start runs/c5-search \
-  --binary ./rlife --max-memory 32GiB --parts 4 -- \
+  --binary ./rlife --max-memory 32GiB --disk-reserve 32GiB --parts 4 -- \
   --rule 'B34ar5in/S2i3-i4-nwz5ceny6cei7e8' \
   --left-edge odd --filters bcaf --halts w_pos:300 \
   2c5-f2b '@bg(15)'
@@ -246,6 +250,38 @@ with `--load CHECKPOINT`. The manager controls `--save`, `--savedir`,
 those options must not be supplied there. Other runtime choices, including
 threads, partial frequency, end detection, and halt-on-end behavior, are saved
 normally.
+
+The manager also treats free disk space as a soft launch constraint. By
+default the minimum free-space reserve equals `--max-memory`; override it with
+`--disk-reserve SIZE` (or use `none`). It checks before every extension and
+before and after each individually materialized child. Below the reserve, the
+durable frontier is marked `paused` with
+`pause_reason.kind = "disk_space"`, no new solver is launched, and the manager
+exits with status 75. This is distinct from Ctrl-C's status 130.
+
+For automatic reclamation, configure an archive directory on another
+filesystem:
+
+```sh
+scripts/rlife_manager.py configure runs/c5-search \
+  --disk-reserve 32GiB --archive-dir /mnt/archive/c5-search
+scripts/rlife_manager.py resume runs/c5-search
+```
+
+When the reserve is crossed, retired checkpoint payloads are copied and
+fsynced to a mirrored path under the archive before the local copy is removed.
+This covers payloads from ordinary extensions and completed partition
+materializations. Live or queued checkpoints and the active partition are
+never moved. Small status and RLE index files stay in the work directory, and
+each relocation is recorded in `state.json`. An archive on the same filesystem
+is not used for automatic reclamation because moving files there cannot
+increase free space. To archive every currently retired checkpoint
+proactively, use:
+
+```sh
+scripts/rlife_manager.py archive runs/c5-search \
+  --archive-dir /mnt/archive/c5-search
+```
 
 Press Ctrl-C once to pause. The manager forwards it to the active solver,
 waits for the current row and checkpoint, commits that branch to `state.json`,
@@ -265,8 +301,8 @@ with the default halt-on-end behavior, the first such result completes the
 managed run while retaining any unvisited branches in the manifest; with
 `--no-halt-on-ends`, completion RLEs are collected and DFS continues. A failed
 subprocess leaves the active operation recorded, and `resume` retries it;
-materialization retries use `--force` only inside that operation's own output
-directory.
+materialization runs one child at a time, so valid completed siblings are
+reused and `--force` is limited to the unfinished child.
 
 ## Representation and sweeps
 

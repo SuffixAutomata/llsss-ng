@@ -186,6 +186,7 @@ runs one ordinary extend/prune/report row, and writes child checkpoints.
   --output DIRECTORY         output directory (default: FILE.parts)
   --boundary-slack PERCENT   endpoint search radius per ideal part (default: 1)
   --materialize              write checkpoints after one ordinary row
+  --part INDEX               materialize only this one-based child
   --dry-run                  print the plan without writing files
   --force                    replace existing partition outputs
   --                         pass following llsss runtime options while materializing
@@ -255,6 +256,11 @@ public:
       spec.constraint.search_name = plan.parts[index].name;
       specs.push_back(std::move(spec));
     }
+    if(config.part.has_value()) {
+      auto selected = std::move(specs[*config.part]);
+      specs.clear();
+      specs.push_back(std::move(selected));
+    }
 
     const auto source_height = source->height_;
     const auto inherited_partial_output = source->options_.partial_output;
@@ -318,6 +324,7 @@ private:
     std::filesystem::path load;
     std::size_t parts = 0;
     std::optional<std::size_t> slice;
+    std::optional<std::size_t> part;
     std::optional<std::string> search_name;
     std::optional<std::filesystem::path> output;
     double slack_percent = 1.0;
@@ -375,6 +382,8 @@ private:
           config.slice.reset();
         else
           config.slice = positive_size(option, value) - 1U;
+      } else if(option == "--part") {
+        config.part = positive_size(option, argument(option)) - 1U;
       } else if(option == "--search-name") {
         config.search_name = argument(option);
         if(!valid_search_name(*config.search_name))
@@ -399,6 +408,10 @@ private:
       throw std::runtime_error("partition requires --load CHECKPOINT");
     if(config.parts < 2U)
       throw std::runtime_error("partition requires --parts N with N >= 2");
+    if(config.part.has_value() && *config.part >= config.parts)
+      throw std::runtime_error("--part is outside the requested partition range");
+    if(config.part.has_value() && !config.materialize)
+      throw std::runtime_error("--part requires --materialize");
     if(!config.materialize && !config.runtime_arguments.empty())
       throw std::runtime_error("llsss runtime options after -- require --materialize");
     return config;

@@ -267,6 +267,34 @@ grep -Fq '"outcome": "halt"' "$test_tmp/managed/state.json"
 [[ $(grep -c '^#C llsss partition ' "$test_tmp/managed/results.rle") == 3 ]]
 "$manager" status "$test_tmp/managed" >"$test_tmp/managed-status.out"
 grep -Fq 'manager state=complete outcome=halt' "$test_tmp/managed-status.out"
+grep -Fq -- '--materialize --part 1 --force' "$test_tmp/managed.out"
+
+# Disk pressure is a durable pause rather than a failed subprocess.  The
+# explicit reserve is persisted and exit 75 tells a batch wrapper to retry
+# after space has been freed.
+set +e
+"$manager" start "$test_tmp/managed-disk-pause" --binary "$binary" \
+  --max-memory 1 --disk-reserve 16TiB --parts 3 -- \
+  --load "$test_tmp/checkpoint_12" --halts w_pos:13 --partials none --ends none \
+  >"$test_tmp/managed-disk-pause.out" 2>"$test_tmp/managed-disk-pause.err"
+disk_pause_status=$?
+set -e
+[[ $disk_pause_status == 75 ]]
+grep -Fq '"state": "paused"' "$test_tmp/managed-disk-pause/state.json"
+grep -Fq '"kind": "disk_space"' "$test_tmp/managed-disk-pause/state.json"
+grep -Fq '"disk_reserve_bytes": 17592186044416' "$test_tmp/managed-disk-pause/state.json"
+test ! -e "$test_tmp/managed-disk-pause/attempts/00000001.status.json"
+"$manager" configure "$test_tmp/managed-disk-pause" --disk-reserve 1 \
+  >"$test_tmp/managed-disk-configure.out" 2>"$test_tmp/managed-disk-configure.err"
+grep -Fq '"disk_reserve_bytes": 1' "$test_tmp/managed-disk-pause/state.json"
+
+# Retired payloads can be moved to a mirrored archive tree without moving the
+# live frontier or the small result/status index files.
+"$manager" archive "$test_tmp/managed" --archive-dir "$test_tmp/managed-archive" \
+  >"$test_tmp/managed-archive.out" 2>"$test_tmp/managed-archive.err"
+grep -Fq '"state": "archived"' "$test_tmp/managed/state.json"
+test -n "$(find "$test_tmp/managed-archive" -type f -print -quit)"
+test -s "$test_tmp/managed/results.rle"
 
 # A completion can first appear in the mandatory materialization row.  It must
 # be transmitted to the combined result and stop the managed search under the
@@ -282,7 +310,7 @@ mkdir "$test_tmp/managed-completion-source"
   --materialize -- --partials none \
   >"$test_tmp/managed-completion-seed.out" 2>"$test_tmp/managed-completion-seed.err"
 "$manager" start "$test_tmp/managed-main-completion" --binary "$binary" \
-  --max-memory 1TiB --parts 2 -- \
+  --max-memory 1TiB --disk-reserve none --parts 2 -- \
   --load "$test_tmp/managed-completion-seed/seed-1_47" --partials none \
   >"$test_tmp/managed-main-completion.out" 2>"$test_tmp/managed-main-completion.err"
 grep -Fq '"outcome": "completion"' "$test_tmp/managed-main-completion/state.json"
@@ -378,6 +406,17 @@ for part in 1 2 3; do
     >"$test_tmp/materialized-$part.out" 2>"$test_tmp/materialized-$part.err"
   grep -Fq "search_name=material-$part" "$test_tmp/materialized-$part.out"
 done
+
+# A manager can materialize and retry one child at a time.  The selected child
+# retains its identity in the full three-way plan and no sibling is written.
+"$binary" partition --load "$test_tmp/checkpoint_12" --parts 3 --part 2 \
+  --search-name selected --boundary-slack 0 --output "$test_tmp/materialized-selected" \
+  --materialize -- --partials none --status-output "$test_tmp/materialized-selected/{name}.status.json" \
+  >"$test_tmp/materialized-selected.out" 2>"$test_tmp/materialized-selected.err"
+test -s "$test_tmp/materialized-selected/selected-2_13"
+grep -Fq '"search_name": "selected-2"' "$test_tmp/materialized-selected/selected-2.status.json"
+test ! -e "$test_tmp/materialized-selected/selected-1_13"
+test ! -e "$test_tmp/materialized-selected/selected-3_13"
 
 "$binary" llsss --load "$test_tmp/checkpoint_12" --halts w_pos:13 \
   --partials none --ends none --save none --verbose \
