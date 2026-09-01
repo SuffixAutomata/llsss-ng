@@ -781,7 +781,18 @@ class Manager:
             return None
         return name, status_path, rle_path, status
 
-    def command_for_partition(self, branch: dict[str, Any], partition: dict[str, Any], part: int) -> list[str]:
+    def partition_statuses(
+        self, partition: dict[str, Any]
+    ) -> list[tuple[str, Path, Path, dict[str, Any]]] | None:
+        statuses: list[tuple[str, Path, Path, dict[str, Any]]] = []
+        for part in range(1, int(self.manifest["config"]["parts"]) + 1):
+            status = self.partition_status(partition, part)
+            if status is None:
+                return None
+            statuses.append(status)
+        return statuses
+
+    def command_for_partition(self, branch: dict[str, Any], partition: dict[str, Any]) -> list[str]:
         config = self.manifest["config"]
         directory = self.absolute(partition["directory"])
         directory.mkdir(parents=True, exist_ok=True)
@@ -799,8 +810,6 @@ class Manager:
             "--boundary-slack",
             str(config["boundary_slack"]),
             "--materialize",
-            "--part",
-            str(part),
             "--force",
             "--",
             "--max-memory",
@@ -815,42 +824,40 @@ class Manager:
         active = self.manifest["active"]
         branch = active["branch"]
         partition = active.get("partition") or self.allocate_partition(active)
-        statuses: list[tuple[str, Path, Path, dict[str, Any]]] = []
-        for part in range(1, int(self.manifest["config"]["parts"]) + 1):
-            materialized = self.partition_status(partition, part)
-            while materialized is None:
-                if not self.ensure_disk_space(f"materializing {partition['id']}/{part}"):
+        statuses = self.partition_statuses(partition)
+        while statuses is None:
+            if not self.ensure_disk_space(f"materializing {partition['id']}"):
+                return False
+            command = self.command_for_partition(branch, partition)
+            return_code, interrupted = self.run_command(
+                command, Path(self.manifest["config"]["launch_cwd"])
+            )
+            statuses = self.partition_statuses(partition)
+            if interrupted or return_code == 130:
+                self.manifest["state"] = "paused"
+                self.manifest["error"] = None
+                self.manifest["pause_reason"] = {"kind": "interrupt", "stage": "partition"}
+                self.event("manager_paused", branch=branch["id"], stage="partition")
+                self.save()
+                return False
+            if statuses is None:
+                reserve = int(self.manifest["config"].get("disk_reserve_bytes", 0))
+                if reserve and self.disk_free_bytes() < reserve:
+                    if self.ensure_disk_space(f"retrying {partition['id']} after an incomplete materialization"):
+                        continue
                     return False
-                command = self.command_for_partition(branch, partition, part)
-                return_code, interrupted = self.run_command(
-                    command, Path(self.manifest["config"]["launch_cwd"])
+                self.fail(
+                    f"partition materialization failed with status {return_code}; "
+                    "resume retries the split with --force"
                 )
-                if interrupted or return_code == 130:
-                    self.manifest["state"] = "paused"
-                    self.manifest["error"] = None
-                    self.manifest["pause_reason"] = {"kind": "interrupt", "stage": "partition", "part": part}
-                    self.event("manager_paused", branch=branch["id"], stage="partition", part=part)
-                    self.save()
-                    return False
-                materialized = self.partition_status(partition, part)
-                if materialized is None:
-                    reserve = int(self.manifest["config"].get("disk_reserve_bytes", 0))
-                    if reserve and self.disk_free_bytes() < reserve:
-                        if self.ensure_disk_space(f"retrying {partition['id']}/{part} after an incomplete checkpoint"):
-                            continue
-                        return False
-                    self.fail(
-                        f"partition child {part} failed with status {return_code}; "
-                        "resume retries only that child with --force"
-                    )
-                    return False
-                status = materialized[3]
-                if return_code != status.get("exit_status"):
-                    self.fail(f"rlife exit status {return_code} disagrees with {materialized[1]}")
-                    return False
-                if not self.ensure_disk_space(f"continuing after {partition['id']}/{part}"):
-                    return False
-            statuses.append(materialized)
+                return False
+            if return_code != 0:
+                self.fail(
+                    f"partition materialization returned status {return_code} despite complete child outputs"
+                )
+                return False
+            if not self.ensure_disk_space(f"continuing after {partition['id']}"):
+                return False
 
         children: list[dict[str, Any]] = []
         completion_halt = False

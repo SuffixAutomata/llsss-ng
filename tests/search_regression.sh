@@ -267,7 +267,11 @@ grep -Fq '"outcome": "halt"' "$test_tmp/managed/state.json"
 [[ $(grep -c '^#C llsss partition ' "$test_tmp/managed/results.rle") == 3 ]]
 "$manager" status "$test_tmp/managed" >"$test_tmp/managed-status.out"
 grep -Fq 'manager state=complete outcome=halt' "$test_tmp/managed-status.out"
-grep -Fq -- '--materialize --part 1 --force' "$test_tmp/managed.out"
+[[ $(grep -c '^manager: .* partition ' "$test_tmp/managed.out") == 1 ]]
+if grep -Fq -- ' --part ' "$test_tmp/managed.out"; then
+  echo 'manager unexpectedly materialized a split one child at a time' >&2
+  exit 1
+fi
 
 # Disk pressure is a durable pause rather than a failed subprocess.  The
 # explicit reserve is persisted and exit 75 tells a batch wrapper to retry
@@ -407,8 +411,8 @@ for part in 1 2 3; do
   grep -Fq "search_name=material-$part" "$test_tmp/materialized-$part.out"
 done
 
-# A manager can materialize and retry one child at a time.  The selected child
-# retains its identity in the full three-way plan and no sibling is written.
+# The low-level command can still target one child. The selected child retains
+# its identity in the full three-way plan and no sibling is written.
 "$binary" partition --load "$test_tmp/checkpoint_12" --parts 3 --part 2 \
   --search-name selected --boundary-slack 0 --output "$test_tmp/materialized-selected" \
   --materialize -- --partials none --status-output "$test_tmp/materialized-selected/{name}.status.json" \

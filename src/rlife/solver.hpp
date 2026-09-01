@@ -975,7 +975,7 @@ private:
       const char ch = static_cast<char>(std::tolower(static_cast<unsigned char>(raw)));
       if(std::isdigit(static_cast<unsigned char>(ch))) {
         run = run * 10U + static_cast<unsigned>(ch - '0');
-      } else if(ch == 'b' || ch == 'o') {
+      } else if(ch == 'b' || ch == 'o' || ch == '.') {
         const auto amount = count();
         for(std::size_t i = 0; i < amount; ++i) {
           if(x >= grid.width || y >= grid.height) {

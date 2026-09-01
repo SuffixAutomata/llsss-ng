@@ -207,8 +207,8 @@ self-contained child checkpoints instead of specs:
 ```
 
 `--part INDEX` (one-based) materializes only that child of the full plan. This
-lets a resumable orchestrator preserve completed children and replace only an
-interrupted or failed child with `--force`.
+is an optional low-level operation for targeted inspection or recovery; the
+depth-first manager materializes a complete split in one command.
 
 Arguments after `--` are ordinary mutable `llsss` runtime options. The
 partition command controls load/save paths, search names, and the one-row
@@ -254,8 +254,8 @@ normally.
 The manager also treats free disk space as a soft launch constraint. By
 default the minimum free-space reserve equals `--max-memory`; override it with
 `--disk-reserve SIZE` (or use `none`). It checks before every extension and
-before and after each individually materialized child. Below the reserve, the
-durable frontier is marked `paused` with
+before and after each complete split-materialization subprocess. Below the
+reserve, the durable frontier is marked `paused` with
 `pause_reason.kind = "disk_space"`, no new solver is launched, and the manager
 exits with status 75. This is distinct from Ctrl-C's status 130.
 
@@ -301,8 +301,9 @@ with the default halt-on-end behavior, the first such result completes the
 managed run while retaining any unvisited branches in the manifest; with
 `--no-halt-on-ends`, completion RLEs are collected and DFS continues. A failed
 subprocess leaves the active operation recorded, and `resume` retries it;
-materialization runs one child at a time, so valid completed siblings are
-reused and `--force` is limited to the unfinished child.
+each split is materialized by one `rlife partition` subprocess, and an
+incomplete split is retried in its manager-owned output directory with
+`--force`.
 
 ## Representation and sweeps
 
