@@ -469,7 +469,7 @@ inline void Solver::validate_partition_constraint() const {
   }
 }
 
-inline void Solver::apply_partition_restriction(std::size_t position, PackedTags& tags) const {
+template <class Tags> inline void Solver::apply_partition_restriction(std::size_t position, Tags& tags) const {
   if(!options_.partition_constraint.has_value() || options_.partition_constraint->slice != position)
     return;
   const auto& partition = *options_.partition_constraint;

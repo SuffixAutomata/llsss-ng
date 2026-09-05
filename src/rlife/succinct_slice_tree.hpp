@@ -7,6 +7,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <limits>
 #include <stdexcept>
@@ -71,6 +72,19 @@ public:
 
   [[nodiscard]] std::uint64_t word(std::size_t word_index) const noexcept { return words_[word_index]; }
 
+  // Zero-padded, possibly unaligned 64-bit view. Useful for translating between
+  // leaf-local and whole-tree bit planes without a per-bit loop.
+  [[nodiscard]] std::uint64_t window(std::uint64_t first) const noexcept {
+    const auto index = static_cast<std::size_t>(first >> 6U);
+    if(index >= words_.size())
+      return 0;
+    const auto shift = static_cast<unsigned>(first & 63U);
+    auto result = words_[index] >> shift;
+    if(shift != 0 && index + 1U < words_.size())
+      result |= words_[index + 1U] << (64U - shift);
+    return result;
+  }
+
   [[nodiscard]] std::uint8_t get_4(std::uint64_t index) const noexcept {
     const auto word_index = static_cast<std::size_t>(index >> 6U);
     const auto offset = static_cast<unsigned>(index & 63U);
@@ -94,6 +108,7 @@ public:
 
   // Direct reductions can assign disjoint destination words to workers.
   void or_word(std::size_t word_index, std::uint64_t value) noexcept { words_[word_index] |= value; }
+  void and_word(std::size_t word_index, std::uint64_t value) noexcept { words_[word_index] &= value; }
 
   void atomic_or_word(std::size_t word_index, std::uint64_t value) noexcept {
     std::atomic_ref<std::uint64_t> word(words_[word_index]);
@@ -355,6 +370,25 @@ public:
   }
   void set_bcaf_child_clauses_unchecked(Node parent, std::uint8_t clauses) noexcept {
     bcaf_child_clauses_[static_cast<std::size_t>(parent - bcaf_parent_begin_)] = clauses;
+  }
+  // Eight expanded parents have 32 consecutive leaf bits per witness plane.
+  // Scatter their nibbles into bytes, then fuse P in the low / S in the high
+  // half. The caller owns all eight destination bytes, including at task edges.
+  void set_bcaf_child_clauses_8_unchecked(Node parent, std::uint32_t prefix, std::uint32_t suffix) noexcept {
+    auto spread = [](std::uint32_t input) {
+      std::uint64_t value = input;
+      value = (value | (value << 16U)) & 0x0000ffff0000ffffULL;
+      value = (value | (value << 8U)) & 0x00ff00ff00ff00ffULL;
+      return (value | (value << 4U)) & 0x0f0f0f0f0f0f0f0fULL;
+    };
+    const auto value = spread(prefix) | (spread(suffix) << 4U);
+    auto* output = bcaf_child_clauses_.data() + static_cast<std::size_t>(parent - bcaf_parent_begin_);
+    if constexpr(std::endian::native == std::endian::little) {
+      std::memcpy(output, &value, sizeof(value));
+    } else {
+      for(unsigned byte = 0; byte < 8; ++byte)
+        output[byte] = static_cast<std::uint8_t>(value >> (8U * byte));
+    }
   }
   [[nodiscard]] const std::vector<std::uint8_t>& bcaf_checkpoint_bytes() const noexcept { return bcaf_child_clauses_; }
 

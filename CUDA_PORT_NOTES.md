@@ -100,6 +100,18 @@ slower. Treat it as a measured memory/time tradeoff, not an unconditional speedu
 
 ## Scheduling and output constraints still to solve for CUDA
 
+`STRUCTURAL_EXPERIMENTS.md` records the destination-range, right-major, whole-
+subtree, and adaptive-task CPU probes. None established an owned-sweep win even
+with index replacement optimistically excluded, so production still uses the
+indexed scheduler. In particular, local triple order is not global leaf-ID
+order: another partner branch can revisit the same destination subtree.
+
+Ownership-based GPU designs should consider cooperative tasks and paired-work
+weights. Narrow destinations can have many source paths; assigning one task
+per destination does not automatically expose that parallelism. Boundary paths
+also consume O(depth) storage unless shared by the cooperative task. The probes
+and their additional state were not added to the production walker.
+
 The sparse index splits accepted parent-pair ordinals into dynamically scheduled
 16K ranges. A restart stores a raw triple path; it is not a list of endpoint
 IDs. Each task must visit exactly its interval. The new index is assembled in
@@ -111,6 +123,12 @@ can reach the same packed destination word. A kernel launch/barrier separates
 dependent sweeps. The right sweep computes R/S; the left sweep computes L/P
 and the next restart index. Retention is `L & R & (P | S)` and the retained
 historical edge clause is `P(left) | S(right)`.
+
+R is now leaf-local, while L remains full-tree for ancestry closure. The shared
+word-wide keep reduction translates R/P/S offsets into L's output words; the
+clause emitter packs eight parents at a time. These are independent flat-output
+operations and add no DFS state. A GPU port can schedule them separately from
+pair traversal without changing the search relation.
 
 Destination-owned ranges might remove write sharing, but a port must establish
 both complete edge enumeration and balanced work. Arbitrary traversal pruning

@@ -2,6 +2,136 @@
 
 This file is the durable handoff for the long-running solver optimization work.  Timings are wall-clock row times on the 20-logical-CPU i7-12700 host unless stated otherwise.  Preserve exact `cols` output when comparing implementations.
 
+## September 5 remaining structural directions
+
+Baseline: committed `67fa84f` (aligned worker scratch). Detailed prototypes,
+limitations, and CPU/CUDA design implications are in `STRUCTURAL_EXPERIMENTS.md`.
+This pass keeps two changes:
+
+- Word-wide BCAF retention, translating leaf-local source planes into full-tree
+  keep words, and clause emission in groups of eight parents. Serial and parallel
+  paths share the callback body; the unused standalone BCAF reifier is removed.
+- Leaf-local R, named explicitly alongside full-tree L in `SupportTags`.
+  Boundary marking, partition restriction, seeding, and counts honor its offset.
+
+The production indexed walker, task scheduler, restart order, checkpoint format,
+and partial selection are unchanged. There is **no additional per-depth state**.
+
+### Five-case resumed comparison
+
+Native Make builds, GCC 15.2, 20 workers, the same absolute checkpoint paths under
+`benchmark-artifacts/checkpoints/` as the scratch-alignment comparison. Two runs
+per build in A/B, B/A order; all runs sequential, with no concurrent builds,
+tests, or audit benchmarks. Row seconds exclude loading; GNU time peak RSS is
+for the whole process. Normal completion detection is inherited, with
+`--partials none --save none --phase-timings`. No fresh timings are substituted.
+
+| case / rewrite row | before | retained changes | row time change | before peak KiB | after peak KiB |
+|---|---:|---:|---:|---:|---:|
+| 1 / 67 | 0.478490 s | 0.452185 s | -5.5% | 137,396 | 132,136 |
+| 2 / 44 | 13.471078 s | 13.505215 s | +0.3% (neutral) | 750,256 | 745,400 |
+| 3 / 44 | 13.125669 s | 12.240071 s | -6.7% | 4,278,728 | 4,118,812 |
+| 4 / 30 | 3.801632 s | 3.638778 s | -4.3% | 739,712 | 740,248 |
+| 5 / 41 | 15.902062 s | 15.181395 s | -4.5% | 5,637,988 | 5,423,364 |
+
+Times are medians; peak columns are maxima. All 20 runs match exact nodes and
+complete `cols` strings. Persistent payload remains 50, 392, 1827, 414, and 2217
+MiB. Case 1's individual before runs were 0.501s and 0.456s, so its percentage is
+particularly noisy. Case 4's sub-MiB RSS difference is noise; another phase sets
+its process peak. Cases 3 and 5 save approximately 156 and 210 MiB respectively.
+
+A later helper extraction initially regressed case 2 by about 8%, localized to
+the left sweep rather than retention. Restoring the original shared callback
+body recovered performance and regenerated the initial leaf-R binary byte for
+byte. A separate repeated case-2 check was 13.571s -> 13.591s (neutral). The
+rejected extraction and isolation runs remain documented; code generation/layout
+is a hypothesis, not a resolved instruction-level cause. No diagonal-specific
+algorithm workaround was added. The prior small **fresh-versus-resumed gap
+remains unexplained and deferred**; this pass did not re-investigate it.
+
+### Other directions: measured, not put into production
+
+- Destination-owned left sweep: tested parent intervals, different task sizes,
+  contained-subtree fast paths, right-major branch order, whole-prefix subtrees,
+  and adaptive task sizing. The best case-4 owned sweep was 1.861s versus 1.872s
+  for the original **including index emission**; case 2 was 9.061s versus 6.767s.
+  This already gives ownership free index replacement. No convincing CPU win
+  emerged, so the diagnostic replay and experimental walkers were not retained.
+- Persistent whole-plane buffers: a two-row case-4 test was timing-neutral but
+  increased process peak from 1,964,660 to about 2,640,000 KiB (34%). Keeping R,
+  witnesses, and completion planes overlaps reification allocations that used
+  to follow their release. Selective or budgeted reuse is not ruled out.
+- Interleaved rank: the synthetic seven-word-plus-rank layout saved 8.7% of
+  combined data/rank storage but lost lookup speed at both 32 and 256 MiB.
+  A branchless six-popcount variant was worse. This is a screening benchmark,
+  not a claim about measured full-solver performance of that layout.
+
+Completed trees are order-independent under the same edge/support recurrences;
+the selected partial and restart ordering need not be. A destination-order
+rewrite must consistently replace the old scheduler/index contract, not merely
+concatenate its new output into the old format. The most promising untested
+follow-up is paired-work-weighted cooperative destination tiles, with explicit
+reductions/fallbacks for narrow destinations. CUDA considerations and additional
+prototype boundary-path storage are documented in `CUDA_PORT_NOTES.md` and
+`STRUCTURAL_EXPERIMENTS.md`; no GPU speedup is claimed.
+
+### Durable reproduction
+
+- Final paired logs/summary: `benchmarks/results/2026-09-05-remaining-final/`.
+- Rejected helper comparison: `benchmarks/results/2026-09-05-remaining-directions/`;
+  isolation/recovery: `remaining-case2-isolation/` and `remaining-case2-restored/`
+  under the same results directory.
+- Frozen baseline: `benchmark-artifacts/remaining-directions/before/rlife`,
+  SHA-256 `eb25f9f6835cb33a68ea490e885ac9f641edd39c7262621a763475ad03c01b88`.
+- Final binary/source: `benchmark-artifacts/remaining-directions/restored/`,
+  binary SHA-256 `0a53e2d426c020e68164813a3702bc84a3c8321ed0b088c74f6a70f2ab60d36d`.
+- Experimental sources/binaries and rank/pool/ownership logs are under
+  `benchmark-artifacts/remaining-directions/`; the detailed notes map variants.
+
+Both `benchmarks/` and `benchmark-artifacts/` are now ignored by Git. Their
+contents survive reboot but require a separate backup across clones; the root
+Markdown notes are the versioned record. No durable asset from this pass relies
+on `/tmp`. Use the existing `target_rows.py` and `compare_states.py` drivers,
+always with a new empty results directory.
+
+### Completed-state validation
+
+The final retained binary and baseline generated **byte-identical complete
+checkpoints for all five target rows**, with matching save paths/options. This
+covers topology, level boundaries, historical clause bytes, and ordered restart
+indexes, not just aggregate counts. Saved candidates, comparison logs, and binary
+fingerprints are in `benchmark-artifacts/remaining-directions/final-state-equality/`.
+Only redundant, identical baseline copies were removed after comparison.
+
+| case / row | checkpoint SHA-256 |
+|---|---|
+| 1 / 67 | `449858665c74e41847d5b574e0d3f23be55594496685321ede186cead7b54a5b` |
+| 2 / 44 | `85a19fd59bbf9e589c88ca0e8719045283bed8046d849fce0988406de4ba93a2` |
+| 3 / 44 | `7b8dbde3b6cc5f451c3a7748e60a248ac404ed1ce5e179f545bd83ca8376053a` |
+| 4 / 30 | `a9eb8b43fe4d408899479f14e5091e73e9048b345e885b1e5f2e9992e3d63573` |
+| 5 / 41 | `2c0ae9dead1ee17faeb8742300a3769977e75e4bdabbd256ac67edb2c8078351` |
+
+The destination-prefix prototype independently matched the baseline's full
+case-4 checkpoint, including its diagnostic replayed index
+(`owned-state-equality/summary.json`). Existing partial expectations are unchanged.
+
+Final validation, after restoring the callback body:
+
+- Native full search, smoke, and structural regressions passed; warning-clean
+  build. This includes serial/indexed partial comparisons, checkpoint continuation,
+  and partition/materialization checks.
+- Non-native CMake Release: all three CTest tests passed; warning-clean build.
+- Native Debug/O1 ASan/UBSan: structural and smoke regressions passed. As before,
+  `ASAN_OPTIONS=detect_leaks=0` bypasses the sandbox's LeakSanitizer restriction;
+  leak checking is not claimed. GCC emitted its libstdc++ regex
+  maybe-uninitialized warnings in the sanitizer build.
+- New structural tests cover all unaligned tag windows across empty, short,
+  word-boundary, and multiword planes; masked whole-word AND; and randomized
+  eight-parent clause packing against scalar nibbles.
+
+Logs: `remaining-directions/restored-{native,portable,sanitized}.log` under
+`benchmark-artifacts/`. The root native binary matches the frozen final binary.
+
 ## September 5 cache-line-isolated worker scratch
 
 The production fix uses a small stateless `CacheAlignedAllocator` for all four
@@ -204,12 +334,13 @@ For example, after generating a case-3 checkpoint at row 43:
 
 ### Remaining directions
 
-Destination-owned task ranges, an interleaved rank directory, persistent tag
-buffer reuse, leaf-local R, and word-wide BCAF keep/clause emission remain
-unimplemented. They should be separate experiments. In particular, implicit
+At the end of this earlier pass, destination-owned task ranges, an interleaved
+rank directory, persistent tag buffer reuse, leaf-local R, and word-wide BCAF
+keep/clause emission remained unimplemented. All five have now been examined
+in the remaining-directions pass at the top of this log. In particular, implicit
 relations do not remove the sparse index's scheduling and deterministic-output
 responsibilities; dropping it requires a replacement that is both complete
-and balanced. This pass deliberately keeps those semantics as a CUDA reference.
+and balanced. Production continues to keep those semantics as a CUDA reference.
 
 ## Previous accepted status (August baseline)
 

@@ -341,7 +341,10 @@ Native searches use two support sweeps. Without BCAF, they compute reachability
 from each boundary and retain their intersection. With BCAF, the right sweep
 computes normal reachability `R` and suffix witnesses `S`; the left sweep computes
 normal reachability `L`, prefix witnesses `P`, and the next sparse restart index.
-A leaf survives exactly when `L & R & (P | S)`. Witness tags are leaf-local.
+A leaf survives exactly when `L & R & (P | S)`. R, witness, and completion tags
+are leaf-local; L is full-tree because it becomes the reification keep plane.
+Retention combines whole words, and expanded-parent clause bytes are emitted
+in groups of eight. Serial and parallel reification share this reduction.
 
 Reification tags live ancestry, then stably compacts internal four-bit records.
 It counts retained leaves and synthesizes their zero-mask tail without scanning

@@ -62,6 +62,40 @@ static void test_scratch_allocator() {
   require(rejected);
 }
 
+static void test_tag_words_and_clauses() {
+  std::mt19937_64 random(0x917c);
+  for(const std::uint64_t size : {0, 1, 4, 63, 64, 65, 127, 128, 129, 411}) {
+    PackedTags bits(size);
+    for(std::uint64_t bit = 0; bit < size; ++bit)
+      bits.set(bit, random() & 1U);
+    for(std::uint64_t start = 0; start < size + 65; ++start) {
+      std::uint64_t expected = 0;
+      for(unsigned bit = 0; bit < 64 && start + bit < size; ++bit)
+        expected |= std::uint64_t{bits.get(start + bit)} << bit;
+      require(bits.window(start) == expected);
+    }
+    for(std::size_t word = 0; word < bits.word_size(); ++word) {
+      const auto value = bits.word(word);
+      const auto mask = random();
+      bits.and_word(word, mask);
+      require(bits.word(word) == (value & mask));
+    }
+  }
+  SuccinctSliceTree tree;
+  for(unsigned depth = 0; depth < 3; ++depth)
+    tree.append_uniform(15);
+  tree.initialize_bcaf_clauses(3);
+  const auto first = tree.level_begin(2);
+  for(unsigned trial = 0; trial < 100; ++trial) {
+    const auto prefix = static_cast<std::uint32_t>(random());
+    const auto suffix = static_cast<std::uint32_t>(random());
+    const auto parent = first + trial % 9;
+    tree.set_bcaf_child_clauses_8_unchecked(parent, prefix, suffix);
+    for(unsigned byte = 0; byte < 8; ++byte)
+      require(tree.bcaf_child_clauses(parent + byte) == (((prefix >> (4U * byte)) & 15U) | (((suffix >> (4U * byte)) & 15U) << 4U)));
+  }
+}
+
 static void test_history() {
   for(const auto* rule_name : {"B3/S12", "B36/S125", "B36/S245"}) {
     const auto rule = RuleTable::parse(rule_name);
@@ -168,7 +202,8 @@ static void test_trees() {
 
 int main() {
   test_scratch_allocator();
+  test_tag_words_and_clauses();
   test_history();
   test_trees();
-  std::cout << "scratch-alignment, packed-history and virtual-leaf regression passed\n";
+  std::cout << "scratch, tag-word, clause, packed-history and virtual-leaf regression passed\n";
 }
