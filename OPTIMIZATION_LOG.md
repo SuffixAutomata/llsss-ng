@@ -2,6 +2,76 @@
 
 This file is the durable handoff for the long-running solver optimization work.  Timings are wall-clock row times on the 20-logical-CPU i7-12700 host unless stated otherwise.  Preserve exact `cols` output when comparing implementations.
 
+## September 5 cache-line-isolated worker scratch
+
+The production fix uses a small stateless `CacheAlignedAllocator` for all four
+`GateRangeScratch` vectors: byte history, packed history, full frames, and
+compact frames. It aligns the heap buffers themselves to 64 bytes (or stronger
+element alignment), checks allocation overflow, and uses matching aligned
+new/delete. There are no diagnostic flags in production, no extra per-depth
+state, and no additional per-node walker work. CUDA implications and the detailed
+case-2 investigation are in `CUDA_PORT_NOTES.md` and `CASE2_FALSE_SHARING.md`.
+
+### Five-case resumed comparison
+
+Before is the unmodified committed `b107825` native Make binary; after adds only
+the production scratch allocator. GCC 15.2, i7-12700, 20 workers. Every run resumes
+the **same pre-target checkpoint as the previous pass**, now relocated unchanged
+into `benchmark-artifacts/checkpoints/`. No fresh-search timing is substituted.
+Checkpoint loading is excluded from row seconds; GNU time peak RSS covers the
+whole process. Two runs per build in A/B, B/A order for each case, sequentially
+with no concurrent builds, tests, or other audit benchmarks.
+
+| case / rewrite row | before | aligned scratch | row time change | before peak KiB | after peak KiB |
+|---|---:|---:|---:|---:|---:|
+| 1 / 67 | 0.465436 s | 0.456838 s | -1.8% | 137,332 | 137,444 |
+| 2 / 44 | 16.718114 s | 13.123006 s | -21.5% | 750,364 | 750,788 |
+| 3 / 44 | 12.732176 s | 12.850163 s | 0.9% | 4,279,004 | 4,279,244 |
+| 4 / 30 | 4.457770 s | 3.691156 s | -17.2% | 739,680 | 740,084 |
+| 5 / 41 | 15.996691 s | 15.673222 s | -2.0% | 5,637,484 | 5,637,744 |
+
+Times are medians; peak RSS is the maximum of the two measurements. All 20 runs
+match exact node counts and complete `cols` strings. Reported persistent payload
+is unchanged in every case (50, 392, 1827, 414, and 2217 MiB respectively).
+Process peak differences are below 0.5 MiB. Cases 2 and 4 show substantial wins;
+the roughly 1–2% changes on the other cases are small enough to treat as noise.
+
+The case-2 unaligned baseline in this sequence is 16.72s, versus the earlier
+roughly 21s measurement of the same committed binary. The checkpoint bytes and
+resume protocol are unchanged, but the load pathname changed when preserving
+artifacts outside /tmp. Incidental allocation layout remains a confounder for
+the unaligned code; the path change is a plausible contributor, not separately
+isolated by this five-case run. Do not splice historical baselines into this
+paired table or attribute the whole historical/current difference to alignment.
+The earlier same-binary runtime-toggle experiment independently established
+21.702003s -> 14.810526s with P-core HitM loads falling about 41x.
+
+A **small residual fresh-versus-resumed gap remains unexplained and deferred**:
+the aligned diagnostic measured row 44 at 13.472523s fresh / 14.915212s resumed,
+and row 45 at 18.901412s / 19.088400s. This is not checkpoint-loading time.
+Future work can investigate it; alignment is not claimed to remove every
+startup effect. The production table above deliberately retains resumed inputs.
+
+### Durable artifacts and validation
+
+- `benchmarks/results/2026-09-05-scratch-alignment/`: small raw logs,
+  binary hashes, exact-output records, and JSON summaries intended for Git.
+- `benchmarks/target_rows.py` and `benchmarks/README.md`: reproducible paired
+  benchmark driver, checkpoint mapping, and commands for regenerating inputs.
+- `benchmarks/checkpoints.sha256`: hashes of the five preserved inputs.
+- Ignored `benchmark-artifacts/`: the five checkpoints, before/after binaries,
+  original case-2 and August audit trees, and test logs, all surviving reboot.
+  No new durable asset for this pass depends on /tmp.
+- Native full and smoke search regressions plus structural tests passed.
+- Non-native CMake Release: all three CTest tests passed, without build warnings.
+- O1 non-native ASan/UBSan structural regression passed. LeakSanitizer cannot
+  operate under this sandbox's ptrace restriction, so the successful run used
+  `ASAN_OPTIONS=detect_leaks=0`; leak checking is not claimed. The sanitizer
+  build emitted GCC 15 libstdc++ regex maybe-uninitialized warnings.
+- New allocator tests cover cross-worker live cache-line isolation at relevant
+  depths and after growth, byte/packed history and 24/40-byte frame-sized
+  elements, 128-byte-aligned elements, copy/move/swap, and overflow rejection.
+
 ## September 5 structural cleanup for a CUDA reference
 
 The current pass prioritizes a simpler reference for a future CUDA port while
@@ -89,7 +159,11 @@ alternating A/B then B/A; no builds or other benchmark jobs run alongside the
 final timing sequence. Every candidate matches the baseline node count and
 entire `cols` string. Small timing differences should be treated as noise.
 
-Artifacts retained under `/tmp` for this session:
+Historical artifact locations for this session are listed below. The five
+pre-target checkpoints and the case-2 diagnostic archives have since been moved
+to the repository's ignored `benchmark-artifacts/` directory; see
+`benchmarks/README.md` for durable paths and regeneration commands. Intermediate
+rejected experiment builds still in `/tmp` are disposable, not handoff assets.
 
 - `/tmp/rlife-structural-baseline/rlife`: original commit build.
 - `/tmp/rlife-structural-packed/rlife`: packed history only.

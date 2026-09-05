@@ -1,5 +1,6 @@
 #pragma once
 
+#include "cache_aligned_allocator.hpp"
 #include "geometry_acceptance.hpp"
 #include "geometry_render.hpp"
 #include "indexed_executor.hpp"
@@ -1425,13 +1426,16 @@ private:
   static_assert(sizeof(CompactGateRangeFrame) == 3U * sizeof(Node));
 
   struct GateRangeScratch {
-    std::vector<std::uint8_t> history;
+    // Ordinary small allocations can share cache lines across workers. Align
+    // the heap buffers themselves; aligning GateRangeScratch is insufficient.
+    // No extra per-depth state: see CASE2_FALSE_SHARING.md.
+    std::vector<std::uint8_t, CacheAlignedAllocator<std::uint8_t>> history;
     // CPU tradeoff: eight extra bytes per depth avoid overlapping byte-store /
     // qword-load gathers. CUDA ports must budget this per-thread storage; see
     // CUDA_PORT_NOTES.md. Keep the compact frame's existing 24-byte layout.
-    std::vector<std::uint64_t> packed_history;
-    std::vector<GateRangeFrame> frames;
-    std::vector<CompactGateRangeFrame> compact_frames;
+    std::vector<std::uint64_t, CacheAlignedAllocator<std::uint64_t>> packed_history;
+    std::vector<GateRangeFrame, CacheAlignedAllocator<GateRangeFrame>> frames;
+    std::vector<CompactGateRangeFrame, CacheAlignedAllocator<CompactGateRangeFrame>> compact_frames;
   };
 
   [[nodiscard]] static constexpr std::uint8_t triple_position(std::uint8_t triple) noexcept {

@@ -1,15 +1,65 @@
+#include "rlife/cache_aligned_allocator.hpp"
 #include "rlife/geometry_acceptance.hpp"
 #include "rlife/succinct_slice_tree.hpp"
 
 #include <iostream>
 #include <numeric>
 #include <random>
+#include <set>
 
 using namespace rlife::llsss;
 
 static void require(bool condition) {
   if(!condition)
     throw std::runtime_error("structural regression mismatch");
+}
+
+template <class T> static void test_buffer_alignment() {
+  using Buffer = std::vector<T, CacheAlignedAllocator<T>>;
+  for(const std::size_t depth : {1, 24, 43, 44, 48, 65, 86, 128}) {
+    std::vector<Buffer> workers(20);
+    for(auto& buffer : workers)
+      buffer.resize(depth);
+    for(unsigned growth = 0; growth < 2; ++growth) {
+      std::set<std::uintptr_t> lines;
+      for(auto& buffer : workers) {
+        if(growth != 0)
+          buffer.resize(depth + 1);
+        const auto first = reinterpret_cast<std::uintptr_t>(buffer.data());
+        require(first % CacheAlignedAllocator<T>::alignment == 0);
+        const auto last = first + buffer.size() * sizeof(T) - 1;
+        for(auto line = first / 64; line <= last / 64; ++line)
+          require(lines.insert(line).second);
+      }
+    }
+  }
+}
+
+static void test_scratch_allocator() {
+  struct alignas(128) OverAligned { std::uint8_t byte; };
+  test_buffer_alignment<std::uint8_t>();
+  test_buffer_alignment<std::uint64_t>();
+  test_buffer_alignment<std::array<std::uint64_t, 3>>();
+  test_buffer_alignment<std::array<std::uint64_t, 5>>();
+  test_buffer_alignment<OverAligned>();
+  using Buffer = std::vector<std::uint8_t, CacheAlignedAllocator<std::uint8_t>>;
+  Buffer original(43, 7);
+  original.resize(44, 9);
+  auto copy = original;
+  auto moved = std::move(copy);
+  require(moved == original && moved.front() == 7 && moved.back() == 9);
+  copy = moved;
+  original.swap(copy);
+  require(original == moved);
+  CacheAlignedAllocator<std::uint64_t> allocator;
+  bool rejected = false;
+  try {
+    auto* pointer = allocator.allocate(std::numeric_limits<std::size_t>::max() / sizeof(std::uint64_t) + 1);
+    allocator.deallocate(pointer, 0);
+  } catch(const std::bad_array_new_length&) {
+    rejected = true;
+  }
+  require(rejected);
 }
 
 static void test_history() {
@@ -117,7 +167,8 @@ static void test_trees() {
 }
 
 int main() {
+  test_scratch_allocator();
   test_history();
   test_trees();
-  std::cout << "packed-history and virtual-leaf regression passed\n";
+  std::cout << "scratch-alignment, packed-history and virtual-leaf regression passed\n";
 }

@@ -33,6 +33,15 @@ eliminates its cost. The result is temporary, not additional per-depth state.
 
 ## Per-depth DFS state: an explicit CPU tradeoff
 
+All four CPU worker scratch buffers use 64-byte-aligned heap allocations
+(or stronger alignment if their element type requires it). This prevents
+false sharing between otherwise private histories/frames; aligning only the
+containing worker struct would not isolate its vector allocations. It adds
+bounded allocation padding, **no per-depth state**, and no per-node walker work.
+CUDA should choose its own coalescing/bank-aware layout rather than treating
+this CPU allocator as an algorithmic requirement. See `CASE2_FALSE_SHARING.md`
+for the counter evidence and the still-unexplained small fresh/resumed gap.
+
 On the current 64-bit host, the ordinary indexed frame is 24 bytes: two child
 block starts, remaining branches, the transition key, and an optional two-bit
 completion class. Exact-summary walks use a 40-byte frame containing the first
@@ -125,6 +134,9 @@ restoration. Existing search regressions also check exact column traces,
 partial/completion RLEs, legacy/runtime behavior, and partition continuation.
 The smoke suite explicitly compares one-worker and four-worker P=7 row traces
 and scheduled partial RLEs across multiple sparse restart ranges.
+Allocator tests also verify cross-worker cache-line isolation before and after
+vector growth, including 24/40-byte frames, stronger element alignment, copying,
+moving, and overflow rejection.
 
 `OPTIMIZATION_LOG.md` records the benchmark rows and measured variants. Preserve
 node and column output, not just elapsed time, when evaluating a new kernel.
