@@ -85,6 +85,12 @@ public:
     return generic_interior_mask(triples, row);
   }
 
+  // Indexed DFS may retain the last 21 triples in a 63-bit shift register,
+  // newest triple in bits 0..2. A zero mask selects the byte-history fallback.
+  // The additional 32 KiB table uses PEXT order instead of the scalar order.
+  [[nodiscard]] std::uint64_t packed_history_mask() const noexcept { return packed_history_mask_; }
+  [[nodiscard]] const std::uint8_t* packed_history_table() const noexcept { return packed_history_table_.data(); }
+
 #if defined(RLIFE_GEOMETRY_ACCEPTANCE_TESTING)
   [[nodiscard]] bool debug_p7_gather_enabled() const noexcept {
 #if RLIFE_ENABLE_P7_GATHER && defined(__BMI2__) && defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
@@ -219,7 +225,7 @@ public:
   }
 
   [[nodiscard]] std::size_t storage_bytes() const noexcept {
-    std::size_t result = 0;
+    std::size_t result = packed_history_table_.capacity();
     for(const auto& phase : interior_acceptance_) {
       for(const auto& projection : phase) {
         result += projection.storage_bytes();
@@ -457,6 +463,28 @@ private:
       }
     }
 
+    packed_history_mask_ = 0;
+    packed_history_table_.clear();
+#if defined(__BMI2__)
+    if(fast_interior_masks_ != nullptr &&
+       *std::max_element(fast_interior_offsets_.begin(), fast_interior_offsets_.end()) <= 21U &&
+       *std::min_element(fast_interior_offsets_.begin(), fast_interior_offsets_.end()) > 0U) {
+      auto ordered = fast_interior_offsets_;
+      std::sort(ordered.begin(), ordered.end());
+      for(const auto offset : ordered)
+        packed_history_mask_ |= std::uint64_t{7} << (3U * (offset - 1U));
+      packed_history_table_.resize(1U << 15U);
+      for(std::size_t key = 0; key < packed_history_table_.size(); ++key) {
+        std::size_t original = 0;
+        for(std::size_t i = 0; i < fast_interior_offsets_.size(); ++i) {
+          const auto index = std::find(ordered.begin(), ordered.end(), fast_interior_offsets_[i]) - ordered.begin();
+          original |= ((key >> (3U * index)) & 7U) << (3U * i);
+        }
+        packed_history_table_[key] = fast_interior_masks_[original];
+      }
+    }
+#endif
+
     if(interior_acceptance_.size() == 2U) {
       bool compatible = true;
       for(std::size_t phase = 0; phase < 2U; ++phase) {
@@ -661,6 +689,8 @@ private:
   std::size_t subtile_count_ = 1;
   std::array<std::size_t, 5> fast_interior_offsets_{};
   const std::uint8_t* fast_interior_masks_ = nullptr;
+  std::uint64_t packed_history_mask_ = 0;
+  std::vector<std::uint8_t> packed_history_table_;
 #if RLIFE_ENABLE_P7_GATHER && defined(__BMI2__) && defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
   std::uint64_t fast_p7_gather_mask_ = 0;
   std::uint8_t fast_p7_block_offset_ = 0;

@@ -154,6 +154,19 @@ if [[ $mode == smoke ]]; then
   [[ $(grep -c '^#C llsss partial ' "$test_tmp/partials-indexed.rle") == 3 ]]
   cmp "$test_tmp/partials-serial.rle" "$test_tmp/partials-indexed.rle"
 
+  # Packed-history indexed DFS must restore the same path on backtracking,
+  # including sparse restart boundaries and scheduled partial reconstruction.
+  for workers in 1 4; do
+    run_with_timeout "$binary" llsss \
+      --rule B3/S12 --left-edge odd --filters bcaf --threads "$workers" \
+      --partials every:1 --partial-output "$test_tmp/p7-$workers.rle" \
+      --halts w_pos:26 --save none 3c7-f2b '@bg(20)' \
+      >"$test_tmp/p7-$workers.out" 2>"$test_tmp/p7-$workers.err"
+    grep -Fq 'height halt at 26' "$test_tmp/p7-$workers.out"
+  done
+  [[ $(normalize_hash "$test_tmp/p7-1.err") == $(normalize_hash "$test_tmp/p7-4.err") ]]
+  cmp "$test_tmp/p7-1.rle" "$test_tmp/p7-4.rle"
+
   run_tiny_edge gse 2c4-f2b 8 "$test_tmp/orth-gse.out" "$test_tmp/orth-gse.err"
   [[ $(normalize_hash "$test_tmp/orth-gse.err") == 5574b6a953ab5ddf891961447b8b8f5a198d045561a28d636f52709dfe1bacaf ]]
   run_tiny_edge gso 2c4-f2b 8 "$test_tmp/orth-gso.out" "$test_tmp/orth-gso.err"

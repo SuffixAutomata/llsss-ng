@@ -1242,6 +1242,27 @@ private:
     return static_cast<std::uint8_t>(active & (expand_left_edges(left_clauses & 0x0fU) | expand_right_edges(right_clauses >> 4U)));
   }
 
+  struct PairStep {
+    Node left_first;
+    Node right_first;
+    std::uint8_t transition_key;
+    std::uint8_t active;
+  };
+
+  // Shared, read-only interior transition for recursive and indexed walkers.
+  // History representation, DFS scheduling, and terminal writes are separate.
+  template <class Acceptor>
+  [[nodiscard]] PairStep pair_step(const SuccinctSliceTree& left, const SuccinctSliceTree& right, Node left_node, Node right_node,
+    std::size_t depth, Acceptor&& accepts) const {
+    const auto left_children = left.child_block(left_node);
+    const auto right_children = right.child_block(right_node);
+    const auto acceptor = accepts();
+    const auto key = static_cast<std::uint8_t>(left_children.mask | (right_children.mask << 4U));
+    auto active = static_cast<std::uint8_t>(acceptor & pair_transitions_[key].present);
+    active = filter_historical_pair_clause(left, right, left_node, right_node, depth + 1U, active);
+    return {left_children.first, right_children.first, key, active};
+  }
+
   template <bool CountStats, bool VisitRejected, bool TrackSummary, class BatchCallback>
   void candidate_pair_batch_dfs(const SuccinctSliceTree& left, const SuccinctSliceTree& right, Node left_node, Node right_node, std::size_t depth,
     std::vector<std::uint8_t>& history, const PairGate& parent_gate, std::uint64_t& parent_gate_cursor, PairPathSummary summary, BatchCallback& batch_callback) {
@@ -1272,12 +1293,9 @@ private:
       return;
     }
 
-    const auto left_children = left.child_block(left_node);
-    const auto right_children = right.child_block(right_node);
-    const auto acceptor = history_all_accepts(history.data(), depth);
-    const auto& transitions = pair_transitions_[static_cast<std::size_t>(left_children.mask) | (static_cast<std::size_t>(right_children.mask) << 4U)];
-    auto active = static_cast<std::uint8_t>(acceptor & transitions.present);
-    active = filter_historical_pair_clause(left, right, left_node, right_node, depth + 1U, active);
+    auto [left_first, right_first, key, active] = pair_step(left, right, left_node, right_node, depth,
+      [&] { return history_all_accepts(history.data(), depth); });
+    const auto& transitions = pair_transitions_[key];
     while(active != 0) {
       const auto position = static_cast<std::uint8_t>(std::countr_zero(static_cast<unsigned>(active)));
       const auto triple = geometry_pair_triple_order[position];
@@ -1292,8 +1310,8 @@ private:
           next_summary.last_left_nonzero = depth;
         }
       }
-      candidate_pair_batch_dfs<CountStats, VisitRejected, TrackSummary>(left, right, left_children.first + (offsets & 0b11U),
-        right_children.first + ((offsets >> 2U) & 0b11U), depth + 1U, history, parent_gate, parent_gate_cursor, next_summary, batch_callback);
+      candidate_pair_batch_dfs<CountStats, VisitRejected, TrackSummary>(left, right, left_first + (offsets & 0b11U),
+        right_first + ((offsets >> 2U) & 0b11U), depth + 1U, history, parent_gate, parent_gate_cursor, next_summary, batch_callback);
       active = static_cast<std::uint8_t>(active & (active - 1U));
     }
   }
@@ -1352,20 +1370,17 @@ private:
       return;
     }
 
-    const auto left_children = left.child_block(left_node);
-    const auto right_children = right.child_block(right_node);
-    const auto acceptor = history_all_accepts(history.data(), depth);
-    const auto& transitions = pair_transitions_[static_cast<std::size_t>(left_children.mask) | (static_cast<std::size_t>(right_children.mask) << 4U)];
-    auto active = static_cast<std::uint8_t>(acceptor & transitions.present);
-    active = filter_historical_pair_clause(left, right, left_node, right_node, depth + 1U, active);
+    auto [left_first, right_first, key, active] = pair_step(left, right, left_node, right_node, depth,
+      [&] { return history_all_accepts(history.data(), depth); });
+    const auto& transitions = pair_transitions_[key];
     while(active != 0) {
       const auto position = static_cast<std::uint8_t>(std::countr_zero(static_cast<unsigned>(active)));
       const auto triple = geometry_pair_triple_order[position];
       const auto offsets = transitions.child_offsets[position];
       history[depth] = triple;
       const auto next_state = advance_completion_path(completion_state, triple, depth, long_start, short_start);
-      candidate_pair_batch_completion_dfs<CountStats, VisitRejected>(left, right, left_children.first + (offsets & 0b11U),
-        right_children.first + ((offsets >> 2U) & 0b11U), depth + 1U, history, parent_gate, parent_gate_cursor, next_state, long_start, short_start, batch_callback);
+      candidate_pair_batch_completion_dfs<CountStats, VisitRejected>(left, right, left_first + (offsets & 0b11U),
+        right_first + ((offsets >> 2U) & 0b11U), depth + 1U, history, parent_gate, parent_gate_cursor, next_state, long_start, short_start, batch_callback);
       active = static_cast<std::uint8_t>(active & (active - 1U));
     }
   }
@@ -1411,6 +1426,10 @@ private:
 
   struct GateRangeScratch {
     std::vector<std::uint8_t> history;
+    // CPU tradeoff: eight extra bytes per depth avoid overlapping byte-store /
+    // qword-load gathers. CUDA ports must budget this per-thread storage; see
+    // CUDA_PORT_NOTES.md. Keep the compact frame's existing 24-byte layout.
+    std::vector<std::uint64_t> packed_history;
     std::vector<GateRangeFrame> frames;
     std::vector<CompactGateRangeFrame> compact_frames;
   };
@@ -1419,7 +1438,7 @@ private:
     return static_cast<std::uint8_t>(((triple & 0b001U) << 2U) | (triple & 0b010U) | ((triple & 0b100U) >> 2U));
   }
 
-  template <bool VisitRejected, bool TrackSummary, bool TrackCompletion, bool CurrentLeaves, class BatchCallback>
+  template <bool VisitRejected, bool TrackSummary, bool TrackCompletion, bool CurrentLeaves, bool PackedHistory = false, class BatchCallback>
   void walk_indexed_gate_range(std::size_t position, std::size_t checkpoint, std::size_t worker, std::size_t long_start, std::size_t short_start, BatchCallback& batch_callback) {
     static_assert(!TrackSummary || !TrackCompletion);
     static_assert(!CurrentLeaves || (!VisitRejected && TrackSummary && !TrackCompletion));
@@ -1429,6 +1448,19 @@ private:
     const auto parent_depth = static_cast<std::size_t>(gate.index_depth);
     auto& scratch = parallel_gate_scratch_[worker];
     auto& history = scratch.history;
+    auto& history_prefix = scratch.packed_history;
+    std::uint64_t packed_history = 0;
+    [[maybe_unused]] const auto gather_mask = geometry_acceptance_.packed_history_mask();
+    [[maybe_unused]] const auto* gather_table = geometry_acceptance_.packed_history_table();
+    if constexpr(PackedHistory)
+      history_prefix.resize(history.size());
+    auto accepts = [&](std::size_t depth) {
+#if defined(__BMI2__)
+      if constexpr(PackedHistory)
+        return depth < geometry_.short_window() ? std::uint8_t{0xffU} : gather_table[_pext_u64(packed_history, gather_mask)];
+#endif
+      return history_all_accepts(history.data(), depth);
+    };
     auto& frames = scratch.frames;
     auto& compact_frames = scratch.compact_frames;
     Node left_node = 0;
@@ -1447,19 +1479,17 @@ private:
         completion_state = advance_completion_path(completion_state, triple, depth, long_start, short_start);
       }
     };
-    auto select_branch = [&](std::size_t depth, std::uint8_t position_in_order, std::uint8_t active, const SuccinctSliceTree::ChildBlock& left_children,
-                           const SuccinctSliceTree::ChildBlock& right_children) {
+    auto select_branch = [&](std::size_t depth, std::uint8_t position_in_order, std::uint8_t active, Node left_first, Node right_first, std::uint8_t key) {
       const auto selected = static_cast<std::uint8_t>(1U << position_in_order);
       if((active & selected) == 0)
         throw std::logic_error("pair-gate index path names an absent branch");
-      const auto key = static_cast<std::uint8_t>(left_children.mask | (right_children.mask << 4U));
       const auto remaining = static_cast<std::uint8_t>(active & ~((selected << 1U) - 1U));
       if constexpr(TrackSummary) {
-        frames[depth] = GateRangeFrame{left_children.first, right_children.first, summary, remaining, key};
+        frames[depth] = GateRangeFrame{left_first, right_first, summary, remaining, key};
       } else {
         auto& frame = compact_frames[depth];
-        frame.left_first = left_children.first;
-        frame.right_first = right_children.first;
+        frame.left_first = left_first;
+        frame.right_first = right_first;
         frame.remaining = remaining;
         frame.transition_key = key;
         if constexpr(TrackCompletion)
@@ -1469,20 +1499,19 @@ private:
       const auto offsets = transitions.child_offsets[position_in_order];
       const auto triple = geometry_pair_triple_order[position_in_order];
       history[depth] = triple;
+      if constexpr(PackedHistory) {
+        history_prefix[depth] = packed_history;
+        packed_history = (packed_history << 3U) | triple;
+      }
       update_path_state(triple, depth);
-      left_node = left_children.first + (offsets & 0b11U);
-      right_node = right_children.first + ((offsets >> 2U) & 0b11U);
+      left_node = left_first + (offsets & 0b11U);
+      right_node = right_first + ((offsets >> 2U) & 0b11U);
     };
 
     for(std::size_t depth = 0; depth < parent_depth; ++depth) {
-      const auto left_children = left.child_block(left_node);
-      const auto right_children = right.child_block(right_node);
-      const auto acceptor = history_all_accepts(history.data(), depth);
-      const auto key = static_cast<std::uint8_t>(left_children.mask | (right_children.mask << 4U));
-      auto active = static_cast<std::uint8_t>(acceptor & pair_transitions_[key].present);
-      active = filter_historical_pair_clause(left, right, left_node, right_node, depth + 1U, active);
+      const auto [left_first, right_first, key, active] = pair_step(left, right, left_node, right_node, depth, [&] { return accepts(depth); });
       const auto triple = gate.indexed_triple(checkpoint, depth);
-      select_branch(depth, triple_position(triple), active, left_children, right_children);
+      select_branch(depth, triple_position(triple), active, left_first, right_first, key);
     }
 
     auto advance = [&]() {
@@ -1514,6 +1543,8 @@ private:
         const auto offsets = pair_transitions_[transition_key].child_offsets[branch];
         const auto triple = geometry_pair_triple_order[branch];
         history[parent] = triple;
+        if constexpr(PackedHistory)
+          packed_history = (history_prefix[parent] << 3U) | triple;
         update_path_state(triple, parent);
         if constexpr(TrackSummary) {
           left_node = frames[parent].left_first + (offsets & 0b11U);
@@ -1525,16 +1556,11 @@ private:
         depth = parent + 1U;
 
         while(depth < parent_depth) {
-          const auto left_children = left.child_block(left_node);
-          const auto right_children = right.child_block(right_node);
-          const auto acceptor = history_all_accepts(history.data(), depth);
-          const auto key = static_cast<std::uint8_t>(left_children.mask | (right_children.mask << 4U));
-          auto active = static_cast<std::uint8_t>(acceptor & pair_transitions_[key].present);
-          active = filter_historical_pair_clause(left, right, left_node, right_node, depth + 1U, active);
+          const auto [left_first, right_first, key, active] = pair_step(left, right, left_node, right_node, depth, [&] { return accepts(depth); });
           if(active == 0)
             break;
           const auto first = static_cast<std::uint8_t>(std::countr_zero(static_cast<unsigned>(active)));
-          select_branch(depth, first, active, left_children, right_children);
+          select_branch(depth, first, active, left_first, right_first, key);
           ++depth;
         }
         if(depth == parent_depth)
@@ -1564,7 +1590,7 @@ private:
         if(ancestry_allowed)
           batch_callback(left_node, right_node, history, summary, checkpoint, worker);
       } else {
-        const auto active = history_all_accepts(history.data(), parent_depth);
+        const auto active = accepts(parent_depth);
 #ifndef NDEBUG
         if constexpr(TrackCompletion)
           verify_completion_path_state(completion_state, history.data(), parent_depth, long_start, short_start);
@@ -1604,6 +1630,13 @@ private:
   template <bool VisitRejected, bool TrackSummary, bool TrackCompletion, bool CurrentLeaves, class BatchCallback>
   static void execute_indexed_gate_range(void* opaque, std::size_t checkpoint, std::size_t worker) {
     auto& context = *static_cast<IndexedGateWalkContext<VisitRejected, TrackSummary, TrackCompletion, BatchCallback>*>(opaque);
+#if defined(__BMI2__)
+    if(context.solver->geometry_acceptance_.packed_history_mask() != 0) {
+      context.solver->template walk_indexed_gate_range<VisitRejected, TrackSummary, TrackCompletion, CurrentLeaves, true>(context.position, checkpoint, worker,
+        context.long_start, context.short_start, *context.callback);
+      return;
+    }
+#endif
     context.solver->template walk_indexed_gate_range<VisitRejected, TrackSummary, TrackCompletion, CurrentLeaves>(context.position, checkpoint, worker,
       context.long_start, context.short_start, *context.callback);
   }
@@ -1822,12 +1855,9 @@ private:
       return;
     }
 
-    const auto left_children = left.child_block(left_node);
-    const auto right_children = right.child_block(right_node);
-    const auto acceptor = history_all_accepts(history.data(), depth);
-    const auto& transitions = pair_transitions_[static_cast<std::size_t>(left_children.mask) | (static_cast<std::size_t>(right_children.mask) << 4U)];
-    auto active = static_cast<std::uint8_t>(acceptor & transitions.present);
-    active = filter_historical_pair_clause(left, right, left_node, right_node, depth + 1U, active);
+    auto [left_first, right_first, key, active] = pair_step(left, right, left_node, right_node, depth,
+      [&] { return history_all_accepts(history.data(), depth); });
+    const auto& transitions = pair_transitions_[key];
     while(active != 0) {
       const auto position = static_cast<std::uint8_t>(std::countr_zero(static_cast<unsigned>(active)));
       const auto triple = geometry_pair_triple_order[position];
@@ -1842,8 +1872,8 @@ private:
           next_summary.last_left_nonzero = depth;
         }
       }
-      const auto next_left = left_children.first + (offsets & 0b11U);
-      const auto next_right = right_children.first + ((offsets >> 2U) & 0b11U);
+      const auto next_left = left_first + (offsets & 0b11U);
+      const auto next_right = right_first + ((offsets >> 2U) & 0b11U);
       if(children_are_leaves) {
         bool leaf_allowed = ancestry_allowed;
         if constexpr(GateLocation == PairGateLocation::Leaf) {

@@ -7,11 +7,11 @@ port of either Rust storage backend or `cpp-old`.
 The persistent state has one quaternary trie for each pair of adjacent
 logical `U` columns. (`U` is the physical x-axis orthogonally and the
 `(1,-1)` diagonal for diagonal velocities.) Each trie node is only a four-bit
-child mask and nodes are stored in breadth-first order. A packed relation gate
-retains one bit for each currently compatible neighboring leaf pair when
-filtering cannot be expressed as a unary slice projection. An all-one gate is
-implicit and uses no payload. It stores neither endpoint IDs nor join objects,
-and there is no join DAG or separate column-history store.
+child mask and nodes are stored in breadth-first order. Native searches retain
+historical BCAF clauses on trie parents and sparse restart paths for parallel
+pair traversal. The compatible relation is implicit: it stores neither endpoint
+IDs nor join objects, and there is no join DAG or separate column-history store.
+Legacy v1/v2 checkpoints can still use explicit packed relation gates.
 
 ## Build
 
@@ -321,8 +321,9 @@ The persistent cost is therefore four child bits plus
 level boundaries.
 
 At an extension, every current leaf mask changes from `0000` to `1111` and its
-four zero-mask children are appended. Synchronized DFS over neighboring tries
-rechecks overlap at every flattened row. Each new three-cell row is tested
+four children receive logical node IDs. These expanded leaves are virtual:
+their zero masks and rank entries are not allocated. Synchronized DFS over
+neighboring tries rechecks overlap at every flattened row. Each new three-cell row is tested
 against the same static 1024-entry CA table for every complete or partially
 known local equation it touches. Interior projections are generated from the
 quotient lattice for each subtile phase. Checks are greedily grouped so a
@@ -336,50 +337,47 @@ transition table maps the two four-bit child masks directly to the possible
 overlapping child pairs, so a pair state performs one rank operation per trie
 and iterates only present, CA-accepted branches.
 
-Without BCAF, one sweep starts at the left boundary and the opposite sweep
-intersects reachability from the right boundary. With BCAF, dependency order
-combines normal right reachability with suffix witnesses, then combines normal
-left reachability, prefix witnesses, and the first global-cleanup direction.
-The reverse cleanup and final gate emission bring the total to four pair-tree
-traversals instead of six independent traversals. Normal reachability, witness
-reachability, and global cleanup use six simultaneous packed tag bits per
-expanded node. This deliberately avoids a much larger temporary bit tape over
-every compatible neighboring leaf pair.
+Native searches use two support sweeps. Without BCAF, they compute reachability
+from each boundary and retain their intersection. With BCAF, the right sweep
+computes normal reachability `R` and suffix witnesses `S`; the left sweep computes
+normal reachability `L`, prefix witnesses `P`, and the next sparse restart index.
+A leaf survives exactly when `L & R & (P | S)`. Witness tags are leaf-local.
 
-Reification performs one DFS to tag live ancestry, then stably compacts the
-four-bit records in place. Whole-tree walks exploit BFS ordering with one child
-cursor per depth; children remain contiguous, so these walks do not need a
-rank lookup for each child. This deletes empty nodes and leaves the new current
-leaves as the zero-mask tail for the next extension.
+Reification tags live ancestry, then stably compacts internal four-bit records.
+It counts retained leaves and synthesizes their zero-mask tail without scanning
+expanded leaf records. Serial reification closes ancestry by DFS and compacts
+in place; parallel reification distributes closure and compaction ranges from
+all slices across one worker team. Both preserve BFS node order and restore
+the ordinary compact checkpoint representation.
 
 The optional `bcaf` filter uses the fixed first complete lookback plus one
 logical `W` tile of each lineage as its zero-background witness, matching the
 Rust implementation and `cpp-old`. Its window is `2P+1` flattened levels
 orthogonally and `4P+2g` diagonally. It propagates witnesses in both directions,
 admits individual compatible leaf pairs only when they lie on an interesting
-prefix or suffix, and then performs global reachability cleanup. The BCAF
-predicate is recomputed during those existing DFS passes instead of being
-materialized as a temporary gate. While the surviving relation gate is emitted
-in deterministic synchronized-DFS order, each finished slice is immediately
-reified and its old gate and tags are released. The persistent gate is the
-minimum correlation state needed to prevent a rejected pair from reappearing
-merely because both unary slice nodes survive; it has no endpoint records.
+prefix or suffix, and enforces global reachability through the retention formula
+above. For retained endpoints, an edge survives exactly when `P(left) | S(right)`.
+Each row stores these two historical witness bits by raw child label in a byte
+on the parent. Future pair walks check the clause at its original depth,
+preventing rejected pairs from reappearing merely because their endpoints
+survive. No dense native pair gate is needed. Sparse restart paths preserve
+deterministic traversal order.
 
-End detection uses two temporary leaf suffix tags (valid and interesting), and
-BCAF partial reconstruction uses one.  Under BCAF these tags are propagated by
-the existing reverse cleanup walk, then the existing forward gate-emission walk
-chooses and saves the corresponding lineages before reification changes node
-IDs.  Thus partial and completion reconstruction add no pair-tree traversals.
-The non-BCAF fallback still rescans the compact relation gate and needs neither
-parent IDs nor cached join endpoints.
+Native BCAF completion detection propagates valid/interesting prefix tags in
+the existing left sweep. Indexed traversal carries a three-state completion
+class, while exact-summary walks retain first/last nonzero depths. Scheduled
+partial and completion lineages are captured before reification changes node
+IDs. Fallback reconstruction can walk the compact relation and needs neither
+stored parent IDs nor cached join endpoints.
 
 End detection likewise uses one complete lookback (`2P` orthogonal or `4P`
 diagonal) as its zero suffix and the preceding logical tile as its interesting
 witness. It runs only at complete tile boundaries.
 
 The reported `persistent_payload_bytes` covers the allocated slice-tree child
-bits, rank directories and level boundaries, persistent relation gates, and
-rule/projection/transition lookup payloads. At a row boundary those are the
+bits, rank directories and level boundaries, historical BCAF clauses, restart
+indexes, legacy relation gates, and rule/projection/transition lookup payloads.
+At a row boundary those are the
 large persistent state terms. It intentionally excludes small C++
 object/container overhead, allocator metadata, stream buffers, configuration,
 and a temporarily cached reconstructed board. `maxrss` is the process's
@@ -387,6 +385,10 @@ lifetime resident-set high-water mark, so it also retains peaks from the
 expanded pre-compaction trees, the sweep tag planes, overlapping old/new gates,
 reconstruction data, and allocator high-water behavior after a row compacts.
 
-This version is serial. Pair-tree traversal is isolated from mutation of the
-persistent tries, leaving its top-level branch work suitable for later
-parallelization. Autochoke is intentionally absent.
+The default is one worker; `--threads N` enables dynamically scheduled indexed
+pair traversal and grouped parallel reification. The common read-only interior
+transition is `Solver::pair_step`; `walk_indexed_gate_range` supplies DFS
+scheduling and sweep callbacks supply writes. On supported BMI2 geometries the
+indexed walker carries a packed history window to avoid gathering recent byte
+stores. Its extra per-depth storage and the remaining CUDA port constraints are
+documented in [CUDA_PORT_NOTES.md](CUDA_PORT_NOTES.md). Autochoke is absent.

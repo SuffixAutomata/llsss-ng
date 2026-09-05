@@ -2,7 +2,142 @@
 
 This file is the durable handoff for the long-running solver optimization work.  Timings are wall-clock row times on the 20-logical-CPU i7-12700 host unless stated otherwise.  Preserve exact `cols` output when comparing implementations.
 
-## Final accepted status (authoritative)
+## September 5 structural cleanup for a CUDA reference
+
+The current pass prioritizes a simpler reference for a future CUDA port while
+retaining measured CPU improvements. See `CUDA_PORT_NOTES.md` for the kernel
+contracts and explicit CPU/GPU storage tradeoffs. The baseline is commit
+`30b7b01`, built afresh with GCC 15.2, CMake Release, and `-march=native`.
+
+Retained changes:
+
+- Indexed single-projection geometries with offsets in 1..21 carry a 63-bit
+  history window. BMI2 gathers a register into a separately ordered 32 KiB
+  table. Byte history and existing geometry kernels remain the fallback.
+  This **adds eight bytes per depth per worker**; it is a CPU optimization,
+  not an assertion that the same per-thread storage is suitable for CUDA.
+- Expansion no longer allocates the new zero-mask leaf bitstream or its rank
+  entries. Logical IDs and tags remain unchanged. Both reifiers compact only
+  internal records and synthesize retained zero leaf records. The persisted
+  checkpoint representation is unchanged; no new lookup branch or per-depth
+  state was added for virtual leaves.
+- `pair_step` shares topology/acceptance/historical-clause evaluation across
+  the three recursive interior sites and both indexed descent sites. Terminal
+  uniform batches remain separate. Branch selection consumes scalar child
+  starts and a transition key.
+- Removed the unused standalone parallel reifier, its duplicate closure/count
+  machinery, `close_from_leaves`, `lineage_dfs`, and three unused PackedTags
+  helpers. The runtime headers have a net reduction of about 140 lines.
+- Updated README's stale serial/four-sweep description to describe the native
+  two-sweep implicit engine and its actual source locations.
+
+### Isolated experiments and rejected refactor
+
+Alternating case-4 runs, three measurements per binary:
+
+| experiment | control median | candidate median | observation |
+|---|---:|---:|---|
+| packed history | 6.408566 s | 4.550736 s | -29.0%, RSS unchanged |
+| add virtual leaves | 4.541025 s | 4.625896 s | +1.9%, RSS 1015 -> 722 MiB |
+| aggregate-return pair_step | 4.683523 s | 5.624115 s | +20.1%; rejected |
+| scalar-result pair_step | 4.453802 s | 4.438880 s | effectively neutral; retained |
+
+Packed history alone also reduced case 1 from 0.519931 s to 0.473800 s
+(five measurements per binary). Virtual leaves reduced expansion and reify
+time but slightly increased sweep time in their isolated case-4 comparison.
+Their retention is justified by the large memory saving, not a claim that
+removing the zero tail always speeds the CPU walk. The recalled earlier 10x
+virtual-leaf regression was not found in this log; this implementation leaves
+ordinary child lookup unchanged and explicitly excludes leaves from emission.
+
+The first `pair_step` helper returned two `ChildBlock` aggregates. GCC inlined
+it, but generated larger walker code and slower execution. Returning only two
+child starts/key/active and passing those scalars into branch selection kept
+the shared source logic and recovered the performance. No extra frame fields
+were introduced by this cleanup.
+
+A whole-process `perf stat` comparison on case 4 reported P-core
+`ld_blocks.store_forward` falling from 156,289,375 to 36,680,430 (about 76.5%).
+The hybrid counters were scheduled for approximately 80% of enabled time;
+these are perf's scaled counts, include checkpoint loading, and do not cover
+E-core store-forward events. This supports the store-forwarding hypothesis,
+but does not assign all elapsed-time improvement to it. The stat command used
+`DEBUGINFOD_URLS=''` and `-e cycles,instructions,ld_blocks.store_forward`.
+
+### Reproduction
+
+Final comparison, median of two measurements per build in A/B, B/A order:
+
+| case / rewrite row | original build | retained changes | row time change | original peak KiB | retained peak KiB |
+|---|---:|---:|---:|---:|---:|
+| 1 / 67 | 0.539899 s | 0.468254 s | -13.3% | 185,324 | 136,916 |
+| 2 / 44 | 21.161864 s | 20.868159 s | -1.4% (neutral) | 929,892 | 750,088 |
+| 3 / 44 | 15.908377 s | 12.818232 s | -19.4% | 5,819,552 | 4,278,876 |
+| 4 / 30 | 6.579170 s | 4.690816 s | -28.7% | 1,039,732 | 739,796 |
+| 5 / 41 | 20.785363 s | 16.181282 s | -22.2% | 7,635,244 | 5,637,592 |
+
+Peak columns report the maximum of the two process peaks, not an average.
+Case 2 does not use packed history; its smaller difference is within normal
+timing variation. These are fresh comparisons, not comparisons against the
+older August timings below.
+
+All timing comparisons use 20 workers, completion detection inherited from
+the supplied searches, `--partials none --save none --phase-timings`, and an
+identical pre-target checkpoint per case. The timed `Row` excludes checkpoint
+loading; GNU `time` peak RSS covers the whole process. Runs are sequential,
+alternating A/B then B/A; no builds or other benchmark jobs run alongside the
+final timing sequence. Every candidate matches the baseline node count and
+entire `cols` string. Small timing differences should be treated as noise.
+
+Artifacts retained under `/tmp` for this session:
+
+- `/tmp/rlife-structural-baseline/rlife`: original commit build.
+- `/tmp/rlife-structural-packed/rlife`: packed history only.
+- `/tmp/rlife-structural-virtual/rlife`: packed history plus virtual leaves.
+- `/tmp/rlife-structural-clean/rlife`: rejected aggregate helper.
+- `/tmp/rlife-structural-scalar/rlife`: retained scalar helper and cleanup.
+- `bench-cN-t20-R.log` beside each binary: raw output and GNU maxRSS.
+- `/tmp/rlife_structural_bench.py`: alternating comparison and exact-output check.
+- `/tmp/rlife-structural-cases/case2_43`, `case3_43`, `case5_40`:
+  freshly generated original-build checkpoints for the larger cases.
+- Cases 1 and 4 reuse Claude's `scratchpad/c1/c1_66` and `scratchpad/c4/c4_29`
+  beneath `/tmp/claude-1000/-home-dandan-Documents-rlife/4a45f242-a2bb-4a53-b22e-5f32f9e7483e/`.
+
+For example, after generating a case-3 checkpoint at row 43:
+
+```sh
+/usr/bin/time -v ./rlife llsss --load /tmp/rlife-structural-cases/case3_43 \
+  --halts w_pos:44 --threads 20 --partials none --save none --phase-timings
+```
+
+### Final validation
+
+- Warning-clean native `make -j3`, full search regression, and the new
+  structural regression through `make test`.
+- Native smoke regression, including the new P=7 serial/indexed comparison of
+  every column trace and scheduled partial RLE through row 26.
+- Non-native CMake Release build without warnings; all three registered tests
+  passed (smoke rerun after correcting its new orthogonal halt-message check).
+- Native ASan/UBSan structural differential and Debug/O1 ASan/UBSan smoke
+  regression passed. The latter also exercises DFS completion-state assertions.
+- All five large target rows have exact node counts and complete `cols` output
+  against the original build, on both alternating comparisons.
+- Original and rebuilt native binaries emitted byte-identical case-1 row-67
+  checkpoints with identical options and save path. SHA-256:
+  `41ffe698acd141363433df251fd9e825c3045d473ae50ac514659bfd59adbc48`.
+  This covers compact topology, clauses, and restart-index ordering, not just
+  aggregate search counts. Files remain in `/tmp/rlife-structural-checkpoint/`.
+
+### Remaining directions
+
+Destination-owned task ranges, an interleaved rank directory, persistent tag
+buffer reuse, leaf-local R, and word-wide BCAF keep/clause emission remain
+unimplemented. They should be separate experiments. In particular, implicit
+relations do not remove the sparse index's scheduling and deterministic-output
+responsibilities; dropping it requires a replacement that is both complete
+and balanced. This pass deliberately keeps those semantics as a CUDA reference.
+
+## Previous accepted status (August baseline)
 
 All five requested target rows beat vanilla with exact node/column output.  The
 case-5 number predates the final P=7 gather and BMI2 expansion wins, so it is a

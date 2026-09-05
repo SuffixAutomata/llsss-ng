@@ -27,6 +27,15 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(structural_regression tests/structural_regression.cpp)
+  target_include_directories(structural_regression PRIVATE src)
+  target_compile_features(structural_regression PRIVATE cxx_std_20)
+  target_compile_options(structural_regression PRIVATE -Wall -Wextra -Wpedantic)
+  target_link_libraries(structural_regression PRIVATE rlife_indexed_executor)
+  if(RLIFE_NATIVE_FLAG)
+    target_compile_options(structural_regression PRIVATE ${RLIFE_NATIVE_FLAG})
+  endif()
+  add_test(NAME structural_regression COMMAND structural_regression)
   add_test(
     NAME search_regression_full
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/search_regression.sh $<TARGET_FILE:rlife> full
@@ -37,4 +46,5 @@ if(BUILD_TESTING)
   )
   set_tests_properties(search_regression_full PROPERTIES TIMEOUT 300 LABELS "full;regression")
   set_tests_properties(search_smoke PROPERTIES TIMEOUT 60 LABELS "smoke;regression")
+  set_tests_properties(structural_regression PROPERTIES TIMEOUT 120 LABELS "regression")
 endif()

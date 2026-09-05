@@ -33,5 +33,10 @@ src/rlife/indexed_executor.o: src/rlife/indexed_executor.cpp src/rlife/indexed_e
 clean:
 	rm -f $(TARGET) $(OBJECTS)
 
-test: $(TARGET)
+build/structural_regression: tests/structural_regression.cpp $(HEADERS) src/rlife/indexed_executor.o
+	mkdir -p build
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(NATIVE_FLAGS) -Isrc $< src/rlife/indexed_executor.o $(LDFLAGS) -fopenmp -o $@
+
+test: $(TARGET) build/structural_regression
 	bash tests/search_regression.sh ./$(TARGET)
+	./build/structural_regression
