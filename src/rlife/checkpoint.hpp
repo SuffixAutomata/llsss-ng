@@ -264,6 +264,7 @@ inline Options Solver::read_config(CheckpointReader& input, std::uint32_t checkp
   options.partial_output = input.string();
   options.stats_output = input.string();
   options.verbose = input.boolean();
+  options.verbose = false; // not to be persisted in checkpoints
   options.phase_timings = input.boolean();
   const auto save_mode = input.u8();
   if(save_mode > static_cast<std::uint8_t>(SaveMode::Every)) {
