@@ -126,8 +126,22 @@ if [[ $mode == smoke ]]; then
   [[ $(sha256_digest "$test_tmp/completion.rle" | awk '{print $1}') == 8571b78b68c4f8db6d845fe68dd9ead52c589fa0c2c19d269d07a10543fcee40 ]]
   test -s "$test_tmp/completion-checkpoints/search2/completion-checkpoint_48"
   "$binary" llsss --load "$test_tmp/completion-checkpoints/search2/completion-checkpoint_48" --partials none --save none \
+    --partial-output "$test_tmp/completion-reloaded.rle" \
     >"$test_tmp/completion-reload.out" 2>"$test_tmp/completion-reload.err"
   grep -Fq 'checkpoint row already contains a halting completion' "$test_tmp/completion-reload.out"
+  cmp "$test_tmp/completion.rle" "$test_tmp/completion-reloaded.rle"
+
+  # A failed partial stream is reopened once, then the complete buffered board
+  # is preserved on stderr if the retry also fails.
+  if [[ -e /dev/full ]]; then
+    "$binary" llsss --rule B3578/S24678 --left-edge gse --filters bcaf \
+      --partials final --partial-output /dev/full --ends none --halts w_pos:8 \
+      --save none c6d-f2b '@bg:4' \
+      >"$test_tmp/partial-fallback.out" 2>"$test_tmp/partial-fallback.err"
+    grep -Fq 'rlife: partial output failed after retry; emitting halt to stderr' "$test_tmp/partial-fallback.err"
+    grep -Fq '#C llsss halt flattened_depth=24 w_pos=12[0] geometry=c6d-f2b' "$test_tmp/partial-fallback.err"
+    grep -Eq '^x = [0-9]+, y = [0-9]+, rule = B3578/S24678$' "$test_tmp/partial-fallback.err"
+  fi
 
   # The indexed implicit walk carries only the three-state completion class;
   # it must reproduce the serial exact-summary completion byte-for-byte.

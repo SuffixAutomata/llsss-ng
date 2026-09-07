@@ -707,6 +707,11 @@ public:
     }
     if(completion_at_current_row_ && options_.detect_ends && options_.halt_on_ends) {
       std::cout << "checkpoint row already contains a halting completion\n";
+      phase("completion reconstruction/output");
+      auto completion = find_completion();
+      if(!completion)
+        throw std::logic_error("checkpoint completion flag does not match the loaded search state");
+      emit_board(*completion, "completion");
       return finish(0, "completion");
     }
     if(options_.halt_height >= 0 && geometry_.w_position(height_) >= static_cast<std::size_t>(options_.halt_height)) {
@@ -2841,16 +2846,44 @@ private:
 
   void emit_board(const Board& row_sequence, std::string_view kind) {
     const auto board = rlife::llsss::render_phase_montage(geometry_, row_sequence, options_.left_edge, options_.right_edge);
-    std::ostream& output = partial_file_.is_open() ? static_cast<std::ostream&>(partial_file_) : static_cast<std::ostream&>(std::cout);
-    output << "#C llsss " << kind << ' ';
+    std::ostringstream rendered;
+    rendered << "#C llsss " << kind << ' ';
     if(geometry_.subtile_count != 1) {
-      output << "flattened_depth=" << height_ << " w_pos=" << geometry_.position_string(height_) << " geometry=" << geometry_.source << '\n';
+      rendered << "flattened_depth=" << height_ << " w_pos=" << geometry_.position_string(height_) << " geometry=" << geometry_.source << '\n';
     } else {
-      output << "height=" << height_ << " geometry=" << geometry_.source << '\n';
+      rendered << "height=" << height_ << " geometry=" << geometry_.source << '\n';
     }
-    output << "#C physical time phases 0.." << geometry_.period - 1 << " left-to-right; gap=16\n";
-    output << "x = " << board.front().size() << ", y = " << board.size() << ", rule = " << options_.rule << '\n' << encode_rle(board);
-    output.flush();
+    rendered << "#C physical time phases 0.." << geometry_.period - 1 << " left-to-right; gap=16\n";
+    rendered << "x = " << board.front().size() << ", y = " << board.size() << ", rule = " << options_.rule << '\n' << encode_rle(board);
+    const auto payload = rendered.str();
+
+    auto write_payload = [&](std::ostream& output) {
+      output.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+      output.flush();
+      return static_cast<bool>(output);
+    };
+
+    if(!options_.partial_output.empty()) {
+      if(write_payload(partial_file_))
+        return;
+      partial_file_.close();
+      partial_file_.clear();
+      partial_file_.open(options_.partial_output, std::ios::out | std::ios::app);
+      if(partial_file_.is_open() && write_payload(partial_file_))
+        return;
+    } else {
+      if(write_payload(std::cout))
+        return;
+      std::cout.clear();
+      if(write_payload(std::cout))
+        return;
+    }
+
+    std::cerr << "rlife: partial output failed after retry; emitting " << kind << " to stderr\n";
+    std::cerr.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+    std::cerr.flush();
+    if(!std::cerr)
+      throw std::runtime_error("failed to emit partial output and stderr fallback");
   }
 
   void emit_final_partial(std::string_view kind) {
