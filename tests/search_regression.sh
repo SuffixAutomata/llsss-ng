@@ -83,6 +83,16 @@ if [[ $mode == smoke ]]; then
   four_subtile_hash=$(normalize_hash "$test_tmp/four-subtile.err")
   [[ $four_subtile_hash == 92692a524225d9f5d02253fc1e12459e06f958e4b7a876dfc6335d08be7bbc99 ]]
 
+  # The default pause policy does not leave a checkpoint after exhaustion.
+  mkdir "$test_tmp/default-pause-exhausted"
+  run_with_timeout "$binary" llsss \
+    --rule B35678/S4678 --left-edge bg --filters bcaf --partials none \
+    --savedir "$test_tmp/default-pause-exhausted" --search-name exhausted \
+    c3d-f2b '@bg(7)' \
+    >"$test_tmp/default-pause-exhausted.out" 2>"$test_tmp/default-pause-exhausted.err"
+  grep -Fq 'search exhausted at flattened depth 16 (w_pos 8[0])' "$test_tmp/default-pause-exhausted.out"
+  test -z "$(find "$test_tmp/default-pause-exhausted" -type f -print -quit)"
+
   run_with_timeout "$binary" llsss \
     --rule B3578/S24678 --left-edge gse --filters bcaf \
     --partials final --partial-output "$test_tmp/gse.rle" \
@@ -130,6 +140,17 @@ if [[ $mode == smoke ]]; then
     >"$test_tmp/completion-reload.out" 2>"$test_tmp/completion-reload.err"
   grep -Fq 'checkpoint row already contains a halting completion' "$test_tmp/completion-reload.out"
   cmp "$test_tmp/completion.rle" "$test_tmp/completion-reloaded.rle"
+
+  # Pause is an explicit override for old final checkpoints and suppresses a
+  # redundant checkpoint when the loaded row is already a completion.
+  "$binary" llsss --load "$test_tmp/completion-checkpoints/search2/completion-checkpoint_48" \
+    --partials none --save pause --savedir "$test_tmp/pause-completion" \
+    --search-name paused-completion --partial-output "$test_tmp/pause-completion.rle" \
+    --status-output "$test_tmp/pause-completion.json" \
+    >"$test_tmp/pause-completion.out" 2>"$test_tmp/pause-completion.err"
+  grep -Fq 'checkpoint row already contains a halting completion' "$test_tmp/pause-completion.out"
+  grep -Fq '"checkpoint": null' "$test_tmp/pause-completion.json"
+  test ! -e "$test_tmp/pause-completion/paused-completion_48"
 
   # A failed partial stream is reopened once, then the complete buffered board
   # is preserved on stderr if the retry also fails.
@@ -295,10 +316,25 @@ grep -Fq '"outcome": "halt"' "$test_tmp/managed/state.json"
 "$manager" status "$test_tmp/managed" >"$test_tmp/managed-status.out"
 grep -Fq 'manager state=complete outcome=halt' "$test_tmp/managed-status.out"
 [[ $(grep -c '^manager: .* partition ' "$test_tmp/managed.out") == 1 ]]
+grep -Fq '[3/3 100.00%]' "$test_tmp/managed.out"
 if grep -Fq -- ' --part ' "$test_tmp/managed.out"; then
   echo 'manager unexpectedly materialized a split one child at a time' >&2
   exit 1
 fi
+
+# Immediate deletion uses the same retired-payload test as archival, but
+# removes each checkpoint as soon as its replacement frontier is durable.
+"$manager" start "$test_tmp/managed-delete" --binary "$binary" --max-memory 1 \
+  --disk-reserve none --delete-immediately --bfs --parts 3 --boundary-slack 0 -- \
+  --load "$test_tmp/checkpoint_12" --halts w_pos:13 \
+  --partials none --ends none \
+  >"$test_tmp/managed-delete.out" 2>"$test_tmp/managed-delete.err"
+grep -Fq '"delete_immediately": true' "$test_tmp/managed-delete/state.json"
+grep -Fq '"kind": "checkpoint_deleted"' "$test_tmp/managed-delete/state.json"
+grep -Fxq '[100.00%]' "$test_tmp/managed-delete.out"
+test -z "$(find "$test_tmp/managed-delete/checkpoints" "$test_tmp/managed-delete/partitions" \
+  -type f ! -name '*.json' ! -name '*.rle' -print -quit)"
+test -n "$(find "$test_tmp/managed-delete/partitions" -name '*.status.json' -print -quit)"
 
 # Disk pressure is a durable pause rather than a failed subprocess.  The
 # explicit reserve is persisted and exit 75 tells a batch wrapper to retry

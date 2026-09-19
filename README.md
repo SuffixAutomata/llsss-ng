@@ -109,12 +109,13 @@ right.
 ## Checkpoints
 
 Checkpointing happens only after a row has finished and the tries and relation
-gates are back in their compact persistent form. By default a final checkpoint
-is written as `saves/save_{row}` whenever the search exits normally. The policy,
-directory, and search name can be changed with:
+gates are back in their compact persistent form. By default a checkpoint is
+written as `saves/save_{row}` when the search pauses at `--halts`, a memory cap,
+or Ctrl-C, but not when a completion is found or the tree is exhausted. The
+policy, directory, and search name can be changed with:
 
 ```sh
---save none|final|every:N
+--save none|pause|final|every:N
 --savedir DIRECTORY
 --search-name NAME
 ```
@@ -123,6 +124,8 @@ Checkpoint files are named `DIRECTORY/SEARCH_NAME_{row}`. The directory is
 created recursively when needed, and must not be an existing file. The search
 name is checkpoint metadata and survives a reload, while the save directory
 remains a runtime policy. Existing checkpoint files are atomically replaced.
+`final` retains the previous behavior of also saving completed and exhausted
+searches, while `every:N` additionally saves every Nth row.
 Resume without geometry or a start grid using:
 
 ```sh
@@ -225,7 +228,7 @@ within one percent of a part's leaf count in order to minimize the depth of
 `--dry-run` to inspect the ranges and spanning-node overhead, and use `--force`
 to replace existing partition outputs.
 
-## Depth-first search manager
+## Partitioned search manager
 
 `scripts/rlife_manager.py` automates the memory-cap cycle in fresh subprocesses
 (peak RSS is process-lifetime state, so this separation matters). On a
@@ -233,6 +236,14 @@ to replace existing partition outputs.
 the first child to completion before the next sibling. A child that reaches
 the cap is recursively partitioned; an exhausted child is retired. The
 original `--halts` target is reapplied to every materialized descendant.
+Pass `--bfs` before the `--` separator to visit all queued partitions at the
+shallowest depth before descending further. Without it, traversal remains
+depth-first. The choice is saved in the run state and retained by `resume`.
+The manager also prints a heuristic progress estimate. A finished branch at
+partition depth `d` contributes `1 / parts^d`; the counters are saved across
+resumes. Depth-first runs show the estimate as base-`parts` digits by depth,
+such as `[1/4 0/4 25.00%]`, while breadth-first runs show `[25.00%]`. On an
+interactive terminal the indicator is rendered in bright green.
 
 Start a new managed search with a new work directory:
 
@@ -283,6 +294,13 @@ scripts/rlife_manager.py archive runs/c5-search \
   --archive-dir /mnt/archive/c5-search
 ```
 
+If retired checkpoints do not need to be retained, use `--delete-immediately`
+instead of `--archive-dir`. As soon as a new frontier is committed, checkpoint
+payloads that are no longer active or queued are permanently deleted; status
+and RLE result files remain. The setting is durable and can also be enabled
+with `configure` or `resume`. It is mutually exclusive with an archive
+directory.
+
 Press Ctrl-C once to pause. The manager forwards it to the active solver,
 waits for the current row and checkpoint, commits that branch to `state.json`,
 and exits with status 130. Continue or inspect it with:
@@ -299,8 +317,8 @@ completions are transmitted back without duplicate appends across a resume.
 detection is active in both ordinary extension and partition materialization:
 with the default halt-on-end behavior, the first such result completes the
 managed run while retaining any unvisited branches in the manifest; with
-`--no-halt-on-ends`, completion RLEs are collected and DFS continues. A failed
-subprocess leaves the active operation recorded, and `resume` retries it;
+`--no-halt-on-ends`, completion RLEs are collected and traversal continues. A
+failed subprocess leaves the active operation recorded, and `resume` retries it;
 each split is materialized by one `rlife partition` subprocess, and an
 incomplete split is retried in its manager-owned output directory with
 `--force`.

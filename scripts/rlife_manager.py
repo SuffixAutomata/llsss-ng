@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resumable depth-first orchestration for memory-partitioned rlife searches."""
+"""Resumable orchestration for memory-partitioned rlife searches."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 from datetime import datetime, timezone
+from fractions import Fraction
 from typing import Any
 
 
@@ -38,6 +39,8 @@ CONTROLLED_LLSSS_OPTIONS = {
     "--partial-output",
 }
 RLE_KIND = re.compile(r"^#C llsss ([A-Za-z0-9_-]+)\b", re.MULTILINE)
+BRIGHT_GREEN = "\033[1;92m"
+ANSI_RESET = "\033[0m"
 
 
 class ManagerError(RuntimeError):
@@ -141,6 +144,7 @@ class Manager:
         self.results_path = workdir / "results.rle"
         self.events_path = workdir / "events.jsonl"
         self.manifest = manifest
+        self.last_progress_text: str | None = None
         config = self.manifest.setdefault("config", {})
         if "disk_reserve_bytes" not in config:
             memory_cap = str(config.get("memory_cap", "none"))
@@ -149,8 +153,69 @@ class Manager:
         else:
             config.setdefault("disk_reserve", str(config["disk_reserve_bytes"]))
         config.setdefault("archive_dir", None)
+        # Manifests created before traversal was configurable are DFS runs.
+        config.setdefault("traversal", "dfs")
+        config.setdefault("delete_immediately", False)
+        if config["delete_immediately"] and config["archive_dir"]:
+            raise ManagerError("saved configuration enables both --delete-immediately and --archive-dir")
         self.manifest.setdefault("pause_reason", None)
         self.manifest.setdefault("archived_checkpoints", [])
+        if "progress" not in self.manifest:
+            self.manifest["progress"] = self.reconstruct_progress()
+        progress = self.manifest["progress"]
+        progress.setdefault("completed_by_depth", {})
+        progress.setdefault("max_depth", 0)
+        active = self.manifest.get("active")
+        frontier = list(self.manifest.get("stack", []))
+        if active is not None:
+            frontier.append(active["branch"])
+        if frontier:
+            progress["max_depth"] = max(
+                int(progress["max_depth"]),
+                max(int(branch.get("depth", 0)) for branch in frontier),
+            )
+
+    def reconstruct_progress(self) -> dict[str, Any]:
+        """Rebuild progress for manifests created before progress was stored."""
+        branch_depths = {"root": 0}
+        partition_depths: dict[str, int] = {}
+        max_depth = 0
+
+        def branch_depth(branch_id: str) -> int | None:
+            known = branch_depths.get(branch_id)
+            if known is not None:
+                return known
+            partition_id, separator, _ = branch_id.rpartition("/")
+            if not separator:
+                return None
+            known = partition_depths.get(partition_id)
+            if known is not None:
+                branch_depths[branch_id] = known
+            return known
+
+        for event in self.manifest.get("events", []):
+            if event.get("kind") != "partition_materialized":
+                continue
+            parent_depth = branch_depth(str(event.get("branch", "")))
+            partition_id = event.get("partition")
+            if parent_depth is None or not isinstance(partition_id, str):
+                continue
+            child_depth = parent_depth + 1
+            partition_depths[partition_id] = child_depth
+            max_depth = max(max_depth, child_depth)
+
+        completed_by_depth: dict[str, int] = {}
+        terminal_reasons = {"exhausted", "halt", "completion"}
+        for event in self.manifest.get("events", []):
+            if event.get("kind") != "solver_result" or event.get("reason") not in terminal_reasons:
+                continue
+            depth = branch_depth(str(event.get("branch", "")))
+            if depth is None:
+                continue
+            key = str(depth)
+            completed_by_depth[key] = completed_by_depth.get(key, 0) + 1
+            max_depth = max(max_depth, depth)
+        return {"completed_by_depth": completed_by_depth, "max_depth": max_depth}
 
     @classmethod
     def create(
@@ -162,8 +227,12 @@ class Manager:
         archive_dir: Path | None,
         parts: int,
         boundary_slack: float,
+        delete_immediately: bool,
+        bfs: bool,
         solver_args: list[str],
     ) -> "Manager":
+        if delete_immediately and archive_dir is not None:
+            raise ManagerError("--delete-immediately is mutually exclusive with --archive-dir")
         if archive_dir is not None:
             try:
                 archive_dir.relative_to(workdir)
@@ -199,8 +268,10 @@ class Manager:
                 "disk_reserve": reserve_text,
                 "disk_reserve_bytes": reserve_bytes,
                 "archive_dir": str(archive_dir) if archive_dir is not None else None,
+                "delete_immediately": delete_immediately,
                 "parts": parts,
                 "boundary_slack": boundary_slack,
+                "traversal": "bfs" if bfs else "dfs",
                 "solver_args": solver_args,
                 "halt_w_position": None,
             },
@@ -222,6 +293,7 @@ class Manager:
             "artifacts": [],
             "events": [],
             "terminal": {"exhausted": 0, "halt": 0, "completion": 0},
+            "progress": {"completed_by_depth": {}, "max_depth": 0},
             "discoveries": {},
             "archived_checkpoints": [],
         }
@@ -253,9 +325,18 @@ class Manager:
     def absolute(self, stored: str) -> Path:
         return (self.workdir / stored).resolve()
 
-    def configure(self, disk_reserve: str | None, archive_dir: Path | None) -> bool:
+    def configure(
+        self,
+        disk_reserve: str | None,
+        archive_dir: Path | None,
+        delete_immediately: bool = False,
+    ) -> bool:
         changed = False
         config = self.manifest["config"]
+        if delete_immediately and (archive_dir is not None or config.get("archive_dir")):
+            raise ManagerError("--delete-immediately is mutually exclusive with --archive-dir")
+        if archive_dir is not None and config.get("delete_immediately"):
+            raise ManagerError("--archive-dir is mutually exclusive with --delete-immediately")
         if disk_reserve is not None:
             reserve_bytes = parse_byte_size(disk_reserve, "--disk-reserve")
             config["disk_reserve"] = disk_reserve
@@ -276,6 +357,9 @@ class Manager:
             else:
                 raise ManagerError("--archive-dir must not contain the managed work directory")
             config["archive_dir"] = str(resolved)
+            changed = True
+        if delete_immediately:
+            config["delete_immediately"] = True
             changed = True
         return changed
 
@@ -431,6 +515,26 @@ class Manager:
                 return free, moved
         return self.disk_free_bytes(), moved
 
+    def delete_retired_checkpoints(self) -> tuple[int, int]:
+        if not self.manifest["config"].get("delete_immediately"):
+            return 0, 0
+        count = 0
+        deleted = 0
+        for source in self.retired_checkpoint_paths():
+            relative = source.relative_to(self.workdir)
+            size = source.stat().st_size
+            source.unlink()
+            count += 1
+            deleted += size
+            self.event("checkpoint_deleted", source=str(relative), bytes=size)
+            print(
+                f"manager: deleted retired checkpoint {relative} ({format_bytes(size)})",
+                flush=True,
+            )
+        if count:
+            self.save()
+        return count, deleted
+
     def pause_for_disk(self, stage: str, free: int, reserve: int, detail: str | None = None) -> None:
         message = (
             f"disk reserve reached before {stage}: {format_bytes(free)} free is below "
@@ -482,6 +586,62 @@ class Manager:
 
     def event(self, kind: str, **fields: Any) -> None:
         self.manifest["events"].append({"time": now(), "kind": kind, **fields})
+
+    def observe_progress_depth(self, depth: int) -> None:
+        progress = self.manifest["progress"]
+        progress["max_depth"] = max(int(progress.get("max_depth", 0)), depth)
+
+    def complete_progress_branch(self, branch: dict[str, Any]) -> None:
+        depth = int(branch.get("depth", 0))
+        self.observe_progress_depth(depth)
+        completed = self.manifest["progress"]["completed_by_depth"]
+        key = str(depth)
+        completed[key] = int(completed.get(key, 0)) + 1
+
+    def progress_fraction(self) -> Fraction:
+        parts = int(self.manifest["config"]["parts"])
+        result = Fraction(0)
+        completed = self.manifest["progress"]["completed_by_depth"]
+        for depth_text, count in completed.items():
+            depth = int(depth_text)
+            if depth < 0 or int(count) < 0:
+                raise ManagerError("saved progress contains a negative depth or count")
+            result += Fraction(int(count), parts**depth)
+        return min(result, Fraction(1))
+
+    def progress_text(self) -> str:
+        parts = int(self.manifest["config"]["parts"])
+        completed = self.progress_fraction()
+        percentage = float(completed * 100)
+        if self.manifest["config"].get("traversal", "dfs") == "bfs":
+            return f"[{percentage:.2f}%]"
+
+        completed_depths = self.manifest["progress"]["completed_by_depth"]
+        deepest_completed = max((int(depth) for depth in completed_depths), default=0)
+        depth = max(1, int(self.manifest["progress"].get("max_depth", 0)), deepest_completed)
+        if completed == 1:
+            digits = [parts] + [0] * (depth - 1)
+        else:
+            scaled = completed * parts**depth
+            if scaled.denominator != 1:
+                raise ManagerError("saved progress depth is inconsistent with its completed branches")
+            remaining = scaled.numerator
+            digits = []
+            for position in range(depth - 1, -1, -1):
+                place = parts**position
+                digit, remaining = divmod(remaining, place)
+                digits.append(digit)
+        fractions = " ".join(f"{digit}/{parts}" for digit in digits)
+        return f"[{fractions} {percentage:.2f}%]"
+
+    def print_progress(self) -> None:
+        text = self.progress_text()
+        if text == self.last_progress_text:
+            return
+        self.last_progress_text = text
+        if sys.stdout.isatty() and "NO_COLOR" not in os.environ:
+            text = f"{BRIGHT_GREEN}{text}{ANSI_RESET}"
+        print(text, flush=True)
 
     def add_artifact(self, artifact_id: str, path: Path, branch: str, stage: str) -> bool:
         if any(item["id"] == artifact_id for item in self.manifest["artifacts"]):
@@ -714,17 +874,21 @@ class Manager:
             self.event("manager_paused", branch=branch["id"], stage="extend")
         elif reason == "completion":
             self.manifest["terminal"]["completion"] += 1
+            self.complete_progress_branch(branch)
             self.manifest["state"] = "complete"
             self.manifest["outcome"] = "completion"
             self.manifest["active"] = None
         elif reason in ("exhausted", "halt"):
             self.manifest["terminal"][reason] += 1
+            self.complete_progress_branch(branch)
             self.manifest["active"] = None
         else:
             self.fail(f"unexpected extension result: {reason}")
             return False
 
         self.save()
+        self.print_progress()
+        self.delete_retired_checkpoints()
         if interrupted and self.manifest["state"] == "running":
             self.manifest["state"] = "paused"
             self.manifest["pause_reason"] = {"kind": "interrupt", "stage": "extend"}
@@ -872,6 +1036,7 @@ class Manager:
                 "depth": int(branch["depth"]) + 1,
                 "initial": False,
             }
+            self.observe_progress_depth(int(child["depth"]))
             artifacts_added |= self.record_status_artifact(
                 f"{partition['id']}-part-{part}", rle_path, child, "materialize", status
             )
@@ -880,19 +1045,19 @@ class Manager:
                 children.append(child)
             elif reason == "exhausted":
                 self.manifest["terminal"]["exhausted"] += 1
+                self.complete_progress_branch(child)
             elif reason == "halt":
                 self.manifest["terminal"]["halt"] += 1
+                self.complete_progress_branch(child)
             elif reason == "completion":
                 self.manifest["terminal"]["completion"] += 1
+                self.complete_progress_branch(child)
                 completion_halt = True
             else:
                 self.fail(f"unexpected materialization result for {name}: {reason}")
                 return False
 
-        # Reverse insertion makes the first materialized part the next LIFO
-        # branch, preserving deterministic depth-first traversal.
-        for child in reversed(children):
-            self.manifest["stack"].append(child)
+        self.queue_children(children)
         self.event(
             "partition_materialized",
             branch=branch["id"],
@@ -904,9 +1069,25 @@ class Manager:
             self.manifest["state"] = "complete"
             self.manifest["outcome"] = "completion"
         self.save()
+        self.print_progress()
+        self.delete_retired_checkpoints()
         if artifacts_added:
             self.rebuild_outputs_best_effort()
         return self.manifest["state"] == "running"
+
+    def queue_children(self, children: list[dict[str, Any]]) -> None:
+        """Queue children in part order using the configured traversal."""
+        traversal = self.manifest["config"].get("traversal", "dfs")
+        if traversal == "dfs":
+            # The end of the list is the next branch, so reversed insertion
+            # visits the first child immediately.
+            self.manifest["stack"].extend(reversed(children))
+        elif traversal == "bfs":
+            # Keep the oldest queued branch at the end. New children go at
+            # the opposite end, after all existing (shallower) branches.
+            self.manifest["stack"][0:0] = reversed(children)
+        else:
+            raise ManagerError(f"unknown traversal policy: {traversal}")
 
     def finish_if_done(self) -> bool:
         if self.manifest["active"] is not None or self.manifest["stack"]:
@@ -920,6 +1101,8 @@ class Manager:
         return True
 
     def run(self) -> int:
+        self.delete_retired_checkpoints()
+        self.print_progress()
         if self.manifest["state"] == "complete":
             self.rebuild_outputs_best_effort()
             self.print_status()
@@ -968,13 +1151,15 @@ class Manager:
         return 1
 
     def print_status(self) -> None:
+        self.print_progress()
         active = self.manifest.get("active")
         active_text = "none"
         if active:
             active_text = f"{active['branch']['id']} ({active['action']}, height={active['branch'].get('height')})"
         print(
             f"manager state={self.manifest['state']} outcome={self.manifest.get('outcome')} "
-            f"active={active_text} queued={len(self.manifest.get('stack', []))}"
+            f"active={active_text} queued={len(self.manifest.get('stack', []))} "
+            f"traversal={self.manifest['config'].get('traversal', 'dfs')}"
         )
         print(
             f"terminal={self.manifest.get('terminal', {})} discoveries={self.manifest.get('discoveries', {})}"
@@ -982,7 +1167,8 @@ class Manager:
         reserve = int(self.manifest["config"].get("disk_reserve_bytes", 0))
         print(
             f"disk_free={format_bytes(self.disk_free_bytes())} disk_reserve={format_bytes(reserve)} "
-            f"archive={self.manifest['config'].get('archive_dir') or 'none'}"
+            f"archive={self.manifest['config'].get('archive_dir') or 'none'} "
+            f"delete_immediately={bool(self.manifest['config'].get('delete_immediately'))}"
         )
         if self.manifest.get("error"):
             print(f"error: {self.manifest['error']}", file=sys.stderr)
@@ -1006,7 +1192,7 @@ def validate_start_arguments(arguments: list[str]) -> list[str]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run an rlife search depth-first, recursively materializing partitions at a soft memory cap."
+        description="Run an rlife search, recursively materializing partitions at a soft memory cap."
     )
     commands = parser.add_subparsers(dest="command", required=True)
     start = commands.add_parser(
@@ -1022,23 +1208,48 @@ def build_parser() -> argparse.ArgumentParser:
         "--disk-reserve",
         help="minimum free space before launching more work (default: --max-memory)",
     )
-    start.add_argument(
+    start_retention = start.add_mutually_exclusive_group()
+    start_retention.add_argument(
         "--archive-dir",
         type=Path,
         help="move retired checkpoint payloads here when the disk reserve is reached",
     )
+    start_retention.add_argument(
+        "--delete-immediately",
+        action="store_true",
+        help="delete retired checkpoint payloads as soon as they are no longer live",
+    )
     start.add_argument("--parts", type=int, default=4)
     start.add_argument("--boundary-slack", type=float, default=1.0)
+    start.add_argument(
+        "--bfs",
+        action="store_true",
+        help="visit the shallowest queued partitions first (default: depth-first)",
+    )
     resume = commands.add_parser("resume", help="resume a paused or failed managed search")
     resume.add_argument("workdir", type=Path)
     resume.add_argument("--disk-reserve", help="replace the saved minimum-free-space setting")
-    resume.add_argument("--archive-dir", type=Path, help="set or replace the saved archive directory")
+    resume_retention = resume.add_mutually_exclusive_group()
+    resume_retention.add_argument("--archive-dir", type=Path, help="set or replace the saved archive directory")
+    resume_retention.add_argument(
+        "--delete-immediately",
+        action="store_true",
+        help="enable immediate deletion of retired checkpoint payloads",
+    )
     status = commands.add_parser("status", help="show persistent managed-search state")
     status.add_argument("workdir", type=Path)
     configure = commands.add_parser("configure", help="change durable disk-space settings without resuming")
     configure.add_argument("workdir", type=Path)
     configure.add_argument("--disk-reserve", help="replace the saved minimum-free-space setting")
-    configure.add_argument("--archive-dir", type=Path, help="set or replace the saved archive directory")
+    configure_retention = configure.add_mutually_exclusive_group()
+    configure_retention.add_argument(
+        "--archive-dir", type=Path, help="set or replace the saved archive directory"
+    )
+    configure_retention.add_argument(
+        "--delete-immediately",
+        action="store_true",
+        help="enable immediate deletion of retired checkpoint payloads",
+    )
     archive = commands.add_parser("archive", help="move all currently retired checkpoints to the archive")
     archive.add_argument("workdir", type=Path)
     archive.add_argument("--archive-dir", type=Path, help="set or replace the saved archive directory")
@@ -1078,6 +1289,8 @@ def main() -> int:
                 archive_dir,
                 args.parts,
                 args.boundary_slack,
+                args.delete_immediately,
+                args.bfs,
                 solver_args,
             )
         else:
@@ -1086,10 +1299,13 @@ def main() -> int:
             manager = Manager.open(workdir)
         with RunLock(workdir):
             if args.command == "configure":
-                if args.disk_reserve is None and args.archive_dir is None:
-                    raise ManagerError("configure requires --disk-reserve and/or --archive-dir")
-                manager.configure(args.disk_reserve, args.archive_dir)
+                if args.disk_reserve is None and args.archive_dir is None and not args.delete_immediately:
+                    raise ManagerError(
+                        "configure requires --disk-reserve, --archive-dir, and/or --delete-immediately"
+                    )
+                manager.configure(args.disk_reserve, args.archive_dir, args.delete_immediately)
                 manager.save()
+                manager.delete_retired_checkpoints()
                 manager.print_status()
                 return 0
             if args.command == "archive":
@@ -1101,7 +1317,9 @@ def main() -> int:
                 print(f"manager: archived {format_bytes(moved)} of retired checkpoints")
                 manager.print_status()
                 return 0
-            if args.command == "resume" and manager.configure(args.disk_reserve, args.archive_dir):
+            if args.command == "resume" and manager.configure(
+                args.disk_reserve, args.archive_dir, args.delete_immediately
+            ):
                 manager.save()
             try:
                 return manager.run()

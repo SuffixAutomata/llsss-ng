@@ -11,6 +11,11 @@
 #include <sys/resource.h>
 #endif
 
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/task_info.h>
+#endif
+
 #ifdef __linux__
 #include <sys/time.h>
 #endif
@@ -24,11 +29,20 @@ inline std::uint64_t getMaxRSS() {
     return static_cast<std::uint64_t>(pmc.PeakWorkingSetSize);
   }
 #elif defined(__APPLE__)
-  rusage usage{};
-  if(getrusage(RUSAGE_SELF, &usage) == 0) {
-    // macOS reports ru_maxrss in bytes.
-    return static_cast<std::uint64_t>(usage.ru_maxrss);
-  }
+  task_vm_info_data_t info{};
+  mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+
+  const kern_return_t kr = task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&info), &count);
+
+  if (kr != KERN_SUCCESS)
+    return 0;
+
+  if (count >= TASK_VM_INFO_REV3_COUNT && info.ledger_phys_footprint_peak > 0)
+    return static_cast<std::uint64_t>(info.ledger_phys_footprint_peak);
+
+  // Old-system fallback: current footprint only.
+  if (count >= TASK_VM_INFO_REV1_COUNT)
+      return static_cast<std::uint64_t>(info.phys_footprint);
 #elif defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
   rusage usage{};
   if(getrusage(RUSAGE_SELF, &usage) == 0) {

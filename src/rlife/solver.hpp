@@ -78,7 +78,10 @@ static_assert([] {
 } // namespace detail
 
 enum class PartialMode { None, Final, Every };
-enum class SaveMode { None, Final, Every };
+// Checkpoints persist these values numerically. Keep the existing entries in
+// place and append new modes so older checkpoint configurations retain their
+// meaning.
+enum class SaveMode { None, Final, Every, Pause };
 
 struct Options {
   std::string rule = "S23/B3";
@@ -101,7 +104,7 @@ struct Options {
   std::string stats_output;
   bool verbose = false;
   bool phase_timings = false;
-  SaveMode save_mode = SaveMode::Final;
+  SaveMode save_mode = SaveMode::Pause;
   int save_every = 1;
   std::string savedir = "saves";
   std::string search_name = "save";
@@ -336,7 +339,7 @@ Orthogonal and diagonal fixed-width LLSSS using succinct two-column slice trees.
   --[no-]halt-on-ends        halt after the first completion (default: halt)
   --halts w_pos:N            stop at logical W-tile position N
   --max-memory SIZE          soft peak-RSS cap; stop after the current row
-  --save MODE                none, final, or every:N (default: final)
+  --save MODE                none, pause, final, or every:N (default: pause)
   --savedir DIRECTORY        save under DIRECTORY (default: saves/)
   --search-name NAME         persistent search identity (default: save)
   --load FILE                resume a checkpoint; geometry/start may be omitted
@@ -462,6 +465,8 @@ inline Options parse_cli(int argc, char** argv) {
       std::smatch match;
       if(value == "none") {
         options.save_mode = SaveMode::None;
+      } else if(value == "pause") {
+        options.save_mode = SaveMode::Pause;
       } else if(value == "final") {
         options.save_mode = SaveMode::Final;
       } else if(std::regex_match(value, match, std::regex(R"(^every:([0-9]+)$)"))) {
@@ -471,7 +476,7 @@ inline Options parse_cli(int argc, char** argv) {
           throw std::runtime_error("save interval must be positive");
         }
       } else {
-        throw std::runtime_error("--save supports none, final, or every:N");
+        throw std::runtime_error("--save supports none, pause, final, or every:N");
       }
     } else if(current == "--savedir") {
       options.savedir = argument(current);

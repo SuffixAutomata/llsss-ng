@@ -267,7 +267,7 @@ inline Options Solver::read_config(CheckpointReader& input, std::uint32_t checkp
   options.verbose = false; // not to be persisted in checkpoints
   options.phase_timings = input.boolean();
   const auto save_mode = input.u8();
-  if(save_mode > static_cast<std::uint8_t>(SaveMode::Every)) {
+  if(save_mode > static_cast<std::uint8_t>(SaveMode::Pause)) {
     throw std::runtime_error("invalid save mode in checkpoint");
   }
   options.save_mode = static_cast<SaveMode>(save_mode);
@@ -635,7 +635,8 @@ inline void Solver::write_status(std::string_view reason, int exit_status) const
 }
 
 inline int Solver::finish(int status, std::string_view reason) {
-  if(options_.save_mode != SaveMode::None)
+  const bool completed_search = reason == "completion" || reason == "exhausted";
+  if(options_.save_mode != SaveMode::None && (options_.save_mode != SaveMode::Pause || !completed_search))
     save_checkpoint();
   write_status(reason, status);
   return status;
