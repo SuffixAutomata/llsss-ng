@@ -609,6 +609,15 @@ class Manager:
             result += Fraction(int(count), parts**depth)
         return min(result, Fraction(1))
 
+    def current_progress_depth(self) -> int:
+        active = self.manifest.get("active")
+        if active is not None:
+            return int(active["branch"].get("depth", 0))
+        stack = self.manifest.get("stack", [])
+        if stack:
+            return int(stack[-1].get("depth", 0))
+        return 0
+
     def progress_text(self) -> str:
         parts = int(self.manifest["config"]["parts"])
         completed = self.progress_fraction()
@@ -616,9 +625,7 @@ class Manager:
         if self.manifest["config"].get("traversal", "dfs") == "bfs":
             return f"[{percentage:.2f}%]"
 
-        completed_depths = self.manifest["progress"]["completed_by_depth"]
-        deepest_completed = max((int(depth) for depth in completed_depths), default=0)
-        depth = max(1, int(self.manifest["progress"].get("max_depth", 0)), deepest_completed)
+        depth = max(1, self.current_progress_depth())
         if completed == 1:
             digits = [parts] + [0] * (depth - 1)
         else:
