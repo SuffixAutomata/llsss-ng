@@ -344,7 +344,11 @@ their zero masks and rank entries are not allocated. Synchronized DFS over
 neighboring tries rechecks overlap at every flattened row. Each new three-cell row is tested
 against the same static 1024-entry CA table for every complete or partially
 known local equation it touches. Interior projections are generated from the
-quotient lattice for each subtile phase. Checks are greedily grouped so a
+quotient lattice for each subtile phase. At phase `s`, their history includes
+the complete lookback plus the `s` earlier subtiles of the current tile:
+`2P+s` flattened levels orthogonally or `4P+s` diagonally. This covers equations
+whose oldest and newest cells occupy different subtiles, including non-coprime
+periods. Checks are greedily grouped so a
 lookup reads at most five historical triples;
 for `c5d-f2b`, the three projections use 32,768 + 4,096 + 512 bytes per phase,
 or 73 KiB total. This avoids a monolithic `2^27` lookup without adding anything
@@ -373,7 +377,7 @@ the ordinary compact checkpoint representation.
 
 The optional `bcaf` filter uses the fixed first complete lookback plus one
 logical `W` tile of each lineage as its zero-background witness, matching the
-Rust implementation and `cpp-old`. Its window is `2P+1` flattened levels
+Rust implementation and `cpp-old`. Its window is `2P+g` flattened levels
 orthogonally and `4P+2g` diagonally. It propagates witnesses in both directions,
 admits individual compatible leaf pairs only when they lie on an interesting
 prefix or suffix, and enforces global reachability through the retention formula

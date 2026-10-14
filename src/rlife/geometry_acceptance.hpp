@@ -298,11 +298,11 @@ private:
 
   void build_interior(const Geometry& geometry, const RuleTable& rule) {
     constexpr std::size_t maximum_projection_history_rows = 5;
-    const auto lookback = geometry.short_window();
     interior_acceptance_.clear();
     interior_acceptance_.resize(static_cast<std::size_t>(geometry.subtile_count));
 
     for(std::size_t phase = 0; phase < interior_acceptance_.size(); ++phase) {
+      const auto lookback = geometry.history_window(phase);
       std::map<Geometry::Coordinate, Read> board;
       for(std::uint8_t column = 0; column < 3; ++column) {
         board.emplace(geometry.cell(column, static_cast<std::int64_t>(phase)), Read{Read::Kind::Candidate, 0, column});
@@ -520,7 +520,7 @@ private:
     phases.resize(static_cast<std::size_t>(geometry.subtile_count));
 
     for(std::size_t phase = 0; phase < phases.size(); ++phase) {
-      const auto lookback = geometry.short_window() + phase;
+      const auto lookback = geometry.history_window(phase);
       std::map<Geometry::Coordinate, std::vector<Read>> board;
       std::vector<BoundaryCondition> conditions;
       std::set<Geometry::Coordinate> candidate_cells;

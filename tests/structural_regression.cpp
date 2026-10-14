@@ -3,7 +3,9 @@
 #include "rlife/succinct_slice_tree.hpp"
 
 #include <iostream>
+#include <map>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <set>
 
@@ -132,6 +134,109 @@ static void test_history() {
   }
 }
 
+static void test_non_coprime_acceptance() {
+  // Evaluate neighborhoods in physical (x,y,t), independently of the
+  // quotient-coordinate shifts and projection history used by acceptance.
+  constexpr std::array<std::array<int, 3>, 10> offsets = {
+      std::array{-1, -1, 0}, std::array{0, -1, 0}, std::array{1, -1, 0}, std::array{-1, 0, 0}, std::array{0, 0, 0},
+      std::array{1, 0, 0}, std::array{-1, 1, 0}, std::array{0, 1, 0}, std::array{1, 1, 0}, std::array{0, 0, 1},
+  };
+  using PhysicalKey = std::tuple<std::int64_t, std::int64_t, std::int64_t>;
+  using Read = std::pair<std::size_t, std::uint8_t>;
+  using Equation = std::array<std::optional<Read>, 10>;
+  std::mt19937_64 random(0x3c6);
+  for(const auto* rule_name : {"B2/S", "B3/S23"}) {
+    const auto rule = RuleTable::parse(rule_name);
+    for(const auto* name : {"c5-f2b", "2c4-f2b", "3c6-f2b", "3c9-f2b", "4c8-f2b", "5c10-f2b", "6c12-f2b",
+                           "0c3-f2b", "3c3-f2b", "c3d-f2b", "2c4d-f2b", "3c6d-f2b", "3c9d-f2b", "4c8d-f2b"}) {
+      const auto geometry = Geometry::parse(name);
+      GeometryAcceptance acceptance;
+      acceptance.build(geometry, rule, EdgeMode::Background, EdgeMode::Background);
+      auto key = [&](std::int64_t x, std::int64_t y, std::int64_t t) -> PhysicalKey {
+        auto periods = t / geometry.period;
+        if(t % geometry.period < 0)
+          --periods;
+        return {x + (geometry.diagonal() ? periods * geometry.displacement : 0),
+                y + periods * geometry.displacement, t - periods * geometry.period};
+      };
+      for(int phase = 0; phase < geometry.subtile_count; ++phase) {
+        const auto row = geometry.short_window() + static_cast<std::size_t>(phase);
+        std::map<PhysicalKey, Read> board;
+        for(std::size_t depth = 0; depth <= row; ++depth) {
+          for(std::uint8_t column = 0; column < 3; ++column) {
+            const auto physical = geometry.to_physical(geometry.cell(column, depth));
+            require(board.emplace(key(physical.x, physical.y, physical.t), Read{depth, column}).second);
+          }
+        }
+        std::set<PhysicalKey> centers;
+        for(std::uint8_t column = 0; column < 3; ++column) {
+          const auto physical = geometry.to_physical(geometry.cell(column, row));
+          for(const auto& delta : offsets)
+            centers.insert(key(physical.x - delta[0], physical.y - delta[1], physical.t - delta[2]));
+        }
+        std::vector<Equation> equations;
+        for(const auto& [x, y, t] : centers) {
+          Equation equation{};
+          bool touches_candidate = false;
+          for(std::size_t bit = 0; bit < offsets.size(); ++bit) {
+            const auto& delta = offsets[bit];
+            const auto found = board.find(key(x + delta[0], y + delta[1], t + delta[2]));
+            if(found != board.end()) {
+              equation[bit] = found->second;
+              touches_candidate = touches_candidate || found->second.first == row;
+            }
+          }
+          if(touches_candidate)
+            equations.push_back(equation);
+        }
+        auto check = [&](const std::vector<std::uint8_t>& history) {
+          std::uint8_t expected = 0;
+          for(std::size_t position = 0; position < geometry_pair_triple_order.size(); ++position) {
+            const auto candidate = geometry_pair_triple_order[position];
+            bool accepted = true;
+            for(const auto& equation : equations) {
+              std::uint16_t known = 0;
+              std::uint16_t value = 0;
+              for(std::size_t bit = 0; bit < equation.size(); ++bit) {
+                if(!equation[bit])
+                  continue;
+                const auto [depth, column] = *equation[bit];
+                known |= 1U << bit;
+                if(((depth == row ? candidate : history[depth]) >> column) & 1U)
+                  value |= 1U << bit;
+              }
+              if(!rule.accepts_partial(known, value)) {
+                accepted = false;
+                break;
+              }
+            }
+            if(accepted)
+              expected |= 1U << position;
+          }
+          if(acceptance.interior_mask(history.data(), row) != expected)
+            throw std::runtime_error(std::string("physical CA mismatch: ") + name + " " + rule_name + " phase=" + std::to_string(phase));
+        };
+        std::vector<std::uint8_t> history(row, 0);
+        check(history);
+        // Sparse histories expose equations whose oldest cell lies beyond
+        // 2P/4P; dense random histories are often rejected by both versions.
+        for(std::size_t depth = 0; depth < row; ++depth) {
+          for(std::uint8_t column = 0; column < 3; ++column) {
+            history[depth] = 1U << column;
+            check(history);
+          }
+          history[depth] = 0;
+        }
+        for(unsigned trial = 0; trial < 64; ++trial) {
+          for(auto& triple : history)
+            triple = random() & 7U;
+          check(history);
+        }
+      }
+    }
+  }
+}
+
 static void same_tree(const SuccinctSliceTree& a, const SuccinctSliceTree& b) {
   require(a.node_count() == b.node_count());
   require(a.checkpoint_words() == b.checkpoint_words());
@@ -204,6 +309,7 @@ int main() {
   test_scratch_allocator();
   test_tag_words_and_clauses();
   test_history();
+  test_non_coprime_acceptance();
   test_trees();
-  std::cout << "scratch, tag-word, clause, packed-history and virtual-leaf regression passed\n";
+  std::cout << "scratch, tag-word, clause, packed-history, physical CA and virtual-leaf regression passed\n";
 }

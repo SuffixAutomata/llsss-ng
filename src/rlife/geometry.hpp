@@ -133,6 +133,11 @@ struct Geometry {
     return static_cast<std::size_t>(diagonal() ? 4 : 2) * static_cast<std::size_t>(period);
   }
 
+  // Include the earlier subtiles of the candidate's current tile.  The
+  // oldest and newest cells in a CA equation can have different subtile
+  // phases, so its flattened history can exceed the complete-tile lookback.
+  [[nodiscard]] std::size_t history_window(std::size_t phase) const noexcept { return short_window() + phase; }
+
   [[nodiscard]] std::size_t long_window() const noexcept { return short_window() + static_cast<std::size_t>(subtile_count); }
 
   [[nodiscard]] bool complete_tile(std::size_t depth) const noexcept { return depth % static_cast<std::size_t>(subtile_count) == 0; }

@@ -224,6 +224,35 @@ else
   [[ $diagonal_hash == e24f646987b57b50b3c16f0d066a33f48338f1c17b46a503abd98ad3679a6a28 ]]
 fi
 
+# Non-coprime histories must include earlier subtiles of the current tile.
+# These searches previously returned isolated-cell completions at depth 27.
+for threads in 1 2; do
+  for rule in B2/S B3/S23; do
+    width=5
+    if [[ $rule == B3/S23 ]]; then
+      width=6
+    fi
+    prefix="$test_tmp/non-coprime-$width-$threads"
+    run_with_timeout "$binary" llsss \
+      --rule "$rule" --left-edge bg --right-edge bg --threads "$threads" \
+      --filters bcaf --partials none --save none --halts w_pos:12 \
+      --status-output "$prefix.json" 3c6-f2b "@bg($width)" \
+      >"$prefix.out" 2>"$prefix.err"
+    grep -Fq 'search exhausted at flattened depth 18 (w_pos 6[0])' "$prefix.out"
+    grep -Fq '"reason": "exhausted"' "$prefix.json"
+  done
+done
+
+# The wider B2/S example should advance past the reported row-27 stall.
+run_with_timeout "$binary" llsss \
+  --rule B2/S --left-edge bg --right-edge bg --threads 2 --filters bcaf \
+  --partials every:1 --save none --halts w_pos:12 \
+  --status-output "$test_tmp/non-coprime-wide.json" 3c6-f2b '@bg(9)' \
+  >"$test_tmp/non-coprime-wide.out" 2>"$test_tmp/non-coprime-wide.err"
+grep -Fq 'w_pos halt at 12[0]' "$test_tmp/non-coprime-wide.out"
+grep -Fq '"reason": "halt"' "$test_tmp/non-coprime-wide.json"
+grep -Fq '"completion": false' "$test_tmp/non-coprime-wide.json"
+
 if "$binary" llsss --left-edge even --partials none --ends none --save none c5d-f2b '@bg(5)' >"$test_tmp/edge.out" 2>"$test_tmp/edge.err"; then
   echo 'diagonal even edge unexpectedly succeeded' >&2
   exit 1
